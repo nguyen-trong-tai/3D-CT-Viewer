@@ -22,4 +22,5 @@ dist/
 # Project specific
 docs/
 data/
+dataset/
 outputs/

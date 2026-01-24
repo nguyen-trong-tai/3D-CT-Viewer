@@ -1,97 +1,145 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Form
-from storage.repository import CaseRepository
-from processing import loader
-from services.pipeline import PipelineService
-from models import schemas
+"""
+API Router
+
+REST API endpoints for the CT-based Medical Imaging & AI Research Platform.
+
+This API follows the case-based architecture defined in the PRD:
+- Case-based, not slice-based operations
+- Used for data upload, AI processing, and artifact delivery
+- No real-time interaction (slice navigation is handled client-side)
+"""
+
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Form, Depends
+from fastapi.responses import FileResponse, JSONResponse, Response
+from typing import List, Optional
 import uuid
 import numpy as np
 import shutil
 import tempfile
 import os
-from pathlib import Path
-from fastapi.responses import FileResponse, JSONResponse
-from typing import List, Optional
-import pydicom
-from io import BytesIO
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
+import asyncio
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 
-router = APIRouter()
-repo = CaseRepository()
-pipeline_service = PipelineService(repo)
+import pydicom
 
-# Store for batch upload sessions
-batch_sessions: dict[str, dict] = {}
+from models import (
+    CaseResponse,
+    StatusResponse,
+    ProcessingResponse,
+    MetadataResponse,
+    SliceResponse,
+    MaskSliceResponse,
+    ImplicitMetadataResponse,
+    ArtifactList,
+    ErrorResponse,
+    Spacing2D,
+    VolumeShape,
+    VoxelSpacing,
+)
+from models.enums import CaseStatus
+from storage.repository import CaseRepository
+from services.pipeline import PipelineService
+from processing import (
+    load_dicom_series,
+    load_nifti,
+    parse_dicom_bytes,
+    process_dicom_slice,
+    extract_dicom_metadata,
+)
+from api.dependencies import get_repository, get_pipeline_service
+from config import settings
+
+
+router = APIRouter(prefix="/api/v1", tags=["CT Imaging Platform"])
 
 # Thread pool for CPU-bound DICOM parsing
-_dicom_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+_dicom_executor = ThreadPoolExecutor(max_workers=settings.MAX_WORKERS)
+
+# Temporary storage for batch upload sessions
+_batch_sessions: dict = {}
 
 
-def _parse_dicom_bytes(content: bytes) -> pydicom.Dataset:
-    """Parse DICOM from bytes - runs in thread pool for parallelism"""
-    return pydicom.dcmread(BytesIO(content))
+# =============================================================================
+# Case Management Endpoints
+# =============================================================================
 
-
-def _process_dicom_slice(ds: pydicom.Dataset) -> np.ndarray:
-    """Process a single DICOM slice with HU conversion - CPU bound"""
-    slope = getattr(ds, 'RescaleSlope', 1)
-    intercept = getattr(ds, 'RescaleIntercept', 0)
-    return ds.pixel_array.astype(np.float64) * slope + intercept
-
-
-@router.post("/cases", response_model=schemas.CaseResponse)
-async def upload_case(file: UploadFile = File(...)):
+@router.post("/cases", response_model=CaseResponse, summary="Upload a CT file")
+async def upload_case(
+    file: UploadFile = File(...),
+    repo: CaseRepository = Depends(get_repository)
+):
+    """
+    Upload a single CT file (ZIP containing DICOM series or NIfTI file).
+    
+    Supported formats:
+    - `.zip` containing DICOM files (`.dcm`)
+    - `.nii` or `.nii.gz` NIfTI volumes
+    
+    Returns a case_id to use for subsequent API calls.
+    """
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
     
     try:
-        # Determine strict suffix (handle .nii.gz case)
-        filename = file.filename or "temp"
+        filename = file.filename or ""
         suffixes = Path(filename).suffixes
-        suffix = "".join(suffixes) if suffixes else ".tmp"
+        suffix = "".join(suffixes).lower()
         
-        # Save temp file
+        # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
         
-        # Load and parse (this converts to HU and extracts metadata)
-        if filename.endswith('.zip'):
-            volume, spacing = loader.load_dicom_series(tmp_path)
-        elif filename.endswith('.nii') or filename.endswith('.nii.gz'):
-            volume, spacing = loader.load_nifti(tmp_path)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file format")
-            
-        # Clean up temp
-        os.remove(tmp_path)
+        try:
+            # Load based on file type
+            if filename.lower().endswith('.zip'):
+                volume, spacing = load_dicom_series(tmp_path)
+            elif filename.lower().endswith(('.nii', '.nii.gz')):
+                volume, spacing = load_nifti(tmp_path)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file format: {suffix}. Use .zip (DICOM) or .nii/.nii.gz (NIfTI)"
+                )
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         
-        # Save to internal storage
+        # Save to repository
         repo.save_ct_volume(case_id, volume, spacing)
         
-        return schemas.CaseResponse(case_id=case_id, status="uploaded")
+        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
         
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
-        traceback.print_exc() # Print to console for debugging
-        repo.update_status(case_id, "error")
+        traceback.print_exc()
+        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 
-@router.post("/cases/dicom", response_model=schemas.CaseResponse)
+@router.post("/cases/dicom", response_model=CaseResponse, summary="Upload DICOM files directly")
 async def upload_dicom_files(
     files: List[UploadFile] = File(...),
-    metadata: Optional[str] = Form(None)  # Optional JSON metadata string
+    metadata: Optional[str] = Form(None),
+    repo: CaseRepository = Depends(get_repository)
 ):
     """
     Upload multiple DICOM files in a single request.
-    This is the FASTEST way to upload a DICOM folder - only 1 API call!
     
-    - files: List of .dcm files
-    - metadata: Optional JSON string with additional metadata
+    This is the FASTEST way to upload a DICOM folder:
+    - Only 1 API call required
+    - Files are processed in parallel
+    - Typical processing time: <2s for standard datasets
     
-    Uses parallel processing for maximum speed (<2s for typical datasets).
+    Args:
+        files: List of .dcm files
+        metadata: Optional JSON string with additional metadata (patient info, etc.)
     """
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
@@ -106,52 +154,57 @@ async def upload_dicom_files(
             try:
                 extra_metadata = json.loads(metadata)
             except json.JSONDecodeError:
-                pass  # Ignore invalid metadata
+                pass
         
-        # Step 1: Read all file contents in parallel (I/O bound)
-        async def read_file_async(f: UploadFile) -> tuple[str, bytes]:
-            content = await f.read()
-            return (f.filename or "", content)
-        
-        # Filter and read only .dcm files
+        # Filter DICOM files
         dcm_files = [f for f in files if f.filename and f.filename.lower().endswith('.dcm')]
         
         if not dcm_files:
-            raise HTTPException(status_code=400, detail="No valid DICOM files found")
+            raise HTTPException(status_code=400, detail="No valid DICOM files (.dcm) found")
         
-        # Read all files concurrently
+        # Step 1: Read all file contents concurrently (I/O bound)
+        async def read_file_async(f: UploadFile) -> tuple:
+            content = await f.read()
+            return (f.filename, content)
+        
         file_contents = await asyncio.gather(*[read_file_async(f) for f in dcm_files])
         
-        # Step 2: Parse DICOM in thread pool (CPU bound) - parallel
+        # Step 2: Parse DICOM files in thread pool (CPU bound)
         loop = asyncio.get_event_loop()
         parse_tasks = [
-            loop.run_in_executor(_dicom_executor, _parse_dicom_bytes, content)
+            loop.run_in_executor(_dicom_executor, parse_dicom_bytes, content)
             for _, content in file_contents
         ]
-        dicom_data = await asyncio.gather(*parse_tasks)
+        dicom_datasets = await asyncio.gather(*parse_tasks)
         
-        if not dicom_data:
-            raise HTTPException(status_code=400, detail="No valid DICOM files parsed")
+        if not dicom_datasets:
+            raise HTTPException(status_code=400, detail="No valid DICOM files could be parsed")
         
-        # Sort by ImagePositionPatient Z coordinate
-        dicom_data = sorted(dicom_data, key=lambda x: float(x.ImagePositionPatient[2]))
+        # Sort by Z position
+        dicom_datasets = sorted(
+            dicom_datasets,
+            key=lambda x: float(getattr(x, 'ImagePositionPatient', [0, 0, 0])[2])
+        )
         
-        # Calculate spacing
+        # Extract spacing
         try:
-            pixel_spacing = dicom_data[0].PixelSpacing
-            slice_thickness = dicom_data[0].SliceThickness
+            pixel_spacing = dicom_datasets[0].PixelSpacing
+            slice_thickness = dicom_datasets[0].SliceThickness
             spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(slice_thickness))
         except AttributeError:
-            raise ValueError("DICOM missing Spacing attributes")
+            raise HTTPException(
+                status_code=400,
+                detail="DICOM files missing required spacing attributes (PixelSpacing, SliceThickness)"
+            )
         
-        # Step 3: Process slices in thread pool (CPU bound) - parallel
+        # Step 3: Process slices in thread pool (CPU bound)
         process_tasks = [
-            loop.run_in_executor(_dicom_executor, _process_dicom_slice, ds)
-            for ds in dicom_data
+            loop.run_in_executor(_dicom_executor, process_dicom_slice, ds)
+            for ds in dicom_datasets
         ]
         volume_slices = await asyncio.gather(*process_tasks)
         
-        # Convert from (Y, X, Z) to (X, Y, Z)
+        # Build volume: (Y, X, Z) -> (X, Y, Z)
         volume_np = np.stack(volume_slices, axis=-1)
         volume_np = np.transpose(volume_np, (1, 0, 2))
         
@@ -162,52 +215,68 @@ async def upload_dicom_files(
         if extra_metadata:
             repo.save_extra_metadata(case_id, extra_metadata)
         
-        return schemas.CaseResponse(case_id=case_id, status="uploaded")
+        # Extract and save DICOM metadata from first file
+        if dicom_datasets:
+            dicom_meta = extract_dicom_metadata(dicom_datasets[0])
+            if dicom_meta:
+                existing_meta = extra_metadata or {}
+                existing_meta.update({"dicom": dicom_meta})
+                repo.save_extra_metadata(case_id, existing_meta)
         
+        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
+        
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        repo.update_status(case_id, "error")
+        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
         raise HTTPException(status_code=500, detail=f"DICOM upload failed: {str(e)}")
 
-# ============== BATCH UPLOAD ENDPOINTS ==============
-# These endpoints allow uploading multiple DICOM files directly without client-side zipping
 
-@router.post("/cases/batch/init", response_model=schemas.CaseResponse)
-async def init_batch_upload():
-    """Initialize a batch upload session. Returns a case_id to use for subsequent file uploads."""
+# =============================================================================
+# Batch Upload Endpoints (Alternative approach for large uploads)
+# =============================================================================
+
+@router.post("/cases/batch/init", response_model=CaseResponse, summary="Initialize batch upload")
+async def init_batch_upload(repo: CaseRepository = Depends(get_repository)):
+    """
+    Initialize a batch upload session for uploading DICOM files in chunks.
+    
+    Use this if you need to upload files in multiple requests.
+    For most cases, use POST /cases/dicom instead.
+    """
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
     
-    # Create temp directory for this batch
     temp_dir = tempfile.mkdtemp(prefix=f"batch_{case_id}_")
-    batch_sessions[case_id] = {
+    _batch_sessions[case_id] = {
         "temp_dir": temp_dir,
-        "files_received": 0,
-        "total_expected": 0
+        "files_received": 0.
     }
     
-    return schemas.CaseResponse(case_id=case_id, status="batch_initialized")
+    return CaseResponse(case_id=case_id, status="batch_initialized")
 
-@router.post("/cases/batch/{case_id}/files")
-async def upload_batch_files(case_id: str, files: List[UploadFile] = File(...)):
-    """
-    Upload multiple DICOM files for a batch session.
-    Can be called multiple times with chunks of files for better performance.
-    """
-    if case_id not in batch_sessions:
-        raise HTTPException(status_code=404, detail="Batch session not found. Call /cases/batch/init first.")
+
+@router.post("/cases/batch/{case_id}/files", summary="Upload batch files")
+async def upload_batch_files(
+    case_id: str,
+    files: List[UploadFile] = File(...)
+):
+    """Upload files to an existing batch session."""
+    if case_id not in _batch_sessions:
+        raise HTTPException(
+            status_code=404,
+            detail="Batch session not found. Call /cases/batch/init first."
+        )
     
-    session = batch_sessions[case_id]
+    session = _batch_sessions[case_id]
     temp_dir = session["temp_dir"]
     
     saved_count = 0
     for file in files:
         if file.filename:
-            # Preserve relative path structure if available
-            file_path = os.path.join(temp_dir, file.filename)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
+            file_path = os.path.join(temp_dir, os.path.basename(file.filename))
             with open(file_path, 'wb') as f:
                 content = await file.read()
                 f.write(content)
@@ -215,22 +284,27 @@ async def upload_batch_files(case_id: str, files: List[UploadFile] = File(...)):
     
     session["files_received"] += saved_count
     
-    return {"case_id": case_id, "files_saved": saved_count, "total_received": session["files_received"]}
+    return {
+        "case_id": case_id,
+        "files_saved": saved_count,
+        "total_received": session["files_received"]
+    }
 
-@router.post("/cases/batch/{case_id}/finalize", response_model=schemas.CaseResponse)
-async def finalize_batch_upload(case_id: str):
-    """
-    Finalize batch upload: process all uploaded DICOM files into a volume.
-    Must be called after all files have been uploaded.
-    """
-    if case_id not in batch_sessions:
+
+@router.post("/cases/batch/{case_id}/finalize", response_model=CaseResponse, summary="Finalize batch upload")
+async def finalize_batch_upload(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Process all uploaded files and create the CT volume."""
+    if case_id not in _batch_sessions:
         raise HTTPException(status_code=404, detail="Batch session not found")
     
-    session = batch_sessions[case_id]
+    session = _batch_sessions[case_id]
     temp_dir = session["temp_dir"]
     
     try:
-        # Find all DICOM files in the temp directory
+        # Find all DICOM files
         dicom_files = []
         for root, _, files in os.walk(temp_dir):
             for file in files:
@@ -240,175 +314,380 @@ async def finalize_batch_upload(case_id: str):
         if not dicom_files:
             raise HTTPException(status_code=400, detail="No DICOM files found in batch")
         
-        # Sort and process DICOM files
+        # Sort and process
         slices = [pydicom.dcmread(f) for f in dicom_files]
         slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
         
-        # Calculate spacing
-        try:
-            pixel_spacing = slices[0].PixelSpacing
-            slice_thickness = slices[0].SliceThickness
-            spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(slice_thickness))
-        except AttributeError:
-            raise ValueError("DICOM missing Spacing attributes")
+        # Extract spacing
+        pixel_spacing = slices[0].PixelSpacing
+        slice_thickness = slices[0].SliceThickness
+        spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(slice_thickness))
         
-        # Create volume with HU conversion
-        volume = []
+        # Build volume with HU conversion
+        volume_slices = []
         for s in slices:
             slope = getattr(s, 'RescaleSlope', 1)
             intercept = getattr(s, 'RescaleIntercept', 0)
             slice_data = s.pixel_array.astype(np.float64) * slope + intercept
-            volume.append(slice_data)
+            volume_slices.append(slice_data)
         
-        # Convert from (Y, X, Z) to (X, Y, Z)
-        volume_np = np.stack(volume, axis=-1)
+        volume_np = np.stack(volume_slices, axis=-1)
         volume_np = np.transpose(volume_np, (1, 0, 2))
         
-        # Save to repository
+        # Save
         repo.save_ct_volume(case_id, volume_np, spacing)
         
-        # Cleanup
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        del batch_sessions[case_id]
+        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
         
-        return schemas.CaseResponse(case_id=case_id, status="uploaded")
-        
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
-        repo.update_status(case_id, "error")
-        # Cleanup on error
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        if case_id in batch_sessions:
-            del batch_sessions[case_id]
+        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
         raise HTTPException(status_code=500, detail=f"Batch finalize failed: {str(e)}")
+    finally:
+        # Cleanup
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        _batch_sessions.pop(case_id, None)
 
-# ============== END BATCH UPLOAD ==============
 
-@router.post("/cases/{case_id}/process", response_model=schemas.ProcessingResponse)
-async def trigger_processing(case_id: str, background_tasks: BackgroundTasks):
-    status = repo.get_status(case_id)
-    if status == "error":
-         raise HTTPException(status_code=404, detail="Case not found")
-         
-    background_tasks.add_task(pipeline_service.process_case, case_id)
-    return schemas.ProcessingResponse(case_id=case_id, status="processing_started")
+# =============================================================================
+# Processing Endpoints
+# =============================================================================
 
-@router.get("/cases/{case_id}/status", response_model=schemas.StatusResponse)
-async def get_status(case_id: str):
+@router.post("/cases/{case_id}/process", response_model=ProcessingResponse, summary="Start AI processing")
+async def trigger_processing(
+    case_id: str,
+    background_tasks: BackgroundTasks,
+    repo: CaseRepository = Depends(get_repository),
+    pipeline: PipelineService = Depends(get_pipeline_service)
+):
     """
-    Returns the current processing status of a case.
+    Trigger the AI processing pipeline for a case.
     
-    This endpoint NEVER returns 404 for a case_id. Status values:
-    - "uploaded": Case created, processing not yet started
-    - "processing": Pipeline execution ongoing
-    - "ready": Pipeline completed successfully  
-    - "error": Pipeline failed
+    Pipeline stages:
+    1. Segmentation (threshold-based)
+    2. SDF computation
+    3. Mesh extraction (Marching Cubes)
+    
+    Processing runs in the background. Use GET /cases/{case_id}/status to check progress.
     """
     status = repo.get_status(case_id)
-    return schemas.StatusResponse(case_id=case_id, status=status)
-
-@router.get("/cases/{case_id}/metadata", response_model=schemas.MetadataResponse)
-async def get_metadata(case_id: str):
-    meta = repo.load_ct_metadata(case_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Metadata not found")
-        
-    shape = meta["shape"] # (X, Y, Z)
-    spacing = meta["spacing"]
     
-    return schemas.MetadataResponse(
-        volume_shape={"x": shape[0], "y": shape[1], "z": shape[2]},
-        voxel_spacing_mm={"x": spacing[0], "y": spacing[1], "z": spacing[2]},
-        num_slices=shape[2]
+    if status == "error" and not repo.case_exists(case_id):
+        raise HTTPException(status_code=404, detail="Case not found")
+    
+    if status == CaseStatus.PROCESSING.value:
+        return ProcessingResponse(
+            case_id=case_id,
+            status="already_processing",
+            estimated_time_seconds=15.0
+        )
+    
+    # Start pipeline in background
+    background_tasks.add_task(pipeline.process_case, case_id)
+    
+    return ProcessingResponse(
+        case_id=case_id,
+        status="processing_started",
+        estimated_time_seconds=15.0  # Typical time for standard volumes
     )
 
-@router.get("/cases/{case_id}/extra-metadata")
-async def get_extra_metadata(case_id: str):
+
+@router.get("/cases/{case_id}/status", response_model=StatusResponse, summary="Get case status")
+async def get_status(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
     """
-    Get extra metadata (patient info, study details, etc.) if it was uploaded.
-    Returns 404 if no extra metadata was provided during upload.
+    Get the current processing status of a case.
+    
+    Status values:
+    - `pending`: Case created, awaiting file upload
+    - `uploaded`: Upload complete, ready for processing
+    - `processing`: AI pipeline running
+    - `ready`: All processing complete, artifacts available
+    - `error`: Processing failed
     """
+    status = repo.get_status(case_id)
+    status_info = repo.get_status_info(case_id)
+    
+    message = None
+    if status_info:
+        message = status_info.get("message")
+    
+    return StatusResponse(
+        case_id=case_id,
+        status=status,
+        message=message
+    )
+
+
+@router.get("/cases/{case_id}/pipeline", summary="Get detailed pipeline status")
+async def get_pipeline_status(
+    case_id: str,
+    pipeline: PipelineService = Depends(get_pipeline_service)
+):
+    """Get detailed status of pipeline stages and available artifacts."""
+    return JSONResponse(content=pipeline.get_pipeline_status(case_id))
+
+
+# =============================================================================
+# Data Retrieval Endpoints
+# =============================================================================
+
+@router.get("/cases/{case_id}/metadata", response_model=MetadataResponse, summary="Get CT metadata")
+async def get_metadata(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Get metadata about the CT volume (dimensions, spacing, etc.)."""
+    meta = repo.load_ct_metadata(case_id)
+    
+    if not meta:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    
+    shape = meta["shape"]
+    spacing = meta["spacing"]
+    hu_range = meta.get("hu_range", {"min": -1024, "max": 3071})
+    
+    return MetadataResponse(
+        volume_shape=VolumeShape(x=shape[0], y=shape[1], z=shape[2]),
+        voxel_spacing_mm=VoxelSpacing(x=spacing[0], y=spacing[1], z=spacing[2]),
+        num_slices=shape[2],
+        hu_range=hu_range
+    )
+
+
+@router.get("/cases/{case_id}/extra-metadata", summary="Get extra metadata")
+async def get_extra_metadata(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Get extra metadata (patient info, study details, etc.) if available."""
     meta = repo.load_extra_metadata(case_id)
+    
     if not meta:
         raise HTTPException(status_code=404, detail="No extra metadata available")
+    
     return JSONResponse(content=meta)
 
-@router.get("/cases/{case_id}/ct/slices/{slice_index}", response_model=schemas.SliceResponse)
-async def get_slice(case_id: str, slice_index: int):
-    # Load entire volume? Eek. performance. 
-    # For a demo/POC with local disk, loading memory mapping is best.
-    # np.load(mmap_mode='r')
-    path = repo._case_dir(case_id) / "ct_volume.npy"
-    if not path.exists():
+
+@router.get("/cases/{case_id}/ct/volume", summary="Get full CT volume")
+async def get_ct_volume(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """
+    Get the full CT volume as raw binary data (int16).
+    
+    This transfers the entire volume in a single request for frontend caching.
+    The frontend should load this into GPU memory for real-time interaction.
+    
+    Response is raw binary data with shape and spacing in headers.
+    """
+    volume = repo.load_ct_volume(case_id)
+    meta = repo.load_ct_metadata(case_id)
+    
+    if volume is None or meta is None:
         raise HTTPException(status_code=404, detail="Volume not found")
-        
-    try:
-        # Use mmap to reading just the slice we need
-        vol = np.load(path, mmap_mode='r') # (X, Y, Z)
-        
-        if slice_index < 0 or slice_index >= vol.shape[2]:
-            raise HTTPException(status_code=404, detail="Slice index out of bounds")
-            
-        # Extract slice Z
-        slice_data = vol[:, :, slice_index] # (X, Y)
-        
-        # Transpose to (Y, X) = (Rows, Cols) for standard image display
-        # where X (width) is horizontal, Y (height) is vertical.
-        # Frontend expects List[Rows][Cols] -> List[Y][X].
-        slice_data = slice_data.T
-        
-        meta = repo.load_ct_metadata(case_id)
-        spacing = meta["spacing"]
-        
-        return schemas.SliceResponse(
-            slice_index=slice_index,
-            hu_values=slice_data.tolist(), # Convert to native list
-            spacing_mm={"x": spacing[0], "y": spacing[1]}
+    
+    # Convert to int16 bytes
+    volume_bytes = volume.astype(np.int16).tobytes()
+    
+    # Include metadata in headers
+    headers = {
+        "X-Volume-Shape": json.dumps(meta["shape"]),
+        "X-Volume-Spacing": json.dumps(meta["spacing"]),
+        "Content-Type": "application/octet-stream",
+    }
+    
+    return Response(content=volume_bytes, headers=headers)
+
+
+@router.get("/cases/{case_id}/ct/slices/{slice_index}", response_model=SliceResponse, summary="Get single CT slice")
+async def get_slice(
+    case_id: str,
+    slice_index: int,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """
+    Get a single CT slice as HU values.
+    
+    Note: For optimal performance, use GET /cases/{case_id}/ct/volume to get
+    the full volume and handle slice navigation client-side.
+    """
+    # Use memory-mapped access for efficiency
+    volume = repo.load_ct_volume_mmap(case_id)
+    
+    if volume is None:
+        raise HTTPException(status_code=404, detail="Volume not found")
+    
+    if slice_index < 0 or slice_index >= volume.shape[2]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Slice index out of bounds. Valid range: 0-{volume.shape[2]-1}"
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Extract slice: volume is (X, Y, Z)
+    slice_data = volume[:, :, slice_index]  # (X, Y)
+    
+    # Transpose to (Y, X) for standard image display (rows, cols)
+    slice_data = slice_data.T
+    
+    meta = repo.load_ct_metadata(case_id)
+    spacing = meta["spacing"]
+    
+    return SliceResponse(
+        slice_index=slice_index,
+        hu_values=slice_data.tolist(),
+        spacing_mm=Spacing2D(x=spacing[0], y=spacing[1])
+    )
 
-@router.get("/cases/{case_id}/mask/slices/{slice_index}", response_model=schemas.MaskSliceResponse)
-async def get_mask_slice(case_id: str, slice_index: int):
-    path = repo._case_dir(case_id) / "mask_volume.npy"
-    if not path.exists():
-         # If mask doesn't exist yet, return empty sparse
-         # Or 404? PRD says "Missing or empty slices are valid"
-         # But if processing hasn't run, maybe 404 is better?
-         raise HTTPException(status_code=404, detail="Mask not found")
 
-    try:
-        vol = np.load(path, mmap_mode='r')
-        if slice_index < 0 or slice_index >= vol.shape[2]:
-             raise HTTPException(status_code=404, detail="Slice index out of bounds")
-             
-        mask_slice = vol[:, :, slice_index]
-        mask_slice = mask_slice.T # Transpose (X,Y) -> (Y,X)
-        
-        # Check sparsity
-        is_sparse = bool(np.sum(mask_slice) == 0)
-        
-        return schemas.MaskSliceResponse(
-            slice_index=slice_index,
-            mask=mask_slice.tolist(),
-            sparse=is_sparse
+@router.get("/cases/{case_id}/mask/volume", summary="Get full segmentation mask")
+async def get_mask_volume(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """
+    Get the full segmentation mask as raw binary data (uint8).
+    
+    Similar to CT volume endpoint, for frontend caching.
+    """
+    mask = repo.load_mask(case_id)
+    
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Mask not found")
+    
+    meta = repo.load_ct_metadata(case_id)
+    
+    mask_bytes = mask.astype(np.uint8).tobytes()
+    
+    headers = {
+        "X-Volume-Shape": json.dumps(list(mask.shape)),
+        "X-Volume-Spacing": json.dumps(meta["spacing"]),
+        "Content-Type": "application/octet-stream",
+    }
+    
+    return Response(content=mask_bytes, headers=headers)
+
+
+@router.get("/cases/{case_id}/mask/slices/{slice_index}", response_model=MaskSliceResponse, summary="Get single mask slice")
+async def get_mask_slice(
+    case_id: str,
+    slice_index: int,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Get a single segmentation mask slice."""
+    mask = repo.load_mask_mmap(case_id)
+    
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Mask not found")
+    
+    if slice_index < 0 or slice_index >= mask.shape[2]:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Slice index out of bounds. Valid range: 0-{mask.shape[2]-1}"
         )
-    except Exception as e:
-         raise HTTPException(status_code=500, detail=str(e))
+    
+    mask_slice = mask[:, :, slice_index]
+    mask_slice = mask_slice.T  # Transpose (X,Y) -> (Y,X)
+    
+    # Check sparsity (empty slice)
+    is_sparse = bool(np.sum(mask_slice) == 0)
+    
+    return MaskSliceResponse(
+        slice_index=slice_index,
+        mask=mask_slice.tolist(),
+        sparse=is_sparse
+    )
 
-@router.get("/cases/{case_id}/implicit", response_model=schemas.ImplicitMetadataResponse)
-async def get_implicit_meta(case_id: str):
-    # Static response as per PRD for now, verifying stage exists
+
+@router.get("/cases/{case_id}/implicit", response_model=ImplicitMetadataResponse, summary="Get implicit representation info")
+async def get_implicit_info(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Get metadata about the implicit representation (SDF)."""
     status = repo.get_status(case_id)
-    if status != "ready":
-         raise HTTPException(status_code=400, detail="Processing not complete")
-    return schemas.ImplicitMetadataResponse()
+    
+    if status not in [CaseStatus.READY.value, "ready"]:
+        raise HTTPException(status_code=400, detail="Processing not complete")
+    
+    if not repo.sdf_exists(case_id):
+        raise HTTPException(status_code=404, detail="SDF not available")
+    
+    return ImplicitMetadataResponse()
 
-@router.get("/cases/{case_id}/mesh")
-async def get_mesh(case_id: str):
-    path = repo.get_mesh_path(case_id)
-    if not path:
+
+@router.get("/cases/{case_id}/mesh", summary="Get 3D mesh")
+async def get_mesh(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """
+    Get the reconstructed 3D mesh in OBJ format.
+    
+    The mesh is in physical coordinates (mm) and respects voxel spacing.
+    """
+    mesh_path = repo.get_mesh_path(case_id)
+    
+    if mesh_path is None:
         raise HTTPException(status_code=404, detail="Mesh not found")
-        
-    return FileResponse(path, media_type="model/obj", filename="reconstruction.obj")
+    
+    return FileResponse(
+        path=mesh_path,
+        media_type="model/obj",
+        filename="reconstruction.obj"
+    )
+
+
+@router.get("/cases/{case_id}/artifacts", response_model=ArtifactList, summary="List available artifacts")
+async def list_artifacts(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """List all available artifacts for a case."""
+    if not repo.case_exists(case_id):
+        raise HTTPException(status_code=404, detail="Case not found")
+    
+    artifacts = repo.get_available_artifacts(case_id)
+    
+    return ArtifactList(case_id=case_id, artifacts=artifacts)
+
+
+# =============================================================================
+# Case Management Endpoints (Additional)
+# =============================================================================
+
+@router.delete("/cases/{case_id}", summary="Delete a case")
+async def delete_case(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Delete a case and all its associated artifacts."""
+    if not repo.case_exists(case_id):
+        raise HTTPException(status_code=404, detail="Case not found")
+    
+    success = repo.delete_case(case_id)
+    
+    if success:
+        return {"message": "Case deleted successfully", "case_id": case_id}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete case")
+
+
+# =============================================================================
+# Health Check
+# =============================================================================
+
+@router.get("/health", summary="Health check")
+async def health_check():
+    """Check if the API is running."""
+    return {
+        "status": "healthy",
+        "version": settings.APP_VERSION,
+        "storage_root": str(settings.STORAGE_ROOT)
+    }
