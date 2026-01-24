@@ -1,119 +1,292 @@
-import React, { Suspense } from 'react';
+import React, { Suspense, useMemo } from 'react';
 import { Canvas, useLoader } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera, Grid } from '@react-three/drei';
+import { OrbitControls, PerspectiveCamera, Grid, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 // @ts-ignore
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
-import { meshApi } from '../../services/api/mesh';
+import { meshApi } from '../../services/api';
+import { Box, RotateCcw, Move3d } from 'lucide-react';
 
 interface ModelViewerProps {
     caseId: string;
     currentSliceIndex: number;
-    voxelSpacing: [number, number, number]; // [x, y, z]
+    voxelSpacing: [number, number, number];
     showWireframe: boolean;
     totalSlices: number;
+    showSliceIndicator?: boolean;
 }
 
-const SliceIndicator = ({ zPos, wireframe }: { zPos: number, wireframe: boolean }) => {
+/**
+ * Slice Indicator Plane
+ * Shows the current 2D slice position in 3D space
+ */
+const SliceIndicator: React.FC<{ zPos: number; wireframe: boolean }> = ({ zPos, wireframe }) => {
     return (
         <group position={[0, zPos, 0]}>
-            {/* Visual Plane showing the slice cut */}
+            {/* Semi-transparent plane */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
                 <planeGeometry args={[400, 400]} />
                 <meshBasicMaterial
                     color="#3b82f6"
                     transparent
-                    opacity={wireframe ? 0.3 : 0.15}
+                    opacity={wireframe ? 0.3 : 0.12}
                     side={THREE.DoubleSide}
                     depthWrite={false}
-                    wireframe={wireframe}
                 />
             </mesh>
-            {/* Frame */}
+            {/* Edge ring */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
-                <ringGeometry args={[198, 200, 64]} />
-                <meshBasicMaterial color="#3b82f6" opacity={0.5} transparent side={THREE.DoubleSide} />
+                <ringGeometry args={[195, 200, 64]} />
+                <meshBasicMaterial color="#3b82f6" opacity={0.6} transparent side={THREE.DoubleSide} />
             </mesh>
         </group>
     );
 };
 
-const ProcessedMesh = ({ url, wireframe }: { url: string, wireframe: boolean }) => {
+/**
+ * 3D Mesh Component
+ * Loads and renders the reconstructed mesh with proper material
+ */
+const ProcessedMesh: React.FC<{ url: string; wireframe: boolean; color?: string }> = ({
+    url,
+    wireframe,
+    color = '#ef4444',
+}) => {
     const obj = useLoader(OBJLoader, url);
 
-    // Process material
-    obj.traverse((child: THREE.Object3D) => {
-        if ((child as THREE.Mesh).isMesh) {
-            const mesh = child as THREE.Mesh;
-            mesh.material = new THREE.MeshStandardMaterial({
-                color: "#ef4444",
-                roughness: 0.4,
-                metalness: 0.1,
-                wireframe: wireframe,
-                side: THREE.DoubleSide
-            });
+    // Process mesh and apply material
+    useMemo(() => {
+        obj.traverse((child: THREE.Object3D) => {
+            if ((child as THREE.Mesh).isMesh) {
+                const mesh = child as THREE.Mesh;
 
-            // Adjust geometry center if needed, but backend should send physical coords.
-            // Assuming backend sends coords where (0,0,0) is meaningful or consistent index space.
-            // Often meshes come in positive coordinates. We might need to center it?
-            // "Coordinate system is consistent with CT volume"
-            // Usually CT volume 0,0,0 is corner. We orbit around center.
-            // Let's auto-center for visualization convenience if it's off-screen.
-            // Actually, for strictness, valid physical coords should be respected. 
-            // We just ensure Camera looks at it.
+                // Dispose old material to prevent memory leak
+                if (mesh.material) {
+                    if (Array.isArray(mesh.material)) {
+                        mesh.material.forEach(m => m.dispose());
+                    } else {
+                        mesh.material.dispose();
+                    }
+                }
 
-            mesh.geometry.computeBoundingBox();
-            const center = new THREE.Vector3();
-            mesh.geometry.boundingBox?.getCenter(center);
-            mesh.position.sub(center); // Center the mesh at world logic origin for rotation
-        }
-    });
+                // Create material with proper lighting
+                mesh.material = new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.35,
+                    metalness: 0.05,
+                    wireframe: wireframe,
+                    side: THREE.DoubleSide,
+                    flatShading: false,
+                });
+
+                // Compute normals for better lighting
+                mesh.geometry.computeVertexNormals();
+
+                // Center the mesh for easier viewing
+                mesh.geometry.computeBoundingBox();
+                const center = new THREE.Vector3();
+                mesh.geometry.boundingBox?.getCenter(center);
+                mesh.position.sub(center);
+            }
+        });
+    }, [obj, wireframe, color]);
 
     return <primitive object={obj} />;
 };
 
-const SceneContent = ({ caseId, currentSliceIndex, voxelSpacing, showWireframe, totalSlices }: ModelViewerProps) => {
+/**
+ * Loading Fallback for 3D Scene
+ */
+const LoadingFallback: React.FC = () => {
+    return (
+        <mesh>
+            <boxGeometry args={[50, 50, 50]} />
+            <meshBasicMaterial color="#1a1e26" wireframe />
+        </mesh>
+    );
+};
+
+/**
+ * Scene Content
+ */
+const SceneContent: React.FC<ModelViewerProps> = ({
+    caseId,
+    currentSliceIndex,
+    voxelSpacing,
+    showWireframe,
+    totalSlices,
+    showSliceIndicator = true,
+}) => {
     const meshUrl = meshApi.getMeshUrl(caseId);
 
-    // Map slice index to World Z.
-    // Center of volume is at TOTAL_SLICES / 2.
-    // Z-spacing is voxelSpacing[2].
-
-    // Note: If we centered the mesh above, we must conceptually center the slice indicator too.
-    // Logic: Slice index N corresponds to Physical Z = (N * SpacingZ)
-    // If Mesh is centered, then we shift Slice Z by (CenterZ).
-    // Let's try relative movement.
-
+    // Calculate slice position in physical space
     const centerSlice = totalSlices / 2;
-    // We multiply by spacing to get physical units.
-    // Backend mesh is in MM. So we use MM directly.
     const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
 
     return (
         <>
-            <ambientLight intensity={0.5} />
-            <pointLight position={[100, 100, 100]} intensity={1} />
-            <directionalLight position={[-50, 50, -50]} intensity={0.5} />
+            {/* Lighting */}
+            <ambientLight intensity={0.4} />
+            <directionalLight position={[100, 100, 50]} intensity={0.8} castShadow />
+            <directionalLight position={[-50, 50, -50]} intensity={0.4} />
+            <pointLight position={[0, 100, 0]} intensity={0.3} />
 
-            <Grid infiniteGrid cellSize={50} sectionSize={200} fadeDistance={1000} sectionColor="#404040" cellColor="#202020" />
+            {/* Environment for better reflections */}
+            <Environment preset="city" background={false} />
 
-            <Suspense fallback={null}>
+            {/* Ground Grid */}
+            <Grid
+                infiniteGrid
+                cellSize={50}
+                sectionSize={200}
+                fadeDistance={1000}
+                sectionColor="#2a2e38"
+                cellColor="#1a1e26"
+                fadeStrength={1}
+            />
+
+            {/* 3D Mesh */}
+            <Suspense fallback={<LoadingFallback />}>
                 <ProcessedMesh url={meshUrl} wireframe={showWireframe} />
             </Suspense>
 
-            <SliceIndicator zPos={zPos} wireframe={showWireframe} />
+            {/* Slice Indicator */}
+            {showSliceIndicator && <SliceIndicator zPos={zPos} wireframe={showWireframe} />}
         </>
     );
 };
 
+/**
+ * 3D Model Viewer Component
+ * Displays reconstructed mesh with orbit controls
+ */
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
     return (
-        <div style={{ width: '100%', height: '100%' }}>
-            <Canvas>
-                <PerspectiveCamera makeDefault position={[200, 200, 200]} fov={50} />
-                <OrbitControls makeDefault />
+        <div
+            style={{
+                width: '100%',
+                height: '100%',
+                position: 'relative',
+                background: 'linear-gradient(180deg, #0f1115 0%, #0a0c10 100%)',
+            }}
+        >
+            {/* View Label */}
+            <div
+                style={{
+                    position: 'absolute',
+                    top: 'var(--space-md)',
+                    left: 'var(--space-md)',
+                    zIndex: 10,
+                    display: 'flex',
+                    gap: 'var(--space-sm)',
+                    alignItems: 'center',
+                }}
+            >
+                <div
+                    style={{
+                        background: 'var(--bg-glass)',
+                        backdropFilter: 'blur(8px)',
+                        padding: '4px 12px',
+                        borderRadius: 'var(--radius-md)',
+                        border: '1px solid var(--border-subtle)',
+                        fontSize: '0.8rem',
+                        fontWeight: 600,
+                        color: 'var(--text-primary)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 'var(--space-xs)',
+                    }}
+                >
+                    <Box size={14} />
+                    3D Reconstruction
+                </div>
+            </div>
+
+            {/* Controls Hint */}
+            <div
+                style={{
+                    position: 'absolute',
+                    bottom: 'var(--space-md)',
+                    left: 'var(--space-md)',
+                    zIndex: 10,
+                    display: 'flex',
+                    gap: 'var(--space-md)',
+                }}
+            >
+                <div
+                    style={{
+                        background: 'var(--bg-glass)',
+                        backdropFilter: 'blur(8px)',
+                        padding: '6px 10px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-subtle)',
+                        fontSize: '0.7rem',
+                        color: 'var(--text-muted)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 'var(--space-xs)',
+                    }}
+                >
+                    <RotateCcw size={12} />
+                    Drag to rotate
+                </div>
+                <div
+                    style={{
+                        background: 'var(--bg-glass)',
+                        backdropFilter: 'blur(8px)',
+                        padding: '6px 10px',
+                        borderRadius: 'var(--radius-sm)',
+                        border: '1px solid var(--border-subtle)',
+                        fontSize: '0.7rem',
+                        color: 'var(--text-muted)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 'var(--space-xs)',
+                    }}
+                >
+                    <Move3d size={12} />
+                    Scroll to zoom
+                </div>
+            </div>
+
+            {/* 3D Canvas */}
+            <Canvas
+                shadows
+                gl={{ antialias: true, alpha: true }}
+                style={{ background: 'transparent' }}
+            >
+                <PerspectiveCamera makeDefault position={[250, 200, 250]} fov={45} near={1} far={5000} />
+                <OrbitControls
+                    makeDefault
+                    enableDamping
+                    dampingFactor={0.05}
+                    minDistance={50}
+                    maxDistance={1000}
+                    rotateSpeed={0.8}
+                    zoomSpeed={1}
+                />
                 <SceneContent {...props} />
             </Canvas>
+
+            {/* Disclaimer */}
+            <div
+                style={{
+                    position: 'absolute',
+                    bottom: 'var(--space-md)',
+                    right: 'var(--space-md)',
+                    zIndex: 10,
+                    maxWidth: 280,
+                    background: 'rgba(239, 68, 68, 0.1)',
+                    border: '1px solid rgba(239, 68, 68, 0.3)',
+                    borderRadius: 'var(--radius-sm)',
+                    padding: 'var(--space-sm)',
+                    fontSize: '0.65rem',
+                    color: 'var(--accent-error)',
+                    lineHeight: 1.4,
+                }}
+            >
+                3D visualization is for research purposes only. Not intended for clinical diagnosis.
+            </div>
         </div>
     );
 };

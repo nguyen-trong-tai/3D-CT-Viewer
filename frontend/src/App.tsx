@@ -1,157 +1,341 @@
-import { useState } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { MainLayout } from './components/Layout/MainLayout';
 import { SliceViewer } from './components/CTViewer/SliceViewer';
+import { MPRLayout } from './components/CTViewer/MPRLayout';
 import { ModelViewer } from './components/MeshViewer/ModelViewer';
 import { PipelineVisualizer } from './components/Pipeline/PipelineVisualizer';
-import { RangeSlider, ToggleSwitch, IconButton } from './components/UI/Controls';
-import { ViewModeSelector, type ViewMode } from './components/UI/ViewModeSelector';
 import { UploadPage } from './components/Entry/UploadPage';
-import { PIPELINE_STEPS } from './types';
-import type { CaseMetadata, PipelineStep } from './types';
-import { FileText, Settings, Info, LogOut } from 'lucide-react';
+import {
+  RangeSlider,
+  ToggleSwitch,
+  SegmentedControl,
+  InfoRow,
+  Divider,
+  Button,
+} from './components/UI';
+import {
+  PIPELINE_STEPS,
+  WINDOW_PRESETS,
+  type CaseMetadata,
+  type PipelineStep,
+  type ViewMode,
+  type WindowPresetKey,
+} from './types';
+import { casesApi } from './services/api';
+import {
+  FileText,
+  Settings,
+  Layers,
+  Box,
+  Link2,
+  Info,
+  LogOut,
+  Eye,
+  Palette,
+} from 'lucide-react';
+
+type AppState = 'ENTRY' | 'VISUALIZATION';
 
 function App() {
-  // Application Flow State
-  const [appState, setAppState] = useState<'ENTRY' | 'VISUALIZATION'>('ENTRY');
-
-  // Global Data State
+  // Application state
+  const [appState, setAppState] = useState<AppState>('ENTRY');
   const [metadata, setMetadata] = useState<CaseMetadata | null>(null);
   const [pipelineSteps, setPipelineSteps] = useState<PipelineStep[]>(PIPELINE_STEPS);
 
-  // Viewer State
+  // Viewer state
   const [viewMode, setViewMode] = useState<ViewMode>('LINKED');
   const [sliceIndex, setSliceIndex] = useState(0);
-  const [showSegmentation, setShowSegmentation] = useState(true);
+  const [windowPreset, setWindowPreset] = useState<WindowPresetKey>('SOFT_TISSUE');
+  const [showSegmentation, setShowSegmentation] = useState(false);
   const [segmentationOpacity, setSegmentationOpacity] = useState(0.5);
-  const [windowPreset, setWindowPreset] = useState<'LUNG' | 'SOFT_TISSUE'>('SOFT_TISSUE');
-
-  // 3D State
   const [showWireframe, setShowWireframe] = useState(false);
 
-  // Update pipeline occasionally for demo effect (simulated)
+  // Fetch pipeline status when in visualization mode
+  useEffect(() => {
+    if (appState === 'VISUALIZATION' && metadata?.id) {
+      const fetchPipeline = async () => {
+        try {
+          const status = await casesApi.getPipelineStatus(metadata.id);
+          if (status.stages) {
+            setPipelineSteps(prev => prev.map(step => {
+              const backendStage = status.stages.find(s => s.name === step.id);
+              if (backendStage) {
+                return {
+                  ...step,
+                  status: backendStage.status === 'completed' ? 'completed' :
+                    backendStage.status === 'running' ? 'running' :
+                      backendStage.status === 'failed' ? 'failed' : 'pending'
+                } as PipelineStep;
+              }
+              return step;
+            }));
+          }
+        } catch {
+          // Status endpoint may not be available, just mark as completed
+          setPipelineSteps(prev => prev.map(s => ({ ...s, status: 'completed' as const })));
+        }
+      };
+      fetchPipeline();
+    }
+  }, [appState, metadata?.id]);
 
-  const handleUploadComplete = (meta: CaseMetadata) => {
+  // Handle upload completion
+  const handleUploadComplete = useCallback((meta: CaseMetadata) => {
     setMetadata(meta);
     setSliceIndex(Math.floor(meta.totalSlices / 2));
     setAppState('VISUALIZATION');
 
-    // Mark all steps as completed since we waited for processing in UploadPage
-    setPipelineSteps(PIPELINE_STEPS.map(s => ({ ...s, status: 'completed' })));
-  };
+    // Mark pipeline as completed
+    setPipelineSteps((steps) =>
+      steps.map((s) => ({ ...s, status: 'completed' as const }))
+    );
+  }, []);
 
-  const handleReset = () => {
-    if (confirm("Are you sure you want to load a new case? Current progress will be lost.")) {
+  // Handle case reset
+  const handleReset = useCallback(() => {
+    if (confirm('Are you sure you want to load a new case? Current progress will be lost.')) {
       setMetadata(null);
       setAppState('ENTRY');
+      setPipelineSteps(PIPELINE_STEPS);
     }
-  };
+  }, []);
 
+  // View mode options
+  const viewModeOptions = [
+    { value: '2D' as const, label: '2D', icon: <Layers size={14} /> },
+    { value: 'LINKED' as const, label: 'Linked', icon: <Link2 size={14} /> },
+    { value: '3D' as const, label: '3D', icon: <Box size={14} /> },
+  ];
+
+  // Window preset options
+  const windowPresetOptions = Object.entries(WINDOW_PRESETS).map(([key, preset]) => ({
+    value: key as WindowPresetKey,
+    label: preset.name,
+  }));
+
+  // Sidebar content
   const sidebarContent = (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '32px' }}>
-
-      {/* Case Management */}
-      <div>
-        <h3 style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <FileText size={18} color="var(--accent-primary)" />
-          Case Info
-        </h3>
-        <div className="card" style={{ fontSize: '0.85rem' }}>
-          {metadata ? (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-              <span style={{ color: 'var(--text-scnd)' }}>ID:</span>
-              <span style={{ textAlign: 'right', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{metadata.id}</span>
-              <span style={{ color: 'var(--text-scnd)' }}>Slices:</span>
-              <span style={{ textAlign: 'right' }}>{metadata.totalSlices}</span>
-              <span style={{ color: 'var(--text-scnd)' }}>Dims:</span>
-              <span style={{ textAlign: 'right' }}>{metadata.dimensions.join('x')}</span>
-              <span style={{ color: 'var(--text-scnd)' }}>Spacing:</span>
-              <span style={{ textAlign: 'right' }}>{metadata.voxelSpacing.map(v => v.toFixed(1)).join(', ')}</span>
-            </div>
-          ) : (
-            <div style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>No active case</div>
-          )}
-
-          <div style={{ borderTop: '1px solid var(--border-subtle)', marginTop: '16px', paddingTop: '16px' }}>
-            <button className="secondary" style={{ width: '100%', fontSize: '0.85rem' }} onClick={handleReset}>
-              <LogOut size={14} style={{ marginRight: '8px' }} />
-              Load New Case
-            </button>
-          </div>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-lg)', height: '100%' }}>
+      {/* Case Info Section */}
+      <section>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+            marginBottom: 'var(--space-md)',
+          }}
+        >
+          <FileText size={16} color="var(--accent-primary)" />
+          <h4 style={{ margin: 0 }}>Case Information</h4>
         </div>
-      </div>
-
-      {/* View Settings */}
-      <div>
-        <h3 style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <Settings size={18} color="var(--accent-primary)" />
-          View Settings
-        </h3>
-
-        <ViewModeSelector mode={viewMode} onChange={setViewMode} />
 
         <div className="card">
-          <h4 style={{ fontSize: '0.8rem', marginBottom: '12px', color: 'var(--text-scnd)' }}>CT Visualization</h4>
+          {metadata ? (
+            <>
+              <InfoRow label="Case ID" value={metadata.id.slice(0, 12) + '...'} mono />
+              <InfoRow label="Slices" value={metadata.totalSlices} mono />
+              <InfoRow label="Dimensions" value={metadata.dimensions.join(' × ')} mono />
+              <InfoRow
+                label="Spacing (mm)"
+                value={metadata.voxelSpacing.map((v) => v.toFixed(2)).join(' × ')}
+                mono
+              />
+              {metadata.huRange && (
+                <InfoRow
+                  label="HU Range"
+                  value={`${metadata.huRange.min.toFixed(0)} ~ ${metadata.huRange.max.toFixed(0)}`}
+                  mono
+                />
+              )}
+              <Divider spacing="sm" />
+              <Button
+                variant="ghost"
+                fullWidth
+                icon={<LogOut size={14} />}
+                onClick={handleReset}
+                style={{ justifyContent: 'flex-start' }}
+              >
+                Load New Case
+              </Button>
+            </>
+          ) : (
+            <div style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
+              No active case
+            </div>
+          )}
+        </div>
+      </section>
 
-          <div style={{ marginBottom: '16px', display: 'flex', gap: '8px' }}>
-            <IconButton
-              active={windowPreset === 'SOFT_TISSUE'}
-              onClick={() => setWindowPreset('SOFT_TISSUE')}
-              style={{ flex: 1, fontSize: '0.8rem' }}
-              disabled={viewMode === '3D'}
+      {/* View Settings Section */}
+      <section>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+            marginBottom: 'var(--space-md)',
+          }}
+        >
+          <Settings size={16} color="var(--accent-primary)" />
+          <h4 style={{ margin: 0 }}>View Settings</h4>
+        </div>
+
+        <div style={{ marginBottom: 'var(--space-md)' }}>
+          <label style={{ marginBottom: 'var(--space-sm)' }}>Layout</label>
+          <SegmentedControl
+            options={viewModeOptions}
+            value={viewMode}
+            onChange={setViewMode}
+          />
+        </div>
+
+        <div className="card">
+          {/* CT Visualization Controls */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--space-sm)',
+              marginBottom: 'var(--space-md)',
+            }}
+          >
+            <Eye size={14} color="var(--text-muted)" />
+            <span
+              style={{
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                color: 'var(--text-muted)',
+                letterSpacing: '0.05em',
+              }}
             >
-              Soft Tissue
-            </IconButton>
-            <IconButton
-              active={windowPreset === 'LUNG'}
-              onClick={() => setWindowPreset('LUNG')}
-              style={{ flex: 1, fontSize: '0.8rem' }}
-              disabled={viewMode === '3D'}
-            >
-              Lung
-            </IconButton>
+              CT Visualization
+            </span>
+          </div>
+
+          <div style={{ marginBottom: 'var(--space-md)' }}>
+            <label style={{ marginBottom: 'var(--space-sm)' }}>Window Preset</label>
+            <div style={{ display: 'flex', gap: 'var(--space-xs)', flexWrap: 'wrap' }}>
+              {windowPresetOptions.slice(0, 3).map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => setWindowPreset(opt.value)}
+                  disabled={viewMode === '3D'}
+                  style={{
+                    flex: 1,
+                    padding: 'var(--space-sm)',
+                    fontSize: '0.8rem',
+                    background:
+                      windowPreset === opt.value
+                        ? 'var(--accent-primary)'
+                        : 'var(--bg-element)',
+                    borderColor:
+                      windowPreset === opt.value
+                        ? 'var(--accent-primary)'
+                        : 'var(--border-subtle)',
+                    color: windowPreset === opt.value ? 'white' : 'var(--text-secondary)',
+                    opacity: viewMode === '3D' ? 0.5 : 1,
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
 
           <ToggleSwitch
-            label="Show Segmentation"
+            label="Segmentation Overlay"
             checked={showSegmentation}
             onChange={setShowSegmentation}
-            disabled={viewMode === '3D'} // Example constraint
+            disabled={viewMode === '3D'}
+            description="Show segmented regions"
           />
+
           {showSegmentation && (
             <RangeSlider
-              label="Opacity"
-              min={0} max={1} step={0.1}
+              label="Overlay Opacity"
+              min={0}
+              max={1}
+              step={0.1}
               value={segmentationOpacity}
+              valueDisplay={Math.round(segmentationOpacity * 100) + '%'}
               onChange={(e) => setSegmentationOpacity(parseFloat(e.target.value))}
               disabled={viewMode === '3D'}
             />
           )}
 
-          <div style={{ height: '1px', background: 'var(--border-subtle)', margin: '16px 0' }} />
+          <Divider />
 
-          <h4 style={{ fontSize: '0.8rem', marginBottom: '12px', color: 'var(--text-scnd)' }}>3D Rendering</h4>
+          {/* 3D Controls */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--space-sm)',
+              marginBottom: 'var(--space-md)',
+            }}
+          >
+            <Palette size={14} color="var(--text-muted)" />
+            <span
+              style={{
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                color: 'var(--text-muted)',
+                letterSpacing: '0.05em',
+              }}
+            >
+              3D Rendering
+            </span>
+          </div>
+
           <ToggleSwitch
-            label="Wireframe Mesh"
+            label="Wireframe Mode"
             checked={showWireframe}
             onChange={setShowWireframe}
             disabled={viewMode === '2D'}
+            description="Show mesh structure"
           />
         </div>
-      </div>
+      </section>
 
       {/* Pipeline Status */}
-      <PipelineVisualizer steps={pipelineSteps} />
+      <section>
+        <PipelineVisualizer steps={pipelineSteps} />
+      </section>
+
+      {/* Spacer */}
+      <div style={{ flex: 1 }} />
 
       {/* Disclaimer */}
-      <div style={{ marginTop: 'auto', padding: '12px', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: '8px', display: 'flex', gap: '12px' }}>
-        <Info color="var(--accent-error)" size={20} style={{ flexShrink: 0 }} />
-        <small style={{ color: 'var(--accent-error)', lineHeight: 1.4 }}>
-          This system is for research and educational demonstration only. It is not intended for clinical diagnosis.
-        </small>
-      </div>
+      <section
+        style={{
+          padding: 'var(--space-md)',
+          background: 'rgba(239, 68, 68, 0.08)',
+          border: '1px solid rgba(239, 68, 68, 0.2)',
+          borderRadius: 'var(--radius-md)',
+        }}
+      >
+        <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'flex-start' }}>
+          <Info size={16} color="var(--accent-error)" style={{ flexShrink: 0, marginTop: 2 }} />
+          <p
+            style={{
+              fontSize: '0.75rem',
+              color: 'var(--accent-error)',
+              lineHeight: 1.5,
+              margin: 0,
+            }}
+          >
+            This system is for research and educational purposes only. Not intended for clinical
+            diagnosis.
+          </p>
+        </div>
+      </section>
     </div>
   );
 
+  // Render upload page or main viewer
   if (appState === 'ENTRY') {
     return <UploadPage onUploadComplete={handleUploadComplete} />;
   }
@@ -162,17 +346,38 @@ function App() {
       sidebar={sidebarContent}
       viewer2D={
         metadata ? (
-          <SliceViewer
-            caseId={metadata.id}
-            totalSlices={metadata.totalSlices}
-            currentIndex={sliceIndex}
-            onIndexChange={setSliceIndex}
-            showSegmentation={showSegmentation}
-            segmentationOpacity={segmentationOpacity}
-            windowPreset={windowPreset}
-          />
+          viewMode === 'LINKED' ? (
+            // MPR Layout with synchronized Axial, Sagittal, Coronal views
+            <MPRLayout
+              caseId={metadata.id}
+              windowPreset={windowPreset}
+              showSegmentation={showSegmentation}
+              segmentationOpacity={segmentationOpacity}
+            />
+          ) : (
+            // Single axial view for 2D mode
+            <SliceViewer
+              caseId={metadata.id}
+              totalSlices={metadata.totalSlices}
+              currentIndex={sliceIndex}
+              onIndexChange={setSliceIndex}
+              showControls={true}
+              viewLabel="Axial CT"
+            />
+          )
         ) : (
-          <div className="flex-center full-size">Initializing...</div>
+          <div
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--text-muted)',
+            }}
+          >
+            Initializing viewer...
+          </div>
         )
       }
       viewer3D={
@@ -183,6 +388,7 @@ function App() {
             voxelSpacing={metadata.voxelSpacing}
             showWireframe={showWireframe}
             totalSlices={metadata.totalSlices}
+            showSliceIndicator={true}
           />
         ) : null
       }
