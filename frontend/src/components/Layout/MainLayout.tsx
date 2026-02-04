@@ -1,5 +1,5 @@
-import React, { type ReactNode } from 'react';
-import { Activity } from 'lucide-react';
+import React, { useState, type ReactNode } from 'react';
+import { Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
 import type { ViewMode } from '../../types';
 
 interface MainLayoutProps {
@@ -13,7 +13,7 @@ interface MainLayoutProps {
  * Main Layout Component
  * Provides the overall structure for the viewer:
  * - Header with branding and status
- * - Sidebar for controls
+ * - Collapsible sidebar for controls
  * - Main content area with 2D/3D viewers
  */
 export const MainLayout: React.FC<MainLayoutProps> = ({
@@ -22,6 +22,12 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
     viewer3D,
     viewMode,
 }) => {
+    const [sidebarOpen, setSidebarOpen] = useState(true);
+
+    const toggleSidebar = () => {
+        setSidebarOpen(prev => !prev);
+    };
+
     return (
         <div
             style={{
@@ -45,6 +51,39 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                     zIndex: 20,
                 }}
             >
+                {/* Sidebar Toggle Button */}
+                <button
+                    onClick={toggleSidebar}
+                    title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+                    aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: 36,
+                        height: 36,
+                        borderRadius: 'var(--radius-md)',
+                        background: 'var(--bg-element)',
+                        border: '1px solid var(--border-subtle)',
+                        color: 'var(--text-secondary)',
+                        cursor: 'pointer',
+                        marginRight: 'var(--space-md)',
+                        transition: 'all var(--transition-fast)',
+                    }}
+                    onMouseEnter={(e) => {
+                        e.currentTarget.style.background = 'var(--bg-element-hover)';
+                        e.currentTarget.style.borderColor = 'var(--border-default)';
+                        e.currentTarget.style.color = 'var(--text-primary)';
+                    }}
+                    onMouseLeave={(e) => {
+                        e.currentTarget.style.background = 'var(--bg-element)';
+                        e.currentTarget.style.borderColor = 'var(--border-subtle)';
+                        e.currentTarget.style.color = 'var(--text-secondary)';
+                    }}
+                >
+                    {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeft size={18} />}
+                </button>
+
                 {/* Logo & Title */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
                     <div
@@ -125,17 +164,29 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                 {/* Sidebar */}
                 <aside
                     style={{
-                        width: 320,
-                        minWidth: 320,
+                        width: sidebarOpen ? 320 : 0,
+                        minWidth: sidebarOpen ? 320 : 0,
                         background: 'var(--bg-panel)',
-                        borderRight: '1px solid var(--border-subtle)',
+                        borderRight: sidebarOpen ? '1px solid var(--border-subtle)' : 'none',
                         display: 'flex',
                         flexDirection: 'column',
-                        overflowY: 'auto',
-                        overflowX: 'hidden',
+                        overflow: 'hidden',
+                        transition: 'width var(--transition-slow), min-width var(--transition-slow), border-right var(--transition-slow)',
                     }}
                 >
-                    <div style={{ padding: 'var(--space-lg)', flex: 1 }}>{sidebar}</div>
+                    <div
+                        style={{
+                            padding: 'var(--space-lg)',
+                            flex: 1,
+                            overflowY: 'auto',
+                            overflowX: 'hidden',
+                            opacity: sidebarOpen ? 1 : 0,
+                            transition: 'opacity var(--transition-fast)',
+                            pointerEvents: sidebarOpen ? 'auto' : 'none',
+                        }}
+                    >
+                        {sidebar}
+                    </div>
                 </aside>
 
                 {/* Viewers */}

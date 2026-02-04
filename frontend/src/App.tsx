@@ -32,6 +32,7 @@ import {
   LogOut,
   Eye,
   Palette,
+  SlidersHorizontal,
 } from 'lucide-react';
 
 type AppState = 'ENTRY' | 'VISUALIZATION';
@@ -43,12 +44,27 @@ function App() {
   const [pipelineSteps, setPipelineSteps] = useState<PipelineStep[]>(PIPELINE_STEPS);
 
   // Viewer state
-  const [viewMode, setViewMode] = useState<ViewMode>('LINKED');
+  const [viewMode, setViewMode] = useState<ViewMode>('2D');
   const [sliceIndex, setSliceIndex] = useState(0);
   const [windowPreset, setWindowPreset] = useState<WindowPresetKey>('SOFT_TISSUE');
   const [showSegmentation, setShowSegmentation] = useState(false);
   const [segmentationOpacity, setSegmentationOpacity] = useState(0.5);
   const [showWireframe, setShowWireframe] = useState(false);
+
+  // Custom window/level for manual HU adjustment
+  const [useCustomWindow, setUseCustomWindow] = useState(false);
+  const [customWindowLevel, setCustomWindowLevel] = useState(40);
+  const [customWindowWidth, setCustomWindowWidth] = useState(400);
+
+  // Handler to apply a preset and sync custom values
+  const handlePresetChange = useCallback((preset: WindowPresetKey) => {
+    setWindowPreset(preset);
+    setUseCustomWindow(false);
+    // Also sync custom sliders to preset values for smooth transition
+    const presetValues = WINDOW_PRESETS[preset];
+    setCustomWindowLevel(presetValues.windowLevel);
+    setCustomWindowWidth(presetValues.windowWidth);
+  }, []);
 
   // Fetch pipeline status when in visualization mode
   useEffect(() => {
@@ -220,21 +236,21 @@ function App() {
               {windowPresetOptions.slice(0, 3).map((opt) => (
                 <button
                   key={opt.value}
-                  onClick={() => setWindowPreset(opt.value)}
+                  onClick={() => handlePresetChange(opt.value)}
                   disabled={viewMode === '3D'}
                   style={{
                     flex: 1,
                     padding: 'var(--space-sm)',
                     fontSize: '0.8rem',
                     background:
-                      windowPreset === opt.value
+                      !useCustomWindow && windowPreset === opt.value
                         ? 'var(--accent-primary)'
                         : 'var(--bg-element)',
                     borderColor:
-                      windowPreset === opt.value
+                      !useCustomWindow && windowPreset === opt.value
                         ? 'var(--accent-primary)'
                         : 'var(--border-subtle)',
-                    color: windowPreset === opt.value ? 'white' : 'var(--text-secondary)',
+                    color: !useCustomWindow && windowPreset === opt.value ? 'white' : 'var(--text-secondary)',
                     opacity: viewMode === '3D' ? 0.5 : 1,
                   }}
                 >
@@ -243,6 +259,78 @@ function App() {
               ))}
             </div>
           </div>
+
+          {/* Manual Window/Level Controls */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 'var(--space-sm)',
+              marginBottom: 'var(--space-sm)',
+              marginTop: 'var(--space-sm)',
+            }}
+          >
+            <SlidersHorizontal size={14} color="var(--text-muted)" />
+            <span
+              style={{
+                fontSize: '0.75rem',
+                fontWeight: 600,
+                textTransform: 'uppercase',
+                color: 'var(--text-muted)',
+                letterSpacing: '0.05em',
+              }}
+            >
+              Manual Adjustment
+            </span>
+          </div>
+
+          <ToggleSwitch
+            label="Custom Window/Level"
+            checked={useCustomWindow}
+            onChange={setUseCustomWindow}
+            disabled={viewMode === '3D'}
+            description="Manually adjust HU range"
+          />
+
+          {useCustomWindow && (
+            <>
+              <RangeSlider
+                label="Window Level (Center)"
+                min={-1000}
+                max={1000}
+                step={10}
+                value={customWindowLevel}
+                valueDisplay={`${customWindowLevel} HU`}
+                onChange={(e) => setCustomWindowLevel(parseInt(e.target.value))}
+                disabled={viewMode === '3D'}
+              />
+              <RangeSlider
+                label="Window Width (Range)"
+                min={50}
+                max={4000}
+                step={50}
+                value={customWindowWidth}
+                valueDisplay={`${customWindowWidth} HU`}
+                onChange={(e) => setCustomWindowWidth(parseInt(e.target.value))}
+                disabled={viewMode === '3D'}
+              />
+              <div
+                style={{
+                  padding: 'var(--space-sm)',
+                  background: 'var(--bg-element)',
+                  borderRadius: 'var(--radius-sm)',
+                  fontSize: '0.7rem',
+                  color: 'var(--text-muted)',
+                  fontFamily: 'var(--font-mono)',
+                  marginTop: 'var(--space-xs)',
+                }}
+              >
+                HU Range: {customWindowLevel - customWindowWidth / 2} to {customWindowLevel + customWindowWidth / 2}
+              </div>
+            </>
+          )}
+
+          <Divider spacing="sm" />
 
           <ToggleSwitch
             label="Segmentation Overlay"
@@ -353,6 +441,9 @@ function App() {
               windowPreset={windowPreset}
               showSegmentation={showSegmentation}
               segmentationOpacity={segmentationOpacity}
+              useCustomWindow={useCustomWindow}
+              customWindowLevel={customWindowLevel}
+              customWindowWidth={customWindowWidth}
             />
           ) : (
             // Single axial view for 2D mode
@@ -363,6 +454,12 @@ function App() {
               onIndexChange={setSliceIndex}
               showControls={true}
               viewLabel="Axial CT"
+              windowPreset={windowPreset}
+              showSegmentation={showSegmentation}
+              segmentationOpacity={segmentationOpacity}
+              useCustomWindow={useCustomWindow}
+              customWindowLevel={customWindowLevel}
+              customWindowWidth={customWindowWidth}
             />
           )
         ) : (

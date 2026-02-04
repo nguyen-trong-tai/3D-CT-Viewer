@@ -132,11 +132,6 @@ async def upload_dicom_files(
     """
     Upload multiple DICOM files in a single request.
     
-    This is the FASTEST way to upload a DICOM folder:
-    - Only 1 API call required
-    - Files are processed in parallel
-    - Typical processing time: <2s for standard datasets
-    
     Args:
         files: List of .dcm files
         metadata: Optional JSON string with additional metadata (patient info, etc.)
@@ -234,9 +229,7 @@ async def upload_dicom_files(
         raise HTTPException(status_code=500, detail=f"DICOM upload failed: {str(e)}")
 
 
-# =============================================================================
 # Batch Upload Endpoints (Alternative approach for large uploads)
-# =============================================================================
 
 @router.post("/cases/batch/init", response_model=CaseResponse, summary="Initialize batch upload")
 async def init_batch_upload(repo: CaseRepository = Depends(get_repository)):

@@ -1,13 +1,3 @@
-/**
- * Optimized Volume Viewer Hook
- * 
- * PRD Requirements:
- * - Near-zero latency slice navigation (memory-based, no API calls during scroll)
- * - GPU-ready data formats
- * - Full volume caching
- * 
- * OPTIMIZATION: Uses direct ImageData rendering instead of base64 encoding
- */
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { ctApi, maskApi } from '../services/api';
@@ -340,6 +330,96 @@ export function useVolumeViewer(caseId: string | null) {
     }, [volume, getViewDimensions, windowPreset]);
 
     /**
+     * Render slice with custom window level/width (for real-time manual adjustment)
+     * Does NOT use caching to ensure immediate updates
+     */
+    const renderSliceWithCustomWindow = useCallback((
+        view: MPRView,
+        index: number,
+        windowLevel: number,
+        windowWidth: number
+    ): ImageData | null => {
+        if (!volume) return null;
+
+        const dims = getViewDimensions(view);
+        if (!dims) return null;
+
+        const { width, height } = dims;
+        const [dimX, dimY, dimZ] = volume.shape;
+        const data = volume.data;
+
+        const minHU = windowLevel - windowWidth / 2;
+        const invRange = 255 / windowWidth;
+
+        const imageData = new ImageData(width, height);
+        const pixels = imageData.data;
+
+        const strideX = dimY * dimZ;
+        const strideY = dimZ;
+
+        switch (view) {
+            case 'AXIAL': {
+                if (index < 0 || index >= dimZ) return null;
+                for (let y = 0; y < dimY; y++) {
+                    for (let x = 0; x < dimX; x++) {
+                        const srcIdx = x * strideX + y * strideY + index;
+                        const hu = data[srcIdx];
+                        let val = (hu - minHU) * invRange;
+                        val = val < 0 ? 0 : val > 255 ? 255 : val;
+
+                        const dstIdx = (x + y * width) << 2;
+                        pixels[dstIdx] = val;
+                        pixels[dstIdx + 1] = val;
+                        pixels[dstIdx + 2] = val;
+                        pixels[dstIdx + 3] = 255;
+                    }
+                }
+                break;
+            }
+
+            case 'CORONAL': {
+                if (index < 0 || index >= dimY) return null;
+                for (let z = 0; z < dimZ; z++) {
+                    for (let x = 0; x < dimX; x++) {
+                        const srcIdx = x * strideX + index * strideY + z;
+                        const hu = data[srcIdx];
+                        let val = (hu - minHU) * invRange;
+                        val = val < 0 ? 0 : val > 255 ? 255 : val;
+
+                        const dstIdx = (x + (dimZ - 1 - z) * width) << 2;
+                        pixels[dstIdx] = val;
+                        pixels[dstIdx + 1] = val;
+                        pixels[dstIdx + 2] = val;
+                        pixels[dstIdx + 3] = 255;
+                    }
+                }
+                break;
+            }
+
+            case 'SAGITTAL': {
+                if (index < 0 || index >= dimX) return null;
+                for (let z = 0; z < dimZ; z++) {
+                    for (let y = 0; y < dimY; y++) {
+                        const srcIdx = index * strideX + y * strideY + z;
+                        const hu = data[srcIdx];
+                        let val = (hu - minHU) * invRange;
+                        val = val < 0 ? 0 : val > 255 ? 255 : val;
+
+                        const dstIdx = (y + (dimZ - 1 - z) * width) << 2;
+                        pixels[dstIdx] = val;
+                        pixels[dstIdx + 1] = val;
+                        pixels[dstIdx + 2] = val;
+                        pixels[dstIdx + 3] = 255;
+                    }
+                }
+                break;
+            }
+        }
+
+        return imageData;
+    }, [volume, getViewDimensions]);
+
+    /**
      * Render mask slice to ImageData
      */
     const renderMaskSliceToImageData = useCallback((
@@ -556,6 +636,7 @@ export function useVolumeViewer(caseId: string | null) {
 
         // Direct ImageData rendering (NO base64!)
         renderSliceToImageData,
+        renderSliceWithCustomWindow,
         renderMaskSliceToImageData,
     };
 }

@@ -9,6 +9,10 @@ interface MPRLayoutProps {
     showSegmentation: boolean;
     segmentationOpacity: number;
     onWindowPresetChange?: (preset: WindowPresetKey) => void;
+    // Custom window for manual HU adjustment
+    useCustomWindow?: boolean;
+    customWindowLevel?: number;
+    customWindowWidth?: number;
 }
 
 const VIEW_LABELS: Record<MPRView, string> = {
@@ -25,7 +29,6 @@ const VIEW_COLORS: Record<MPRView, string> = {
 
 /**
  * Single MPR View Panel with Direct Canvas Rendering
- * NO base64 encoding - renders ImageData directly to canvas
  */
 const MPRViewPanel: React.FC<{
     view: MPRView;
@@ -339,6 +342,9 @@ export const MPRLayout: React.FC<MPRLayoutProps> = ({
     windowPreset,
     showSegmentation,
     segmentationOpacity,
+    useCustomWindow = false,
+    customWindowLevel = 40,
+    customWindowWidth = 400,
 }) => {
     const {
         volume,
@@ -350,6 +356,7 @@ export const MPRLayout: React.FC<MPRLayoutProps> = ({
         setCrosshair,
         handleScroll,
         renderSliceToImageData,
+        renderSliceWithCustomWindow,
         renderMaskSliceToImageData,
         getViewDimensions,
         setWindowPreset,
@@ -368,21 +375,27 @@ export const MPRLayout: React.FC<MPRLayoutProps> = ({
         setMaskOpacity(segmentationOpacity);
     }, [showSegmentation, segmentationOpacity, setShowMask, setMaskOpacity]);
 
-    // Render slices (memoized for performance)
-    const axialImage = useMemo(() =>
-        isLoaded ? renderSliceToImageData('AXIAL', crosshair.z, windowPreset) : null,
-        [isLoaded, crosshair.z, windowPreset, renderSliceToImageData]
-    );
+    // Render slices (use custom window if enabled)
+    const axialImage = useMemo(() => {
+        if (!isLoaded) return null;
+        return useCustomWindow
+            ? renderSliceWithCustomWindow('AXIAL', crosshair.z, customWindowLevel, customWindowWidth)
+            : renderSliceToImageData('AXIAL', crosshair.z, windowPreset);
+    }, [isLoaded, crosshair.z, windowPreset, useCustomWindow, customWindowLevel, customWindowWidth, renderSliceToImageData, renderSliceWithCustomWindow]);
 
-    const sagittalImage = useMemo(() =>
-        isLoaded ? renderSliceToImageData('SAGITTAL', crosshair.x, windowPreset) : null,
-        [isLoaded, crosshair.x, windowPreset, renderSliceToImageData]
-    );
+    const sagittalImage = useMemo(() => {
+        if (!isLoaded) return null;
+        return useCustomWindow
+            ? renderSliceWithCustomWindow('SAGITTAL', crosshair.x, customWindowLevel, customWindowWidth)
+            : renderSliceToImageData('SAGITTAL', crosshair.x, windowPreset);
+    }, [isLoaded, crosshair.x, windowPreset, useCustomWindow, customWindowLevel, customWindowWidth, renderSliceToImageData, renderSliceWithCustomWindow]);
 
-    const coronalImage = useMemo(() =>
-        isLoaded ? renderSliceToImageData('CORONAL', crosshair.y, windowPreset) : null,
-        [isLoaded, crosshair.y, windowPreset, renderSliceToImageData]
-    );
+    const coronalImage = useMemo(() => {
+        if (!isLoaded) return null;
+        return useCustomWindow
+            ? renderSliceWithCustomWindow('CORONAL', crosshair.y, customWindowLevel, customWindowWidth)
+            : renderSliceToImageData('CORONAL', crosshair.y, windowPreset);
+    }, [isLoaded, crosshair.y, windowPreset, useCustomWindow, customWindowLevel, customWindowWidth, renderSliceToImageData, renderSliceWithCustomWindow]);
 
     // Mask slices
     const axialMask = useMemo(() =>

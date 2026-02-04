@@ -11,14 +11,17 @@ interface SliceViewerProps {
     showControls?: boolean;
     viewLabel?: string;
     windowPreset?: WindowPresetKey;
+    showSegmentation?: boolean;
+    segmentationOpacity?: number;
+    // Custom window for manual HU adjustment
+    useCustomWindow?: boolean;
+    customWindowLevel?: number;
+    customWindowWidth?: number;
 }
 
 /**
  * CT Slice Viewer Component (Single Axial View)
- * 
- * Uses useVolumeViewer for memory-based slice navigation
- * - No API calls during scrolling
- * - Direct canvas rendering for zero latency
+ * Supports window presets, custom window values, and segmentation overlay
  */
 export const SliceViewer: React.FC<SliceViewerProps> = ({
     caseId,
@@ -26,9 +29,15 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     showControls = true,
     viewLabel = 'Axial',
     windowPreset = 'SOFT_TISSUE',
+    showSegmentation = false,
+    segmentationOpacity = 0.5,
+    useCustomWindow = false,
+    customWindowLevel = 40,
+    customWindowWidth = 400,
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const maskCanvasRef = useRef<HTMLCanvasElement>(null);
     const [zoom, setZoom] = useState(1);
     const [pan, setPan] = useState({ x: 0, y: 0 });
     const [isDragging, setIsDragging] = useState(false);
@@ -43,8 +52,11 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         setCrosshair,
         handleScroll,
         renderSliceToImageData,
+        renderSliceWithCustomWindow,
+        renderMaskSliceToImageData,
         getViewDimensions,
         setWindowPreset: setHookWindowPreset,
+        hasMask,
     } = useVolumeViewer(caseId);
 
     // Sync window preset - use ref to avoid re-render loop
@@ -56,9 +68,17 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         }
     }, [windowPreset, setHookWindowPreset]);
 
-    // Render slice to canvas
-    const imageData = isLoaded ? renderSliceToImageData('AXIAL', crosshair.z, windowPreset) : null;
+    // Render slice to canvas - use custom window if enabled
+    const imageData = isLoaded
+        ? (useCustomWindow
+            ? renderSliceWithCustomWindow('AXIAL', crosshair.z, customWindowLevel, customWindowWidth)
+            : renderSliceToImageData('AXIAL', crosshair.z, windowPreset))
+        : null;
+    const maskImageData = isLoaded && showSegmentation && hasMask
+        ? renderMaskSliceToImageData('AXIAL', crosshair.z)
+        : null;
 
+    // Render CT slice
     useEffect(() => {
         if (!imageData || !canvasRef.current) return;
 
@@ -73,6 +93,31 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
             ctx.putImageData(imageData, 0, 0);
         }
     }, [imageData]);
+
+    // Render mask overlay
+    useEffect(() => {
+        if (!maskCanvasRef.current) return;
+
+        const maskCanvas = maskCanvasRef.current;
+        const ctx = maskCanvas.getContext('2d', { alpha: true });
+        if (!ctx) return;
+
+        if (maskImageData && showSegmentation) {
+            // Resize mask canvas to match
+            if (maskCanvas.width !== maskImageData.width || maskCanvas.height !== maskImageData.height) {
+                maskCanvas.width = maskImageData.width;
+                maskCanvas.height = maskImageData.height;
+            }
+
+            // Clear and draw mask
+            ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+            ctx.globalAlpha = segmentationOpacity;
+            ctx.putImageData(maskImageData, 0, 0);
+        } else {
+            // Clear mask when not showing
+            ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        }
+    }, [maskImageData, showSegmentation, segmentationOpacity]);
 
     const dims = getViewDimensions('AXIAL');
     const sliceCount = dims?.maxSlice || totalSlices;
@@ -194,6 +239,61 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                 {viewLabel}
             </div>
 
+            {/* Window Preset Badge */}
+            <div
+                style={{
+                    position: 'absolute',
+                    top: 8,
+                    left: 80,
+                    zIndex: 10,
+                    background: useCustomWindow ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0,0,0,0.7)',
+                    backdropFilter: 'blur(4px)',
+                    padding: '4px 8px',
+                    borderRadius: 4,
+                    fontSize: '0.65rem',
+                    fontWeight: 500,
+                    color: useCustomWindow ? '#3b82f6' : '#94a3b8',
+                    border: useCustomWindow ? '1px solid rgba(59, 130, 246, 0.4)' : '1px solid rgba(255,255,255,0.1)',
+                }}
+            >
+                {useCustomWindow
+                    ? `WL: ${customWindowLevel} / WW: ${customWindowWidth}`
+                    : windowPreset.replace('_', ' ')}
+            </div>
+
+            {/* Segmentation Indicator */}
+            {showSegmentation && hasMask && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 36,
+                        left: 8,
+                        zIndex: 10,
+                        background: 'rgba(239, 68, 68, 0.2)',
+                        backdropFilter: 'blur(4px)',
+                        padding: '3px 8px',
+                        borderRadius: 4,
+                        fontSize: '0.65rem',
+                        fontWeight: 500,
+                        color: '#ef4444',
+                        border: '1px solid rgba(239, 68, 68, 0.4)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4,
+                    }}
+                >
+                    <span
+                        style={{
+                            width: 6,
+                            height: 6,
+                            borderRadius: '50%',
+                            background: '#ef4444',
+                        }}
+                    />
+                    Segmentation {Math.round(segmentationOpacity * 100)}%
+                </div>
+            )}
+
             {/* Slice Counter */}
             <div
                 style={{
@@ -233,11 +333,26 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         transition: isDragging ? 'none' : 'transform 0.1s ease-out',
                     }}
                 >
+                    {/* CT Canvas (base layer) */}
                     <canvas
                         ref={canvasRef}
                         style={{
                             display: 'block',
                             imageRendering: 'pixelated',
+                        }}
+                    />
+
+                    {/* Mask Overlay Canvas */}
+                    <canvas
+                        ref={maskCanvasRef}
+                        style={{
+                            position: 'absolute',
+                            top: 0,
+                            left: 0,
+                            display: 'block',
+                            imageRendering: 'pixelated',
+                            pointerEvents: 'none',
+                            mixBlendMode: 'normal',
                         }}
                     />
                 </div>

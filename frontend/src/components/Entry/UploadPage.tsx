@@ -238,10 +238,10 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             setUploadState('ready');
                             setProgressLabel('Complete!');
 
-                            // Auto-navigate after delay
-                            setTimeout(() => {
-                                onUploadComplete(newMeta);
-                            }, 1500);
+                            // // Auto-navigate after delay
+                            // setTimeout(() => {
+                            //     onUploadComplete(newMeta);
+                            // }, 2000);
 
                         } else if (pipelineStatus.overall_status === 'error') {
                             clearInterval(pollInterval);

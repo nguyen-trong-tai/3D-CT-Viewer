@@ -1,11 +1,11 @@
-import React, { Suspense, useMemo } from 'react';
-import { Canvas, useLoader } from '@react-three/fiber';
+import React, { Suspense, useMemo, useState, useCallback, useRef, useEffect } from 'react';
+import { Canvas, useLoader, useThree } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, Grid, Environment } from '@react-three/drei';
 import * as THREE from 'three';
 // @ts-ignore
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
 import { meshApi } from '../../services/api';
-import { Box, RotateCcw, Move3d } from 'lucide-react';
+import { Box, RotateCcw, Move3d, Zap } from 'lucide-react';
 
 interface ModelViewerProps {
     caseId: string;
@@ -16,14 +16,43 @@ interface ModelViewerProps {
     showSliceIndicator?: boolean;
 }
 
+// Performance quality levels
+type QualityLevel = 'high' | 'low';
+
+/**
+ * Adaptive Quality Controller
+ * Monitors interaction and switches quality dynamically
+ */
+const AdaptiveQualityController: React.FC<{
+    isInteracting: boolean;
+    quality: QualityLevel;
+}> = ({ isInteracting, quality }) => {
+    const { gl } = useThree();
+
+    useEffect(() => {
+        // Adjust pixel ratio based on quality
+        const dpr = quality === 'high' ? Math.min(window.devicePixelRatio, 2) : 1;
+        gl.setPixelRatio(dpr);
+    }, [quality, gl]);
+
+    return null;
+};
+
 /**
  * Slice Indicator Plane
  * Shows the current 2D slice position in 3D space
+ * Optimized: simplified geometry, no transparency calculations when possible
  */
-const SliceIndicator: React.FC<{ zPos: number; wireframe: boolean }> = ({ zPos, wireframe }) => {
+const SliceIndicator: React.FC<{
+    zPos: number;
+    wireframe: boolean;
+    visible: boolean;
+}> = ({ zPos, wireframe, visible }) => {
+    if (!visible) return null;
+
     return (
         <group position={[0, zPos, 0]}>
-            {/* Semi-transparent plane */}
+            {/* Semi-transparent plane - simplified */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
                 <planeGeometry args={[400, 400]} />
                 <meshBasicMaterial
@@ -34,9 +63,9 @@ const SliceIndicator: React.FC<{ zPos: number; wireframe: boolean }> = ({ zPos, 
                     depthWrite={false}
                 />
             </mesh>
-            {/* Edge ring */}
+            {/* Edge ring - reduced segments from 64 to 32 */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
-                <ringGeometry args={[195, 200, 64]} />
+                <ringGeometry args={[195, 200, 32]} />
                 <meshBasicMaterial color="#3b82f6" opacity={0.6} transparent side={THREE.DoubleSide} />
             </mesh>
         </group>
@@ -46,31 +75,27 @@ const SliceIndicator: React.FC<{ zPos: number; wireframe: boolean }> = ({ zPos, 
 /**
  * 3D Mesh Component
  * Loads and renders the reconstructed mesh with proper material
+ * Optimized: reuses material, proper geometry disposal
  */
-const ProcessedMesh: React.FC<{ url: string; wireframe: boolean; color?: string }> = ({
+const ProcessedMesh: React.FC<{
+    url: string;
+    wireframe: boolean;
+    color?: string;
+    quality: QualityLevel;
+}> = ({
     url,
     wireframe,
     color = '#ef4444',
+    quality,
 }) => {
-    const obj = useLoader(OBJLoader, url);
+        const obj = useLoader(OBJLoader, url);
+        const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
 
-    // Process mesh and apply material
-    useMemo(() => {
-        obj.traverse((child: THREE.Object3D) => {
-            if ((child as THREE.Mesh).isMesh) {
-                const mesh = child as THREE.Mesh;
-
-                // Dispose old material to prevent memory leak
-                if (mesh.material) {
-                    if (Array.isArray(mesh.material)) {
-                        mesh.material.forEach(m => m.dispose());
-                    } else {
-                        mesh.material.dispose();
-                    }
-                }
-
-                // Create material with proper lighting
-                mesh.material = new THREE.MeshStandardMaterial({
+        // Create/update material only when needed
+        useMemo(() => {
+            // Create material once and reuse
+            if (!materialRef.current) {
+                materialRef.current = new THREE.MeshStandardMaterial({
                     color: color,
                     roughness: 0.35,
                     metalness: 0.05,
@@ -78,24 +103,64 @@ const ProcessedMesh: React.FC<{ url: string; wireframe: boolean; color?: string 
                     side: THREE.DoubleSide,
                     flatShading: false,
                 });
-
-                // Compute normals for better lighting
-                mesh.geometry.computeVertexNormals();
-
-                // Center the mesh for easier viewing
-                mesh.geometry.computeBoundingBox();
-                const center = new THREE.Vector3();
-                mesh.geometry.boundingBox?.getCenter(center);
-                mesh.position.sub(center);
+            } else {
+                // Update existing material properties
+                materialRef.current.wireframe = wireframe;
+                materialRef.current.color.set(color);
+                materialRef.current.needsUpdate = true;
             }
-        });
-    }, [obj, wireframe, color]);
 
-    return <primitive object={obj} />;
-};
+            obj.traverse((child: THREE.Object3D) => {
+                if ((child as THREE.Mesh).isMesh) {
+                    const mesh = child as THREE.Mesh;
+
+                    // Dispose old material if different
+                    if (mesh.material && mesh.material !== materialRef.current) {
+                        if (Array.isArray(mesh.material)) {
+                            mesh.material.forEach(m => m.dispose());
+                        } else {
+                            mesh.material.dispose();
+                        }
+                    }
+
+                    // Apply shared material
+                    mesh.material = materialRef.current!;
+
+                    // Compute normals only once
+                    if (!mesh.geometry.getAttribute('normal')) {
+                        mesh.geometry.computeVertexNormals();
+                    }
+
+                    // Center the mesh for easier viewing (only once)
+                    if (!mesh.userData.centered) {
+                        mesh.geometry.computeBoundingBox();
+                        const center = new THREE.Vector3();
+                        mesh.geometry.boundingBox?.getCenter(center);
+                        mesh.position.sub(center);
+                        mesh.userData.centered = true;
+                    }
+
+                    // Frustum culling optimization
+                    mesh.frustumCulled = true;
+                }
+            });
+        }, [obj, wireframe, color, quality]);
+
+        // Cleanup on unmount
+        useEffect(() => {
+            return () => {
+                if (materialRef.current) {
+                    materialRef.current.dispose();
+                }
+            };
+        }, []);
+
+        return <primitive object={obj} />;
+    };
 
 /**
  * Loading Fallback for 3D Scene
+ * Simplified placeholder
  */
 const LoadingFallback: React.FC = () => {
     return (
@@ -107,60 +172,168 @@ const LoadingFallback: React.FC = () => {
 };
 
 /**
- * Scene Content
+ * Optimized Grid Component
+ * Only renders when not interacting for performance
  */
-const SceneContent: React.FC<ModelViewerProps> = ({
+const OptimizedGrid: React.FC<{ visible: boolean }> = ({ visible }) => {
+    if (!visible) return null;
+
+    return (
+        <Grid
+            infiniteGrid
+            cellSize={50}
+            sectionSize={200}
+            fadeDistance={800}
+            sectionColor="#2a2e38"
+            cellColor="#1a1e26"
+            fadeStrength={1.5}
+        />
+    );
+};
+
+/**
+ * Scene Content with quality-aware rendering
+ */
+const SceneContent: React.FC<ModelViewerProps & {
+    quality: QualityLevel;
+    isInteracting: boolean;
+}> = ({
     caseId,
     currentSliceIndex,
     voxelSpacing,
     showWireframe,
     totalSlices,
     showSliceIndicator = true,
+    quality,
+    isInteracting,
 }) => {
-    const meshUrl = meshApi.getMeshUrl(caseId);
+        const meshUrl = meshApi.getMeshUrl(caseId);
 
-    // Calculate slice position in physical space
-    const centerSlice = totalSlices / 2;
-    const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
+        // Calculate slice position in physical space
+        const centerSlice = totalSlices / 2;
+        const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
+
+        // Show grid and slice indicator only in high quality mode (not during interaction)
+        const showExtras = quality === 'high' && !isInteracting;
+
+        return (
+            <>
+                {/* Quality Controller */}
+                <AdaptiveQualityController isInteracting={isInteracting} quality={quality} />
+
+                {/* Optimized Lighting - reduced light count */}
+                <ambientLight intensity={0.5} />
+                <directionalLight
+                    position={[100, 100, 50]}
+                    intensity={0.7}
+                // No shadows for performance
+                />
+                <directionalLight position={[-50, 50, -50]} intensity={0.35} />
+
+                {/* Simplified Environment - studio is lighter than city */}
+                <Environment preset="studio" background={false} />
+
+                {/* Grid - hidden during interaction */}
+                <OptimizedGrid visible={showExtras} />
+
+                {/* 3D Mesh */}
+                <Suspense fallback={<LoadingFallback />}>
+                    <ProcessedMesh
+                        url={meshUrl}
+                        wireframe={showWireframe}
+                        quality={quality}
+                    />
+                </Suspense>
+
+                {/* Slice Indicator - hidden during interaction */}
+                <SliceIndicator
+                    zPos={zPos}
+                    wireframe={showWireframe}
+                    visible={showSliceIndicator && showExtras}
+                />
+            </>
+        );
+    };
+
+/**
+ * Performance Monitor Badge
+ */
+const PerformanceBadge: React.FC<{ quality: QualityLevel; isInteracting: boolean }> = ({
+    quality,
+    isInteracting
+}) => {
+    if (!isInteracting && quality === 'high') return null;
 
     return (
-        <>
-            {/* Lighting */}
-            <ambientLight intensity={0.4} />
-            <directionalLight position={[100, 100, 50]} intensity={0.8} castShadow />
-            <directionalLight position={[-50, 50, -50]} intensity={0.4} />
-            <pointLight position={[0, 100, 0]} intensity={0.3} />
-
-            {/* Environment for better reflections */}
-            <Environment preset="city" background={false} />
-
-            {/* Ground Grid */}
-            <Grid
-                infiniteGrid
-                cellSize={50}
-                sectionSize={200}
-                fadeDistance={1000}
-                sectionColor="#2a2e38"
-                cellColor="#1a1e26"
-                fadeStrength={1}
-            />
-
-            {/* 3D Mesh */}
-            <Suspense fallback={<LoadingFallback />}>
-                <ProcessedMesh url={meshUrl} wireframe={showWireframe} />
-            </Suspense>
-
-            {/* Slice Indicator */}
-            {showSliceIndicator && <SliceIndicator zPos={zPos} wireframe={showWireframe} />}
-        </>
+        <div
+            style={{
+                position: 'absolute',
+                top: 'var(--space-md)',
+                right: 'var(--space-md)',
+                zIndex: 10,
+                background: 'rgba(34, 197, 94, 0.15)',
+                border: '1px solid rgba(34, 197, 94, 0.4)',
+                borderRadius: 'var(--radius-sm)',
+                padding: '4px 8px',
+                fontSize: '0.65rem',
+                color: '#22c55e',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+            }}
+        >
+            <Zap size={10} />
+            Performance Mode
+        </div>
     );
 };
 
 /**
- * 3D Model Viewer Component
- * Displays reconstructed mesh with orbit controls
+ * 3D Model Viewer Component - Optimized Version
+ * 
+ * Performance optimizations:
+ * - Adaptive quality: reduces DPR and hides extras during interaction
+ * - Demand-based rendering: only re-renders when needed
+ * - Optimized controls: tuned damping and speeds
+ * - Simplified environment: lighter preset
+ * - Material reuse: single material instance
  */
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
+    const [isInteracting, setIsInteracting] = useState(false);
+    const [quality, setQuality] = useState<QualityLevel>('high');
+    const idleTimerRef = useRef<number | null>(null);
+
+    // Handle interaction start
+    const handleInteractionStart = useCallback(() => {
+        // Clear any pending idle timer
+        if (idleTimerRef.current) {
+            clearTimeout(idleTimerRef.current);
+            idleTimerRef.current = null;
+        }
+
+        setIsInteracting(true);
+        setQuality('low');
+    }, []);
+
+    // Handle interaction end
+    const handleInteractionEnd = useCallback(() => {
+        setIsInteracting(false);
+
+        // Debounce quality restoration to avoid flashing
+        idleTimerRef.current = window.setTimeout(() => {
+            setQuality('high');
+        }, 300);
+    }, []);
+
+    // Cleanup timer on unmount
+    useEffect(() => {
+        return () => {
+            if (idleTimerRef.current) {
+                clearTimeout(idleTimerRef.current);
+            }
+        };
+    }, []);
+
     return (
         <div
             style={{
@@ -201,6 +374,9 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                     3D Reconstruction
                 </div>
             </div>
+
+            {/* Performance Badge */}
+            <PerformanceBadge quality={quality} isInteracting={isInteracting} />
 
             {/* Controls Hint */}
             <div
@@ -249,23 +425,51 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 </div>
             </div>
 
-            {/* 3D Canvas */}
+            {/* Optimized 3D Canvas */}
             <Canvas
-                shadows
-                gl={{ antialias: true, alpha: true }}
+                // Performance: render only when something changes
+                frameloop="demand"
+                // Performance: limit DPR, no shadows
+                dpr={[1, 2]}
+                gl={{
+                    antialias: quality === 'high',
+                    alpha: true,
+                    powerPreference: 'high-performance',
+                    // Reduce precision for performance
+                    precision: 'mediump',
+                }}
                 style={{ background: 'transparent' }}
+                // Invalidate on any change to trigger re-render
+                onCreated={({ invalidate }) => {
+                    // Force initial render
+                    invalidate();
+                }}
             >
-                <PerspectiveCamera makeDefault position={[250, 200, 250]} fov={45} near={1} far={5000} />
+                <PerspectiveCamera
+                    makeDefault
+                    position={[250, 200, 250]}
+                    fov={45}
+                    near={1}
+                    far={3000}  // Reduced far plane
+                />
                 <OrbitControls
                     makeDefault
                     enableDamping
-                    dampingFactor={0.05}
+                    dampingFactor={0.08}  // Slightly higher for snappier feel
                     minDistance={50}
-                    maxDistance={1000}
-                    rotateSpeed={0.8}
-                    zoomSpeed={1}
+                    maxDistance={800}  // Reduced max distance
+                    rotateSpeed={1.0}  // Faster rotation
+                    zoomSpeed={1.2}    // Faster zoom
+                    panSpeed={0.8}
+                    // Interaction callbacks for adaptive quality
+                    onStart={handleInteractionStart}
+                    onEnd={handleInteractionEnd}
                 />
-                <SceneContent {...props} />
+                <SceneContent
+                    {...props}
+                    quality={quality}
+                    isInteracting={isInteracting}
+                />
             </Canvas>
 
             {/* Disclaimer */}
@@ -290,3 +494,5 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
         </div>
     );
 };
+
+export default ModelViewer;
