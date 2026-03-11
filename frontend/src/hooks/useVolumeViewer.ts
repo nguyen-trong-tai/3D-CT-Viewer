@@ -15,9 +15,22 @@ interface MaskData {
 }
 
 // Global cache for volume data (shared across all hook instances)
+// LRU eviction: keep at most MAX_CACHED_VOLUMES to prevent memory leaks
+// Each volume is ~100-200MB, so 2 = ~200-400MB max RAM usage
+const MAX_CACHED_VOLUMES = 2;
 const globalVolumeCache = new Map<string, VolumeData>();
 const globalMaskCache = new Map<string, MaskData>();
 const globalLoadingPromises = new Map<string, Promise<void>>();
+
+function evictOldestCache() {
+    if (globalVolumeCache.size > MAX_CACHED_VOLUMES) {
+        const oldestKey = globalVolumeCache.keys().next().value;
+        if (oldestKey) {
+            globalVolumeCache.delete(oldestKey);
+            globalMaskCache.delete(oldestKey);
+        }
+    }
+}
 
 /**
  * Hook for volume-based CT viewing
@@ -136,7 +149,8 @@ export function useVolumeViewer(caseId: string | null) {
                     spacing: volumeResult.spacing,
                 };
 
-                // Store in global cache
+                // Store in global cache (evict oldest if over limit)
+                evictOldestCache();
                 globalVolumeCache.set(caseId, volumeData);
                 setVolume(volumeData);
 
