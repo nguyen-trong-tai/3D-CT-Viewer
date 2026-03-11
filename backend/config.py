@@ -47,8 +47,13 @@ class Settings:
     DEFAULT_TISSUE_THRESHOLD: float = -600.0
     
     # Mesh generation
-    MESH_FORMAT: str = "obj"  # Web-compatible format
+    MESH_FORMAT: str = "glb"  # Draco-compressed GLB for optimal web performance
     MESH_LEVEL_SET: float = 0.0  # Zero level set for surface extraction
+    
+    # Draco compression settings
+    DRACO_COMPRESSION_LEVEL: int = 7
+    DRACO_QUANTIZE_POSITION_BITS: int = 14
+    DRACO_QUANTIZE_NORMAL_BITS: int = 10
     
     def __init__(self):
         # Ensure storage directory exists

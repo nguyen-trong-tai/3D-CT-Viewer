@@ -47,6 +47,12 @@ from .mesh import (
     combine_meshes,
 )
 
+from .glb_converter import (
+    convert_mesh_to_glb,
+    get_glb_stats,
+    compare_mesh_sizes,
+)
+
 __all__ = [
     # Loader
     "load_dicom_series",
@@ -79,4 +85,9 @@ __all__ = [
     "compute_mesh_stats",
     "export_mesh",
     "combine_meshes",
+    # GLB Converter
+    "convert_mesh_to_glb",
+    "get_glb_stats",
+    "compare_mesh_sizes",
 ]
+

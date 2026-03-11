@@ -19,6 +19,7 @@ nibabel>=5.0.0
 # Image Processing & Mesh Generation
 scikit-image>=0.21.0
 trimesh>=4.0.0
+pygltflib>=1.16.0  # Required for GLTF/GLB export
 
 # Cloud Deployment (Optional)
 modal>=0.55.0

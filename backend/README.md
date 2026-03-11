@@ -97,13 +97,13 @@ Once running, access:
 | `/api/v1/cases/{case_id}/ct/slices/{index}` | GET | Get single CT slice |
 | `/api/v1/cases/{case_id}/mask/volume` | GET | Get full mask (binary) |
 | `/api/v1/cases/{case_id}/mask/slices/{index}` | GET | Get single mask slice |
-| `/api/v1/cases/{case_id}/mesh` | GET | Get 3D mesh (OBJ) |
+| `/api/v1/cases/{case_id}/mesh` | GET | Get 3D mesh (Draco-compressed GLB) |
 | `/api/v1/cases/{case_id}/artifacts` | GET | List available artifacts |
 
 ## Processing Pipeline
 
 ```
-CT Volume (HU) → Segmentation → SDF → Mesh (OBJ)
+CT Volume (HU) → Segmentation → SDF → Mesh (Draco GLB)
 ```
 
 ### Stage 1: Segmentation
@@ -119,7 +119,9 @@ CT Volume (HU) → Segmentation → SDF → Mesh (OBJ)
 ### Stage 3: Mesh Extraction
 - Marching Cubes at zero level-set
 - Physical coordinates (mm)
-- Output: OBJ file
+- Vertex normals pre-computed
+- Output: Draco-compressed GLB (80-90% smaller than OBJ)
+- Compatible with @react-three/drei useGLTF hook
 
 ## Configuration
 
@@ -150,8 +152,14 @@ Each case is stored in `{STORAGE_ROOT}/{case_id}/`:
 ├── extra_metadata.json   # Patient/study info (optional)
 ├── mask_volume.npy       # Segmentation mask (uint8)
 ├── sdf_volume.npy        # SDF (float32)
-└── mesh.obj              # Surface mesh
+└── mesh.glb              # Surface mesh (Draco-compressed GLB)
 ```
+
+### Node.js Requirement
+
+For optimal Draco compression, ensure Node.js (v18+) is installed.
+The pipeline uses `gltf-pipeline` via npx for compression.
+If Node.js is unavailable, meshes are saved as standard GLB without Draco.
 
 ## Performance Targets
 

@@ -29,7 +29,7 @@ class CaseRepository:
         ├── extra_metadata.json   # Patient/study info (optional)
         ├── mask_volume.npy       # Segmentation mask (uint8)
         ├── sdf_volume.npy        # SDF data (float32)
-        └── mesh.obj              # Surface mesh (OBJ format)
+        └── mesh.glb              # Surface mesh (Draco-compressed GLB format)
     """
     
     def __init__(self, root_dir: Path = None):
@@ -259,25 +259,57 @@ class CaseRepository:
     # =========================================================================
     
     def save_mesh(self, case_id: str, mesh: trimesh.Trimesh):
-        """Save mesh in OBJ format."""
+        """
+        Save mesh in Draco-compressed GLB format.
+        
+        This provides 80-90% file size reduction compared to OBJ
+        and includes pre-computed normals for frontend performance.
+        """
+        from processing.glb_converter import convert_mesh_to_glb
+        
         case_path = self._case_dir(case_id)
-        mesh.export(case_path / "mesh.obj")
+        glb_path = case_path / "mesh.glb"
+        
+        # Convert mesh to Draco-compressed GLB
+        success, message = convert_mesh_to_glb(mesh, glb_path, apply_draco=True)
+        
+        if success:
+            print(f"[Repository] Mesh saved as GLB: {message}")
+        else:
+            print(f"[Repository] GLB conversion warning: {message}")
     
     def load_mesh(self, case_id: str) -> Optional[trimesh.Trimesh]:
-        """Load mesh from file."""
-        path = self._case_dir(case_id) / "mesh.obj"
-        if not path.exists():
-            return None
-        return trimesh.load(path)
+        """Load mesh from file (supports both GLB and legacy OBJ)."""
+        # Try GLB first (new format)
+        glb_path = self._case_dir(case_id) / "mesh.glb"
+        if glb_path.exists():
+            return trimesh.load(glb_path)
+        
+        # Fallback to OBJ (legacy format)
+        obj_path = self._case_dir(case_id) / "mesh.obj"
+        if obj_path.exists():
+            return trimesh.load(obj_path)
+        
+        return None
     
     def get_mesh_path(self, case_id: str) -> Optional[Path]:
-        """Get path to mesh file if it exists."""
-        path = self._case_dir(case_id) / "mesh.obj"
-        return path if path.exists() else None
+        """
+        Get path to mesh file if it exists.
+        
+        Returns GLB path if available, otherwise OBJ for legacy support.
+        """
+        glb_path = self._case_dir(case_id) / "mesh.glb"
+        if glb_path.exists():
+            return glb_path
+        
+        # Fallback to OBJ for legacy cases
+        obj_path = self._case_dir(case_id) / "mesh.obj"
+        return obj_path if obj_path.exists() else None
     
     def mesh_exists(self, case_id: str) -> bool:
-        """Check if mesh exists for a case."""
-        return (self._case_dir(case_id) / "mesh.obj").exists()
+        """Check if mesh exists for a case (GLB or legacy OBJ)."""
+        case_path = self._case_dir(case_id)
+        return (case_path / "mesh.glb").exists() or (case_path / "mesh.obj").exists()
     
     # =========================================================================
     # Artifact Information
@@ -291,7 +323,7 @@ class CaseRepository:
             "ct_metadata": (case_path / "ct_metadata.json").exists(),
             "segmentation_mask": (case_path / "mask_volume.npy").exists(),
             "sdf": (case_path / "sdf_volume.npy").exists(),
-            "mesh": (case_path / "mesh.obj").exists(),
+            "mesh": (case_path / "mesh.glb").exists() or (case_path / "mesh.obj").exists(),
             "extra_metadata": (case_path / "extra_metadata.json").exists(),
         }
     
