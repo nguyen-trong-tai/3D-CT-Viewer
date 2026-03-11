@@ -1,5 +1,6 @@
 import React, { useState, type ReactNode } from 'react';
 import { Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
+import { ErrorBoundary } from '../UI/ErrorBoundary';
 import type { ViewMode } from '../../types';
 
 interface MainLayoutProps {
@@ -201,7 +202,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                     }}
                 >
                     {/* 2D View */}
-                    {(viewMode === 'LINKED' || viewMode === '2D') && (
+                    {viewMode === '2D' && (
                         <div
                             style={{
                                 flex: 1,
@@ -209,15 +210,16 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                                 background: '#000',
                                 display: 'flex',
                                 flexDirection: 'column',
-                                borderRight: viewMode === 'LINKED' ? '1px solid var(--border-subtle)' : 'none',
                             }}
                         >
-                            {viewer2D}
+                            <ErrorBoundary>
+                                {viewer2D}
+                            </ErrorBoundary>
                         </div>
                     )}
 
                     {/* 3D View */}
-                    {(viewMode === 'LINKED' || viewMode === '3D') && viewer3D && (
+                    {viewMode === '3D' && viewer3D && (
                         <div
                             style={{
                                 flex: 1,
@@ -227,7 +229,9 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                                 flexDirection: 'column',
                             }}
                         >
-                            {viewer3D}
+                            <ErrorBoundary>
+                                {viewer3D}
+                            </ErrorBoundary>
                         </div>
                     )}
                 </main>

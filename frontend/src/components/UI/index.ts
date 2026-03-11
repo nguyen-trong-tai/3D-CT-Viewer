@@ -7,3 +7,4 @@ export {
     Divider,
     ProgressBar,
 } from './Controls';
+export { ErrorBoundary } from './ErrorBoundary';
