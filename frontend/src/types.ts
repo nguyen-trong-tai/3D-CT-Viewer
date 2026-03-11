@@ -114,7 +114,7 @@ export type WindowPresetKey = keyof typeof WINDOW_PRESETS;
 /**
  * View modes for the main layout
  */
-export type ViewMode = '2D' | '3D' | 'LINKED';
+export type ViewMode = '2D' | '3D';
 
 /**
  * MPR (Multiplanar Reconstruction) view types
@@ -199,7 +199,7 @@ export interface ViewerState {
 }
 
 export const DEFAULT_VIEWER_STATE: ViewerState = {
-    viewMode: 'LINKED',
+    viewMode: '2D',
     crosshair: { x: 0, y: 0, z: 0 },
     windowPreset: 'SOFT_TISSUE',
     segmentation: DEFAULT_SEGMENTATION_CONFIG,
