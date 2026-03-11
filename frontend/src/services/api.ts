@@ -7,8 +7,8 @@
 
 import axios from 'axios';
 
-// API base with versioned prefix
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// API base — empty string uses Vite proxy in dev, override with VITE_API_URL for production
+const API_BASE = import.meta.env.VITE_API_URL || '';
 const API_V1 = `${API_BASE}/api/v1`;
 
 // =============================================================================
