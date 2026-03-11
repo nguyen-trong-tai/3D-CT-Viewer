@@ -1,11 +1,13 @@
-import React, { Suspense, useMemo, useState, useCallback, useRef, useEffect } from 'react';
-import { Canvas, useLoader, useThree } from '@react-three/fiber';
-import { OrbitControls, PerspectiveCamera, Grid, Environment } from '@react-three/drei';
+import React, { Suspense, useMemo, useCallback, useRef, useEffect } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
+import { PerspectiveCamera, OrbitControls, Grid, Environment, useGLTF } from '@react-three/drei';
 import * as THREE from 'three';
-// @ts-ignore
-import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
+import { DRACOLoader } from 'three-stdlib';
 import { meshApi } from '../../services/api';
-import { Box, RotateCcw, Move3d, Zap } from 'lucide-react';
+import { Box, RotateCcw, Move3d } from 'lucide-react';
+
+// Configure Draco decoder path
+const DRACO_DECODER_PATH = 'https://www.gstatic.com/draco/versioned/decoders/1.5.6/';
 
 interface ModelViewerProps {
     caseId: string;
@@ -14,29 +16,9 @@ interface ModelViewerProps {
     showWireframe: boolean;
     totalSlices: number;
     showSliceIndicator?: boolean;
+    showGrid?: boolean;
 }
 
-// Performance quality levels
-type QualityLevel = 'high' | 'low';
-
-/**
- * Adaptive Quality Controller
- * Monitors interaction and switches quality dynamically
- */
-const AdaptiveQualityController: React.FC<{
-    isInteracting: boolean;
-    quality: QualityLevel;
-}> = ({ isInteracting, quality }) => {
-    const { gl } = useThree();
-
-    useEffect(() => {
-        // Adjust pixel ratio based on quality
-        const dpr = quality === 'high' ? Math.min(window.devicePixelRatio, 2) : 1;
-        gl.setPixelRatio(dpr);
-    }, [quality, gl]);
-
-    return null;
-};
 
 /**
  * Slice Indicator Plane
@@ -73,90 +55,139 @@ const SliceIndicator: React.FC<{
 };
 
 /**
- * 3D Mesh Component
+ * 3D Mesh Component using GLTF + Draco
  * Loads and renders the reconstructed mesh with proper material
- * Optimized: reuses material, proper geometry disposal
+ * Optimized: GLTF format, Draco compression, strict memory management
  */
 const ProcessedMesh: React.FC<{
     url: string;
     wireframe: boolean;
     color?: string;
-    quality: QualityLevel;
-}> = ({
-    url,
-    wireframe,
-    color = '#ef4444',
-    quality,
-}) => {
-        const obj = useLoader(OBJLoader, url);
-        const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+    onLoad?: () => void;
+}> = ({ url, wireframe, color = '#ef4444', onLoad }) => {
+    // Get invalidate from R3F context
+    const { invalidate: triggerInvalidate } = useThree();
 
-        // Create/update material only when needed
-        useMemo(() => {
-            // Create material once and reuse
-            if (!materialRef.current) {
-                materialRef.current = new THREE.MeshStandardMaterial({
-                    color: color,
-                    roughness: 0.35,
-                    metalness: 0.05,
-                    wireframe: wireframe,
-                    side: THREE.DoubleSide,
-                    flatShading: false,
-                });
-            } else {
-                // Update existing material properties
-                materialRef.current.wireframe = wireframe;
-                materialRef.current.color.set(color);
-                materialRef.current.needsUpdate = true;
+    // Refs for cleanup
+    const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
+    const meshesRef = useRef<THREE.Mesh[]>([]);
+    const previousUrlRef = useRef<string | null>(null);
+    const isInitializedRef = useRef(false);
+
+    // Load GLTF with Draco compression
+    const { scene } = useGLTF(url, true, true, (loader) => {
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath(DRACO_DECODER_PATH);
+        loader.setDRACOLoader(dracoLoader);
+    });
+
+    // Clone the scene to avoid modifying the cached original
+    const clonedScene = useMemo(() => scene.clone(true), [scene]);
+
+    // Create shared material once
+    const sharedMaterial = useMemo(() => {
+        return new THREE.MeshStandardMaterial({
+            color: color,
+            roughness: 0.35,
+            metalness: 0.05,
+            wireframe: wireframe,
+            side: THREE.DoubleSide,
+            flatShading: false,
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Update material properties efficiently (without re-traversing)
+    useEffect(() => {
+        if (sharedMaterial) {
+            sharedMaterial.wireframe = wireframe;
+            sharedMaterial.color.set(color);
+            sharedMaterial.needsUpdate = true;
+            triggerInvalidate(); // Trigger re-render
+        }
+    }, [wireframe, color, sharedMaterial, triggerInvalidate]);
+
+    // Initialize meshes once when scene loads
+    useEffect(() => {
+        if (isInitializedRef.current) return;
+        isInitializedRef.current = true;
+
+        materialRef.current = sharedMaterial;
+        meshesRef.current = [];
+
+        // Single traverse to set up all meshes
+        clonedScene.traverse((child: THREE.Object3D) => {
+            if ((child as THREE.Mesh).isMesh) {
+                const mesh = child as THREE.Mesh;
+
+                // Store reference for cleanup
+                meshesRef.current.push(mesh);
+
+                // Dispose old material if different from our shared material
+                if (mesh.material && mesh.material !== materialRef.current) {
+                    if (Array.isArray(mesh.material)) {
+                        mesh.material.forEach((m) => m.dispose());
+                    } else {
+                        (mesh.material as THREE.Material).dispose();
+                    }
+                }
+
+                // Apply shared material
+                mesh.material = materialRef.current!;
+
+                // NOTE: Normals are pre-calculated in GLTF, no runtime computation needed
+
+                // Center the mesh for easier viewing (only once)
+                if (!mesh.userData.centered) {
+                    mesh.geometry.computeBoundingBox();
+                    const center = new THREE.Vector3();
+                    mesh.geometry.boundingBox?.getCenter(center);
+                    mesh.position.sub(center);
+                    mesh.userData.centered = true;
+                }
+
+                // Enable frustum culling for all meshes
+                mesh.frustumCulled = true;
             }
+        });
 
-            obj.traverse((child: THREE.Object3D) => {
-                if ((child as THREE.Mesh).isMesh) {
-                    const mesh = child as THREE.Mesh;
+        // Notify when model is loaded
+        if (onLoad) {
+            onLoad();
+        }
+        triggerInvalidate(); // Trigger re-render for demand frameloop
+    }, [clonedScene, sharedMaterial, onLoad, triggerInvalidate]);
 
-                    // Dispose old material if different
-                    if (mesh.material && mesh.material !== materialRef.current) {
-                        if (Array.isArray(mesh.material)) {
-                            mesh.material.forEach(m => m.dispose());
-                        } else {
-                            mesh.material.dispose();
-                        }
-                    }
+    // Strict memory cleanup on unmount or model change
+    useEffect(() => {
+        previousUrlRef.current = url;
 
-                    // Apply shared material
-                    mesh.material = materialRef.current!;
-
-                    // Compute normals only once
-                    if (!mesh.geometry.getAttribute('normal')) {
-                        mesh.geometry.computeVertexNormals();
-                    }
-
-                    // Center the mesh for easier viewing (only once)
-                    if (!mesh.userData.centered) {
-                        mesh.geometry.computeBoundingBox();
-                        const center = new THREE.Vector3();
-                        mesh.geometry.boundingBox?.getCenter(center);
-                        mesh.position.sub(center);
-                        mesh.userData.centered = true;
-                    }
-
-                    // Frustum culling optimization
-                    mesh.frustumCulled = true;
+        return () => {
+            // Dispose all geometries from tracked meshes
+            meshesRef.current.forEach((mesh) => {
+                if (mesh.geometry) {
+                    mesh.geometry.dispose();
                 }
             });
-        }, [obj, wireframe, color, quality]);
+            meshesRef.current = [];
 
-        // Cleanup on unmount
-        useEffect(() => {
-            return () => {
-                if (materialRef.current) {
-                    materialRef.current.dispose();
-                }
-            };
-        }, []);
+            // Dispose shared material
+            if (materialRef.current) {
+                materialRef.current.dispose();
+                materialRef.current = null;
+            }
 
-        return <primitive object={obj} />;
-    };
+            // Clear GLTF cache for this URL to free memory
+            if (previousUrlRef.current) {
+                useGLTF.clear(previousUrlRef.current);
+            }
+
+            isInitializedRef.current = false;
+        };
+    }, [url]);
+
+    return <primitive object={clonedScene} />;
+};
 
 /**
  * Loading Fallback for 3D Scene
@@ -171,168 +202,85 @@ const LoadingFallback: React.FC = () => {
     );
 };
 
-/**
- * Optimized Grid Component
- * Only renders when not interacting for performance
- */
-const OptimizedGrid: React.FC<{ visible: boolean }> = ({ visible }) => {
-    if (!visible) return null;
 
-    return (
-        <Grid
-            infiniteGrid
-            cellSize={50}
-            sectionSize={200}
-            fadeDistance={800}
-            sectionColor="#2a2e38"
-            cellColor="#1a1e26"
-            fadeStrength={1.5}
-        />
-    );
-};
 
 /**
- * Scene Content with quality-aware rendering
+ * Scene Content — React.memo prevents re-renders from parent state changes.
  */
-const SceneContent: React.FC<ModelViewerProps & {
-    quality: QualityLevel;
-    isInteracting: boolean;
-}> = ({
+const SceneContent = React.memo<ModelViewerProps & {
+    onModelLoad?: () => void;
+}>(function SceneContent({
     caseId,
     currentSliceIndex,
     voxelSpacing,
     showWireframe,
     totalSlices,
-    showSliceIndicator = true,
-    quality,
-    isInteracting,
-}) => {
-        const meshUrl = meshApi.getMeshUrl(caseId);
+    showSliceIndicator = false,
+    showGrid = false,
+    onModelLoad,
+}) {
+    const meshUrl = meshApi.getMeshUrl(caseId);
 
-        // Calculate slice position in physical space
-        const centerSlice = totalSlices / 2;
-        const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
-
-        // Show grid and slice indicator only in high quality mode (not during interaction)
-        const showExtras = quality === 'high' && !isInteracting;
-
-        return (
-            <>
-                {/* Quality Controller */}
-                <AdaptiveQualityController isInteracting={isInteracting} quality={quality} />
-
-                {/* Optimized Lighting - reduced light count */}
-                <ambientLight intensity={0.5} />
-                <directionalLight
-                    position={[100, 100, 50]}
-                    intensity={0.7}
-                // No shadows for performance
-                />
-                <directionalLight position={[-50, 50, -50]} intensity={0.35} />
-
-                {/* Simplified Environment - studio is lighter than city */}
-                <Environment preset="studio" background={false} />
-
-                {/* Grid - hidden during interaction */}
-                <OptimizedGrid visible={showExtras} />
-
-                {/* 3D Mesh */}
-                <Suspense fallback={<LoadingFallback />}>
-                    <ProcessedMesh
-                        url={meshUrl}
-                        wireframe={showWireframe}
-                        quality={quality}
-                    />
-                </Suspense>
-
-                {/* Slice Indicator - hidden during interaction */}
-                <SliceIndicator
-                    zPos={zPos}
-                    wireframe={showWireframe}
-                    visible={showSliceIndicator && showExtras}
-                />
-            </>
-        );
-    };
-
-/**
- * Performance Monitor Badge
- */
-const PerformanceBadge: React.FC<{ quality: QualityLevel; isInteracting: boolean }> = ({
-    quality,
-    isInteracting
-}) => {
-    if (!isInteracting && quality === 'high') return null;
+    const centerSlice = totalSlices / 2;
+    const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
 
     return (
-        <div
-            style={{
-                position: 'absolute',
-                top: 'var(--space-md)',
-                right: 'var(--space-md)',
-                zIndex: 10,
-                background: 'rgba(34, 197, 94, 0.15)',
-                border: '1px solid rgba(34, 197, 94, 0.4)',
-                borderRadius: 'var(--radius-sm)',
-                padding: '4px 8px',
-                fontSize: '0.65rem',
-                color: '#22c55e',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '4px',
-            }}
-        >
-            <Zap size={10} />
-            Performance Mode
-        </div>
+        <>
+            {/* Lighting */}
+            <ambientLight intensity={0.5} />
+            <directionalLight position={[100, 100, 50]} intensity={0.7} />
+            <directionalLight position={[-50, 50, -50]} intensity={0.35} />
+            <Environment preset="studio" background={false} />
+
+            {/* Extras */}
+            <group>
+                {showGrid && (
+                    <Grid
+                        infiniteGrid
+                        cellSize={50}
+                        sectionSize={200}
+                        fadeDistance={800}
+                        sectionColor="#2a2e38"
+                        cellColor="#1a1e26"
+                        fadeStrength={1.5}
+                    />
+                )}
+                {showSliceIndicator && (
+                    <SliceIndicator zPos={zPos} wireframe={showWireframe} visible />
+                )}
+            </group>
+
+            {/* 3D Mesh */}
+            <Suspense fallback={<LoadingFallback />}>
+                <ProcessedMesh
+                    url={meshUrl}
+                    wireframe={showWireframe}
+                    onLoad={onModelLoad}
+                />
+            </Suspense>
+        </>
     );
-};
+});
+
+
 
 /**
- * 3D Model Viewer Component - Optimized Version
- * 
- * Performance optimizations:
- * - Adaptive quality: reduces DPR and hides extras during interaction
- * - Demand-based rendering: only re-renders when needed
- * - Optimized controls: tuned damping and speeds
- * - Simplified environment: lighter preset
- * - Material reuse: single material instance
+ * 3D Model Viewer Component
+ *
+ * Uses drei OrbitControls for native, smooth 3D interactions.
+ * enableDamping provides inertia, frameloop="always" keeps the
+ * damping animation running continuously.
  */
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
-    const [isInteracting, setIsInteracting] = useState(false);
-    const [quality, setQuality] = useState<QualityLevel>('high');
-    const idleTimerRef = useRef<number | null>(null);
+    const handleModelLoad = useCallback(() => {}, []);
 
-    // Handle interaction start
-    const handleInteractionStart = useCallback(() => {
-        // Clear any pending idle timer
-        if (idleTimerRef.current) {
-            clearTimeout(idleTimerRef.current);
-            idleTimerRef.current = null;
-        }
-
-        setIsInteracting(true);
-        setQuality('low');
-    }, []);
-
-    // Handle interaction end
-    const handleInteractionEnd = useCallback(() => {
-        setIsInteracting(false);
-
-        // Debounce quality restoration to avoid flashing
-        idleTimerRef.current = window.setTimeout(() => {
-            setQuality('high');
-        }, 300);
-    }, []);
-
-    // Cleanup timer on unmount
-    useEffect(() => {
-        return () => {
-            if (idleTimerRef.current) {
-                clearTimeout(idleTimerRef.current);
-            }
-        };
-    }, []);
+    const glProps = useMemo(() => ({
+        antialias: true,
+        stencil: false,
+        alpha: true,
+        powerPreference: 'high-performance' as const,
+        precision: 'mediump' as const,
+    }), []);
 
     return (
         <div
@@ -374,9 +322,6 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                     3D Reconstruction
                 </div>
             </div>
-
-            {/* Performance Badge */}
-            <PerformanceBadge quality={quality} isInteracting={isInteracting} />
 
             {/* Controls Hint */}
             <div
@@ -425,50 +370,40 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 </div>
             </div>
 
-            {/* Optimized 3D Canvas */}
+            {/* 3D Canvas */}
             <Canvas
-                // Performance: render only when something changes
-                frameloop="demand"
-                // Performance: limit DPR, no shadows
+                frameloop="always"
                 dpr={[1, 2]}
-                gl={{
-                    antialias: quality === 'high',
-                    alpha: true,
-                    powerPreference: 'high-performance',
-                    // Reduce precision for performance
-                    precision: 'mediump',
-                }}
+                gl={glProps}
                 style={{ background: 'transparent' }}
-                // Invalidate on any change to trigger re-render
-                onCreated={({ invalidate }) => {
-                    // Force initial render
-                    invalidate();
-                }}
             >
                 <PerspectiveCamera
                     makeDefault
                     position={[250, 200, 250]}
                     fov={45}
                     near={1}
-                    far={3000}  // Reduced far plane
+                    far={3000}
                 />
                 <OrbitControls
-                    makeDefault
                     enableDamping
-                    dampingFactor={0.08}  // Slightly higher for snappier feel
+                    dampingFactor={0.08}
+                    rotateSpeed={0.8}
+                    panSpeed={0.6}
+                    zoomSpeed={0.8}
                     minDistance={50}
-                    maxDistance={800}  // Reduced max distance
-                    rotateSpeed={1.0}  // Faster rotation
-                    zoomSpeed={1.2}    // Faster zoom
-                    panSpeed={0.8}
-                    // Interaction callbacks for adaptive quality
-                    onStart={handleInteractionStart}
-                    onEnd={handleInteractionEnd}
+                    maxDistance={800}
+                    minPolarAngle={0.1}
+                    maxPolarAngle={Math.PI - 0.1}
+                    enablePan
+                    mouseButtons={{
+                        LEFT: THREE.MOUSE.ROTATE,
+                        MIDDLE: THREE.MOUSE.DOLLY,
+                        RIGHT: THREE.MOUSE.PAN,
+                    }}
                 />
                 <SceneContent
                     {...props}
-                    quality={quality}
-                    isInteracting={isInteracting}
+                    onModelLoad={handleModelLoad}
                 />
             </Canvas>
 
