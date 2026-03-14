@@ -114,7 +114,7 @@ export type WindowPresetKey = keyof typeof WINDOW_PRESETS;
 /**
  * View modes for the main layout
  */
-export type ViewMode = '2D' | '3D';
+export type ViewMode = '2D' | '3D' | 'MPR' | 'MPR_3D';
 
 /**
  * MPR (Multiplanar Reconstruction) view types

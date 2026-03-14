@@ -707,7 +707,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                 )}
 
                 {/* Research Disclaimer */}
-                <div
+                {/* <div
                     style={{
                         marginTop: 'var(--space-xl)',
                         padding: 'var(--space-md)',
@@ -729,7 +729,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         <br />
                         It is not certified for clinical diagnosis or treatment.
                     </p>
-                </div>
+                </div> */}
             </div>
 
             {/* Animation keyframes */}

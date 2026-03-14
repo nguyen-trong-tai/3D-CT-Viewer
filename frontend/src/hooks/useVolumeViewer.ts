@@ -2,6 +2,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { ctApi, maskApi } from '../services/api';
 import { WINDOW_PRESETS, type WindowPresetKey, type MPRView } from '../types';
+import { useViewerStore } from '../stores/viewerStore';
 
 interface VolumeData {
     data: Int16Array;
@@ -50,7 +51,8 @@ export function useVolumeViewer(caseId: string | null) {
     const [maskOpacity, setMaskOpacity] = useState(0.5);
 
     // Crosshair position for MPR synchronization (voxel indices)
-    const [crosshair, setCrosshair] = useState({ x: 0, y: 0, z: 0 });
+    const crosshair = useViewerStore(state => state.mprCrosshair);
+    const setCrosshair = useViewerStore(state => state.setMprCrosshair);
 
     // ImageData cache for ultra-fast rendering
     const imageDataCache = useRef(new Map<string, ImageData>());
@@ -211,18 +213,22 @@ export function useVolumeViewer(caseId: string | null) {
     /**
      * Get dimensions for a specific view
      */
-    const getViewDimensions = useCallback((view: MPRView): { width: number; height: number; maxSlice: number } | null => {
+    const getViewDimensions = useCallback((view: MPRView): { width: number; height: number; maxSlice: number; spacing: { x: number; y: number } } | null => {
         if (!volume) return null;
 
         const [dimX, dimY, dimZ] = volume.shape;
+        // Handle cases where spacing might not be available or 0
+        const spX = volume.spacing?.[0] || 1;
+        const spY = volume.spacing?.[1] || 1;
+        const spZ = volume.spacing?.[2] || 1;
 
         switch (view) {
             case 'AXIAL':
-                return { width: dimX, height: dimY, maxSlice: dimZ };
+                return { width: dimX, height: dimY, maxSlice: dimZ, spacing: { x: spX, y: spY } };
             case 'CORONAL':
-                return { width: dimX, height: dimZ, maxSlice: dimY };
+                return { width: dimX, height: dimZ, maxSlice: dimY, spacing: { x: spX, y: spZ } };
             case 'SAGITTAL':
-                return { width: dimY, height: dimZ, maxSlice: dimX };
+                return { width: dimY, height: dimZ, maxSlice: dimX, spacing: { x: spY, y: spZ } };
             default:
                 return null;
         }
@@ -528,19 +534,16 @@ export function useVolumeViewer(caseId: string | null) {
      * Update crosshair from a specific view
      */
     const updateCrosshair = useCallback((view: MPRView, sliceIndex: number) => {
-        setCrosshair(prev => {
-            switch (view) {
-                case 'AXIAL':
-                    return { ...prev, z: sliceIndex };
-                case 'CORONAL':
-                    return { ...prev, y: sliceIndex };
-                case 'SAGITTAL':
-                    return { ...prev, x: sliceIndex };
-                default:
-                    return prev;
-            }
-        });
-    }, []);
+        const current = useViewerStore.getState().mprCrosshair;
+        let newX = current.x, newY = current.y, newZ = current.z;
+        
+        switch (view) {
+            case 'AXIAL': newZ = sliceIndex; break;
+            case 'CORONAL': newY = sliceIndex; break;
+            case 'SAGITTAL': newX = sliceIndex; break;
+        }
+        setCrosshair({ x: newX, y: newY, z: newZ });
+    }, [setCrosshair]);
 
     /**
      * Handle scroll in a specific view
@@ -549,23 +552,22 @@ export function useVolumeViewer(caseId: string | null) {
         const dims = getViewDimensions(view);
         if (!dims) return;
 
-        setCrosshair(prev => {
-            let newIndex: number;
-            switch (view) {
-                case 'AXIAL':
-                    newIndex = Math.max(0, Math.min(dims.maxSlice - 1, prev.z - delta));
-                    return { ...prev, z: newIndex };
-                case 'CORONAL':
-                    newIndex = Math.max(0, Math.min(dims.maxSlice - 1, prev.y - delta));
-                    return { ...prev, y: newIndex };
-                case 'SAGITTAL':
-                    newIndex = Math.max(0, Math.min(dims.maxSlice - 1, prev.x - delta));
-                    return { ...prev, x: newIndex };
-                default:
-                    return prev;
-            }
-        });
-    }, [getViewDimensions]);
+        const current = useViewerStore.getState().mprCrosshair;
+        let newX = current.x, newY = current.y, newZ = current.z;
+
+        switch (view) {
+            case 'AXIAL':
+                newZ = Math.max(0, Math.min(dims.maxSlice - 1, current.z - delta));
+                break;
+            case 'CORONAL':
+                newY = Math.max(0, Math.min(dims.maxSlice - 1, current.y - delta));
+                break;
+            case 'SAGITTAL':
+                newX = Math.max(0, Math.min(dims.maxSlice - 1, current.x - delta));
+                break;
+        }
+        setCrosshair({ x: newX, y: newY, z: newZ });
+    }, [getViewDimensions, setCrosshair]);
 
     /**
      * Pre-render adjacent slices for smoother scrolling
@@ -648,7 +650,7 @@ export function useVolumeViewer(caseId: string | null) {
         getSliceIndex,
         handleScroll,
 
-        // Direct ImageData rendering (NO base64!)
+        // Direct ImageData rendering 
         renderSliceToImageData,
         renderSliceWithCustomWindow,
         renderMaskSliceToImageData,

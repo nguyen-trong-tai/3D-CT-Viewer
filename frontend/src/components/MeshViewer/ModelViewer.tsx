@@ -5,6 +5,7 @@ import * as THREE from 'three';
 import { DRACOLoader } from 'three-stdlib';
 import { meshApi } from '../../services/api';
 import { Box, RotateCcw, Move3d } from 'lucide-react';
+import { useViewerStore } from '../../stores/viewerStore';
 
 // Configure Draco decoder path
 const DRACO_DECODER_PATH = 'https://www.gstatic.com/draco/versioned/decoders/1.5.6/';
@@ -65,14 +66,7 @@ const ProcessedMesh: React.FC<{
     color?: string;
     onLoad?: () => void;
 }> = ({ url, wireframe, color = '#ef4444', onLoad }) => {
-    // Get invalidate from R3F context
     const { invalidate: triggerInvalidate } = useThree();
-
-    // Refs for cleanup
-    const materialRef = useRef<THREE.MeshStandardMaterial | null>(null);
-    const meshesRef = useRef<THREE.Mesh[]>([]);
-    const previousUrlRef = useRef<string | null>(null);
-    const isInitializedRef = useRef(false);
 
     // Load GLTF with Draco compression
     const { scene } = useGLTF(url, true, true, (loader) => {
@@ -80,9 +74,6 @@ const ProcessedMesh: React.FC<{
         dracoLoader.setDecoderPath(DRACO_DECODER_PATH);
         loader.setDRACOLoader(dracoLoader);
     });
-
-    // Clone the scene to avoid modifying the cached original
-    const clonedScene = useMemo(() => scene.clone(true), [scene]);
 
     // Create shared material once
     const sharedMaterial = useMemo(() => {
@@ -97,34 +88,18 @@ const ProcessedMesh: React.FC<{
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Update material properties efficiently (without re-traversing)
-    useEffect(() => {
-        if (sharedMaterial) {
-            sharedMaterial.wireframe = wireframe;
-            sharedMaterial.color.set(color);
-            sharedMaterial.needsUpdate = true;
-            triggerInvalidate(); // Trigger re-render
-        }
-    }, [wireframe, color, sharedMaterial, triggerInvalidate]);
+    // Clone the scene and apply material synchronously to prevent white mesh flash
+    const { clonedScene, meshes } = useMemo(() => {
+        const clone = scene.clone(true);
+        const extractedMeshes: THREE.Mesh[] = [];
 
-    // Initialize meshes once when scene loads
-    useEffect(() => {
-        if (isInitializedRef.current) return;
-        isInitializedRef.current = true;
-
-        materialRef.current = sharedMaterial;
-        meshesRef.current = [];
-
-        // Single traverse to set up all meshes
-        clonedScene.traverse((child: THREE.Object3D) => {
+        clone.traverse((child: THREE.Object3D) => {
             if ((child as THREE.Mesh).isMesh) {
                 const mesh = child as THREE.Mesh;
-
-                // Store reference for cleanup
-                meshesRef.current.push(mesh);
+                extractedMeshes.push(mesh);
 
                 // Dispose old material if different from our shared material
-                if (mesh.material && mesh.material !== materialRef.current) {
+                if (mesh.material) {
                     if (Array.isArray(mesh.material)) {
                         mesh.material.forEach((m) => m.dispose());
                     } else {
@@ -133,9 +108,7 @@ const ProcessedMesh: React.FC<{
                 }
 
                 // Apply shared material
-                mesh.material = materialRef.current!;
-
-                // NOTE: Normals are pre-calculated in GLTF, no runtime computation needed
+                mesh.material = sharedMaterial;
 
                 // Center the mesh for easier viewing (only once)
                 if (!mesh.userData.centered) {
@@ -151,40 +124,46 @@ const ProcessedMesh: React.FC<{
             }
         });
 
-        // Notify when model is loaded
+        return { clonedScene: clone, meshes: extractedMeshes };
+    }, [scene, sharedMaterial]);
+
+    // Handle onLoad notification
+    useEffect(() => {
         if (onLoad) {
             onLoad();
         }
-        triggerInvalidate(); // Trigger re-render for demand frameloop
-    }, [clonedScene, sharedMaterial, onLoad, triggerInvalidate]);
+        triggerInvalidate();
+    }, [clonedScene, onLoad, triggerInvalidate]);
+
+    // Update material properties efficiently
+    useEffect(() => {
+        if (sharedMaterial) {
+            sharedMaterial.wireframe = wireframe;
+            sharedMaterial.color.set(color);
+            sharedMaterial.needsUpdate = true;
+            triggerInvalidate();
+        }
+    }, [wireframe, color, sharedMaterial, triggerInvalidate]);
 
     // Strict memory cleanup on unmount or model change
     useEffect(() => {
-        previousUrlRef.current = url;
-
         return () => {
             // Dispose all geometries from tracked meshes
-            meshesRef.current.forEach((mesh) => {
+            meshes.forEach((mesh) => {
                 if (mesh.geometry) {
                     mesh.geometry.dispose();
                 }
             });
-            meshesRef.current = [];
 
             // Dispose shared material
-            if (materialRef.current) {
-                materialRef.current.dispose();
-                materialRef.current = null;
+            if (sharedMaterial) {
+                sharedMaterial.dispose();
             }
 
             // Clear GLTF cache for this URL to free memory
-            if (previousUrlRef.current) {
-                useGLTF.clear(previousUrlRef.current);
-            }
-
-            isInitializedRef.current = false;
+            useGLTF.clear(url);
         };
-    }, [url]);
+    }, [url, meshes, sharedMaterial]);
 
     return <primitive object={clonedScene} />;
 };
@@ -265,6 +244,49 @@ const SceneContent = React.memo<ModelViewerProps & {
 
 
 /**
+ * Active Tool Context wrapper for Orbit Controls
+ * Isolated to prevent Canvas re-renders when activeTool changes
+ */
+const ViewerControls = () => {
+    const activeTool = useViewerStore(state => state.activeTool);
+    const controlsRef = useRef<any>(null);
+
+    // Listen to global reset view event from header toolbar
+    useEffect(() => {
+        const handleReset = () => {
+            if (controlsRef.current) {
+                controlsRef.current.reset();
+            }
+        };
+        window.addEventListener('reset-view', handleReset);
+        return () => window.removeEventListener('reset-view', handleReset);
+    }, []);
+
+    return (
+        <OrbitControls
+            ref={controlsRef}
+            enableDamping
+            dampingFactor={0.08}
+            rotateSpeed={0.8}
+            panSpeed={0.6}
+            zoomSpeed={0.8}
+            minDistance={50}
+            maxDistance={800}
+            minPolarAngle={0.1}
+            maxPolarAngle={Math.PI - 0.1}
+            enablePan
+            mouseButtons={{
+                LEFT: activeTool === 'pan' ? THREE.MOUSE.PAN : 
+                      activeTool === 'zoom' ? THREE.MOUSE.DOLLY : 
+                      THREE.MOUSE.ROTATE,
+                MIDDLE: THREE.MOUSE.DOLLY,
+                RIGHT: THREE.MOUSE.PAN,
+            }}
+        />
+    );
+};
+
+/**
  * 3D Model Viewer Component
  *
  * Uses drei OrbitControls for native, smooth 3D interactions.
@@ -272,7 +294,7 @@ const SceneContent = React.memo<ModelViewerProps & {
  * damping animation running continuously.
  */
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
-    const handleModelLoad = useCallback(() => {}, []);
+    const handleModelLoad = useCallback(() => { }, []);
 
     const glProps = useMemo(() => ({
         antialias: true,
@@ -384,48 +406,13 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                     near={1}
                     far={3000}
                 />
-                <OrbitControls
-                    enableDamping
-                    dampingFactor={0.08}
-                    rotateSpeed={0.8}
-                    panSpeed={0.6}
-                    zoomSpeed={0.8}
-                    minDistance={50}
-                    maxDistance={800}
-                    minPolarAngle={0.1}
-                    maxPolarAngle={Math.PI - 0.1}
-                    enablePan
-                    mouseButtons={{
-                        LEFT: THREE.MOUSE.ROTATE,
-                        MIDDLE: THREE.MOUSE.DOLLY,
-                        RIGHT: THREE.MOUSE.PAN,
-                    }}
-                />
+                <ViewerControls />
                 <SceneContent
                     {...props}
                     onModelLoad={handleModelLoad}
                 />
             </Canvas>
 
-            {/* Disclaimer */}
-            <div
-                style={{
-                    position: 'absolute',
-                    bottom: 'var(--space-md)',
-                    right: 'var(--space-md)',
-                    zIndex: 10,
-                    maxWidth: 280,
-                    background: 'rgba(239, 68, 68, 0.1)',
-                    border: '1px solid rgba(239, 68, 68, 0.3)',
-                    borderRadius: 'var(--radius-sm)',
-                    padding: 'var(--space-sm)',
-                    fontSize: '0.65rem',
-                    color: 'var(--accent-error)',
-                    lineHeight: 1.4,
-                }}
-            >
-                3D visualization is for research purposes only. Not intended for clinical diagnosis.
-            </div>
         </div>
     );
 };

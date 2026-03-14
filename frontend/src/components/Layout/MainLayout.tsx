@@ -1,11 +1,14 @@
 import React, { useState, type ReactNode } from 'react';
-import { Activity, PanelLeftClose, PanelLeft } from 'lucide-react';
+import { Activity, Info } from 'lucide-react';
 import { ErrorBoundary } from '../UI/ErrorBoundary';
+import { HeaderToolbar } from './HeaderToolbar';
+import { PatientInfoPanel } from './PatientInfoPanel';
 import type { ViewMode } from '../../types';
 
 interface MainLayoutProps {
-    sidebar: ReactNode;
     viewer2D: ReactNode;
+    viewer2D_coronal?: ReactNode;
+    viewer2D_sagittal?: ReactNode;
     viewer3D: ReactNode | null;
     viewMode: ViewMode;
 }
@@ -13,22 +16,17 @@ interface MainLayoutProps {
 /**
  * Main Layout Component
  * Provides the overall structure for the viewer:
- * - Header with branding and status
- * - Collapsible sidebar for controls
- * - Main content area with 2D/3D viewers
+ * - Header with branding and control toolbar
+ * - Main content area with 2D/3D viewers and info overlays
  */
 export const MainLayout: React.FC<MainLayoutProps> = ({
-    sidebar,
     viewer2D,
+    viewer2D_coronal,
+    viewer2D_sagittal,
     viewer3D,
     viewMode,
 }) => {
-    const [sidebarOpen, setSidebarOpen] = useState(true);
-
-    const toggleSidebar = () => {
-        setSidebarOpen(prev => !prev);
-    };
-
+    const [showInfoPanel, setShowInfoPanel] = useState(true);
     return (
         <div
             style={{
@@ -44,49 +42,17 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                 style={{
                     height: 56,
                     minHeight: 56,
-                    borderBottom: '1px solid var(--border-subtle)',
                     display: 'flex',
                     alignItems: 'center',
+                    justifyContent: 'space-between',
                     padding: '0 var(--space-lg)',
-                    background: 'var(--bg-panel)',
+                    background: '#072848ff',
                     zIndex: 20,
+                    borderBottom: '1px solid rgba(82, 137, 224, 0.3)',
                 }}
             >
-                {/* Sidebar Toggle Button */}
-                <button
-                    onClick={toggleSidebar}
-                    title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-                    aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
-                    style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        width: 36,
-                        height: 36,
-                        borderRadius: 'var(--radius-md)',
-                        background: 'var(--bg-element)',
-                        border: '1px solid var(--border-subtle)',
-                        color: 'var(--text-secondary)',
-                        cursor: 'pointer',
-                        marginRight: 'var(--space-md)',
-                        transition: 'all var(--transition-fast)',
-                    }}
-                    onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'var(--bg-element-hover)';
-                        e.currentTarget.style.borderColor = 'var(--border-default)';
-                        e.currentTarget.style.color = 'var(--text-primary)';
-                    }}
-                    onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'var(--bg-element)';
-                        e.currentTarget.style.borderColor = 'var(--border-subtle)';
-                        e.currentTarget.style.color = 'var(--text-secondary)';
-                    }}
-                >
-                    {sidebarOpen ? <PanelLeftClose size={18} /> : <PanelLeft size={18} />}
-                </button>
-
                 {/* Logo & Title */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-md)', flex: 1 }}>
                     <div
                         style={{
                             width: 36,
@@ -125,71 +91,39 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                     </div>
                 </div>
 
-                <div style={{ flex: 1 }} />
+                {/* Main Toolbar Controls */}
+                <div style={{ display: 'flex', justifyContent: 'center' }}>
+                    <HeaderToolbar />
+                </div>
 
-                {/* Status Indicator */}
-                <div
-                    style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 'var(--space-sm)',
-                        padding: 'var(--space-xs) var(--space-sm)',
-                        background: 'var(--accent-success-glow)',
-                        borderRadius: 'var(--radius-full)',
-                        border: '1px solid rgba(16, 185, 129, 0.3)',
-                    }}
-                >
-                    <span
+                {/* Toggle Info Panel */}
+                <div style={{ display: 'flex', justifyContent: 'flex-end', flex: 1 }}>
+                    <button
+                        onClick={() => setShowInfoPanel(!showInfoPanel)}
                         style={{
-                            width: 6,
-                            height: 6,
-                            borderRadius: '50%',
-                            background: 'var(--accent-success)',
-                            animation: 'pulse 2s ease-in-out infinite',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            background: showInfoPanel ? 'var(--accent-primary)' : 'rgba(0, 0, 0, 0.2)',
+                            color: showInfoPanel ? '#fff' : 'rgba(255, 255, 255, 0.7)',
+                            border: '1px solid',
+                            borderColor: showInfoPanel ? 'var(--accent-primary)' : 'rgba(255, 255, 255, 0.2)',
+                            padding: '6px 12px',
+                            borderRadius: 'var(--radius-sm)',
+                            fontSize: '0.8rem',
+                            cursor: 'pointer',
+                            transition: 'all 0.2s',
                         }}
-                    />
-                    <span
-                        style={{
-                            fontSize: '0.75rem',
-                            color: 'var(--accent-success)',
-                            fontWeight: 500,
-                        }}
+                        title={showInfoPanel ? 'Hide Info Panel' : 'Show Info Panel'}
                     >
-                        System Ready
-                    </span>
+                        <Info size={14} />
+                        Info
+                    </button>
                 </div>
             </header>
 
             {/* Body */}
-            <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
-                {/* Sidebar */}
-                <aside
-                    style={{
-                        width: sidebarOpen ? 320 : 0,
-                        minWidth: sidebarOpen ? 320 : 0,
-                        background: 'var(--bg-panel)',
-                        borderRight: sidebarOpen ? '1px solid var(--border-subtle)' : 'none',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        overflow: 'hidden',
-                        transition: 'width var(--transition-slow), min-width var(--transition-slow), border-right var(--transition-slow)',
-                    }}
-                >
-                    <div
-                        style={{
-                            padding: 'var(--space-lg)',
-                            flex: 1,
-                            overflowY: 'auto',
-                            overflowX: 'hidden',
-                            opacity: sidebarOpen ? 1 : 0,
-                            transition: 'opacity var(--transition-fast)',
-                            pointerEvents: sidebarOpen ? 'auto' : 'none',
-                        }}
-                    >
-                        {sidebar}
-                    </div>
-                </aside>
-
+            <div style={{ flex: 1, display: 'flex', position: 'relative', overflow: 'hidden' }}>
                 {/* Viewers */}
                 <main
                     style={{
@@ -199,39 +133,55 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                         gap: 2,
                         background: '#000',
                         overflow: 'hidden',
+                        position: 'relative'
                     }}
                 >
+                    {/* Floating Info Panel Overlay */}
+                    {showInfoPanel && <PatientInfoPanel />}
                     {/* 2D View */}
                     {viewMode === '2D' && (
-                        <div
-                            style={{
-                                flex: 1,
-                                position: 'relative',
-                                background: '#000',
-                                display: 'flex',
-                                flexDirection: 'column',
-                            }}
-                        >
-                            <ErrorBoundary>
-                                {viewer2D}
-                            </ErrorBoundary>
+                        <div style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                            <ErrorBoundary>{viewer2D}</ErrorBoundary>
                         </div>
                     )}
 
                     {/* 3D View */}
                     {viewMode === '3D' && viewer3D && (
-                        <div
-                            style={{
-                                flex: 1,
-                                position: 'relative',
-                                background: 'var(--bg-app)',
-                                display: 'flex',
-                                flexDirection: 'column',
-                            }}
-                        >
-                            <ErrorBoundary>
-                                {viewer3D}
-                            </ErrorBoundary>
+                        <div style={{ flex: 1, position: 'relative', background: 'var(--bg-app)', display: 'flex', flexDirection: 'column' }}>
+                            <ErrorBoundary>{viewer3D}</ErrorBoundary>
+                        </div>
+                    )}
+
+                    {/* MPR View (1x3 Grid) */}
+                    {viewMode === 'MPR' && (
+                        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 2, background: '#222' }}>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D}</ErrorBoundary>
+                            </div>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D_sagittal || viewer2D}</ErrorBoundary>
+                            </div>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D_coronal || viewer2D}</ErrorBoundary>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* MPR + 3D View (2x2 Grid) */}
+                    {viewMode === 'MPR_3D' && (
+                        <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr 1fr', gap: 2, background: '#222' }}>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D}</ErrorBoundary>
+                            </div>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D_sagittal || viewer2D}</ErrorBoundary>
+                            </div>
+                            <div style={{ position: 'relative', background: '#000', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer2D_coronal || viewer2D}</ErrorBoundary>
+                            </div>
+                            <div style={{ position: 'relative', background: 'var(--bg-app)', display: 'flex', flexDirection: 'column' }}>
+                                <ErrorBoundary>{viewer3D}</ErrorBoundary>
+                            </div>
                         </div>
                     )}
                 </main>

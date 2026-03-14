@@ -25,10 +25,8 @@ import {
   Settings,
   Layers,
   Box,
-  Info,
   LogOut,
   Eye,
-  Palette,
   SlidersHorizontal,
 } from 'lucide-react';
 
@@ -293,39 +291,6 @@ export function Sidebar() {
               disabled={viewMode === '3D'}
             />
           )}
-
-          <Divider />
-
-          {/* 3D Controls */}
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 'var(--space-sm)',
-              marginBottom: 'var(--space-md)',
-            }}
-          >
-            <Palette size={14} color="var(--text-muted)" />
-            <span
-              style={{
-                fontSize: '0.75rem',
-                fontWeight: 600,
-                textTransform: 'uppercase',
-                color: 'var(--text-muted)',
-                letterSpacing: '0.05em',
-              }}
-            >
-              3D Rendering
-            </span>
-          </div>
-
-          <ToggleSwitch
-            label="Wireframe Mode"
-            checked={showWireframe}
-            onChange={setShowWireframe}
-            disabled={viewMode === '2D'}
-            description="Show mesh structure"
-          />
         </div>
       </section>
 
@@ -334,33 +299,6 @@ export function Sidebar() {
         <PipelineVisualizer steps={pipelineSteps} />
       </section>
 
-      {/* Spacer */}
-      <div style={{ flex: 1 }} />
-
-      {/* Disclaimer */}
-      <section
-        style={{
-          padding: 'var(--space-md)',
-          background: 'rgba(239, 68, 68, 0.08)',
-          border: '1px solid rgba(239, 68, 68, 0.2)',
-          borderRadius: 'var(--radius-md)',
-        }}
-      >
-        <div style={{ display: 'flex', gap: 'var(--space-sm)', alignItems: 'flex-start' }}>
-          <Info size={16} color="var(--accent-error)" style={{ flexShrink: 0, marginTop: 2 }} />
-          <p
-            style={{
-              fontSize: '0.75rem',
-              color: 'var(--accent-error)',
-              lineHeight: 1.5,
-              margin: 0,
-            }}
-          >
-            This system is for research and educational purposes only. Not intended for clinical
-            diagnosis.
-          </p>
-        </div>
-      </section>
     </div>
   );
 }

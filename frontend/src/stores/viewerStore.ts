@@ -15,6 +15,8 @@ import {
   type WindowPresetKey,
 } from '../types';
 
+export type ToolMode = 'none' | 'zoom' | 'pan' | 'rotate' | 'crosshair';
+
 interface ViewerState {
   // App state
   appState: 'ENTRY' | 'VISUALIZATION';
@@ -24,6 +26,7 @@ interface ViewerState {
   // View settings
   viewMode: ViewMode;
   sliceIndex: number;
+  activeTool: ToolMode;
 
   // Window/Level
   windowPreset: WindowPresetKey;
@@ -35,6 +38,9 @@ interface ViewerState {
   showSegmentation: boolean;
   segmentationOpacity: number;
   showWireframe: boolean;
+
+  // MPR State
+  mprCrosshair: { x: number; y: number; z: number };
 }
 
 interface ViewerActions {
@@ -42,6 +48,7 @@ interface ViewerActions {
   setAppState: (state: 'ENTRY' | 'VISUALIZATION') => void;
   setViewMode: (mode: ViewMode) => void;
   setSliceIndex: (index: number) => void;
+  setActiveTool: (tool: ToolMode) => void;
 
   // Case lifecycle
   onUploadComplete: (meta: CaseMetadata) => void;
@@ -61,6 +68,9 @@ interface ViewerActions {
   setShowSegmentation: (show: boolean) => void;
   setSegmentationOpacity: (opacity: number) => void;
   setShowWireframe: (show: boolean) => void;
+
+  // MPR Actions
+  setMprCrosshair: (crosshair: { x: number; y: number; z: number }) => void;
 }
 
 const initialState: ViewerState = {
@@ -69,6 +79,7 @@ const initialState: ViewerState = {
   pipelineSteps: PIPELINE_STEPS,
   viewMode: '2D',
   sliceIndex: 0,
+  activeTool: 'none',
   windowPreset: 'SOFT_TISSUE',
   useCustomWindow: false,
   customWindowLevel: 40,
@@ -76,6 +87,7 @@ const initialState: ViewerState = {
   showSegmentation: false,
   segmentationOpacity: 0.5,
   showWireframe: false,
+  mprCrosshair: { x: 0, y: 0, z: 0 },
 };
 
 export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
@@ -84,6 +96,7 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
   setAppState: (appState) => set({ appState }),
   setViewMode: (viewMode) => set({ viewMode }),
   setSliceIndex: (sliceIndex) => set({ sliceIndex }),
+  setActiveTool: (activeTool) => set({ activeTool }),
 
   onUploadComplete: (meta) =>
     set({
@@ -122,4 +135,5 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
   setShowSegmentation: (showSegmentation) => set({ showSegmentation }),
   setSegmentationOpacity: (segmentationOpacity) => set({ segmentationOpacity }),
   setShowWireframe: (showWireframe) => set({ showWireframe }),
+  setMprCrosshair: (mprCrosshair) => set({ mprCrosshair }),
 }));

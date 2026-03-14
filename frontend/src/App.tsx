@@ -1,6 +1,5 @@
 import { useEffect } from 'react';
 import { MainLayout } from './components/Layout/MainLayout';
-import { Sidebar } from './components/Layout/Sidebar';
 import { SliceViewer } from './components/CTViewer/SliceViewer';
 import { ModelViewer } from './components/MeshViewer/ModelViewer';
 import { UploadPage } from './components/Entry/UploadPage';
@@ -8,22 +7,20 @@ import { useViewerStore } from './stores/viewerStore';
 import { casesApi } from './services/api';
 
 function App() {
-  const {
-    appState,
-    metadata,
-    viewMode,
-    sliceIndex,
-    setSliceIndex,
-    windowPreset,
-    showSegmentation,
-    segmentationOpacity,
-    useCustomWindow,
-    customWindowLevel,
-    customWindowWidth,
-    showWireframe,
-    onUploadComplete,
-    setPipelineSteps,
-  } = useViewerStore();
+  const appState = useViewerStore(s => s.appState);
+  const metadata = useViewerStore(s => s.metadata);
+  const viewMode = useViewerStore(s => s.viewMode);
+  const sliceIndex = useViewerStore(s => s.sliceIndex);
+  const setSliceIndex = useViewerStore(s => s.setSliceIndex);
+  const windowPreset = useViewerStore(s => s.windowPreset);
+  const showSegmentation = useViewerStore(s => s.showSegmentation);
+  const segmentationOpacity = useViewerStore(s => s.segmentationOpacity);
+  const useCustomWindow = useViewerStore(s => s.useCustomWindow);
+  const customWindowLevel = useViewerStore(s => s.customWindowLevel);
+  const customWindowWidth = useViewerStore(s => s.customWindowWidth);
+  const showWireframe = useViewerStore(s => s.showWireframe);
+  const onUploadComplete = useViewerStore(s => s.onUploadComplete);
+  const setPipelineSteps = useViewerStore(s => s.setPipelineSteps);
 
   // Fetch pipeline status when in visualization mode
   useEffect(() => {
@@ -67,7 +64,6 @@ function App() {
   return (
     <MainLayout
       viewMode={viewMode}
-      sidebar={<Sidebar />}
       viewer2D={
         metadata ? (
           <SliceViewer
@@ -98,6 +94,40 @@ function App() {
             Initializing viewer...
           </div>
         )
+      }
+      viewer2D_coronal={
+        metadata ? (
+          <SliceViewer
+            caseId={metadata.id}
+            totalSlices={metadata.totalSlices}
+            showControls={true}
+            viewLabel="Coronal MPR"
+            viewType="CORONAL"
+            windowPreset={windowPreset}
+            showSegmentation={showSegmentation}
+            segmentationOpacity={segmentationOpacity}
+            useCustomWindow={useCustomWindow}
+            customWindowLevel={customWindowLevel}
+            customWindowWidth={customWindowWidth}
+          />
+        ) : undefined
+      }
+      viewer2D_sagittal={
+        metadata ? (
+          <SliceViewer
+            caseId={metadata.id}
+            totalSlices={metadata.totalSlices}
+            showControls={true}
+            viewLabel="Sagittal MPR"
+            viewType="SAGITTAL"
+            windowPreset={windowPreset}
+            showSegmentation={showSegmentation}
+            segmentationOpacity={segmentationOpacity}
+            useCustomWindow={useCustomWindow}
+            customWindowLevel={customWindowLevel}
+            customWindowWidth={customWindowWidth}
+          />
+        ) : undefined
       }
       viewer3D={
         metadata ? (

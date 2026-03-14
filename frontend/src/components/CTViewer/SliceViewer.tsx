@@ -1,7 +1,10 @@
-import React, { useRef, useCallback, useEffect, useState } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { useVolumeViewer } from '../../hooks/useVolumeViewer';
 import { RotateCcw, ZoomIn, ZoomOut, Loader2 } from 'lucide-react';
-import type { WindowPresetKey } from '../../types';
+import { type WindowPresetKey, type MPRView } from '../../types';
+import { useViewerStore } from '../../stores/viewerStore';
+import { WindowPresetControl } from './WindowPresetControl';
+import { useViewerInteractions } from '../../hooks/useViewerInteractions';
 
 interface SliceViewerProps {
     caseId: string;
@@ -10,6 +13,7 @@ interface SliceViewerProps {
     onIndexChange?: (index: number) => void;
     showControls?: boolean;
     viewLabel?: string;
+    viewType?: MPRView;
     windowPreset?: WindowPresetKey;
     showSegmentation?: boolean;
     segmentationOpacity?: number;
@@ -26,8 +30,11 @@ interface SliceViewerProps {
 export const SliceViewer: React.FC<SliceViewerProps> = ({
     caseId,
     totalSlices,
+    currentIndex,
+    onIndexChange,
     showControls = true,
     viewLabel = 'Axial',
+    viewType = 'AXIAL',
     windowPreset = 'SOFT_TISSUE',
     showSegmentation = false,
     segmentationOpacity = 0.5,
@@ -38,26 +45,50 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
-    const [zoom, setZoom] = useState(1);
-    const [pan, setPan] = useState({ x: 0, y: 0 });
-    const [isDragging, setIsDragging] = useState(false);
-    const dragStartRef = useRef({ x: 0, y: 0 });
 
     const {
         isLoaded,
         loading,
         loadProgress,
         error,
+        volume,
         crosshair,
         setCrosshair,
-        handleScroll,
         renderSliceToImageData,
         renderSliceWithCustomWindow,
         renderMaskSliceToImageData,
         getViewDimensions,
         setWindowPreset: setHookWindowPreset,
+        getSliceIndex,
+        updateCrosshair,
         hasMask,
     } = useVolumeViewer(caseId);
+
+    const activeTool = useViewerStore(state => state.activeTool);
+    const viewMode = useViewerStore(state => state.viewMode);
+    const currentSlice = getSliceIndex(viewType);
+    const dims = getViewDimensions(viewType);
+
+    const {
+        zoom,
+        setZoom,
+        pan,
+        isDragging,
+        isZooming,
+        crosshairPos,
+        handleMouseDown,
+        handleMouseMove,
+        handleMouseUp,
+        resetView
+    } = useViewerInteractions({
+        canvasRef,
+        dims,
+        volume,
+        viewType,
+        crosshair,
+        setCrosshair,
+        activeTool
+    });
 
     // Sync window preset - use ref to avoid re-render loop
     const windowPresetRef = useRef(windowPreset);
@@ -71,16 +102,24 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     // Render slice to canvas - use custom window if enabled
     const imageData = isLoaded
         ? (useCustomWindow
-            ? renderSliceWithCustomWindow('AXIAL', crosshair.z, customWindowLevel, customWindowWidth)
-            : renderSliceToImageData('AXIAL', crosshair.z, windowPreset))
+            ? renderSliceWithCustomWindow(viewType, currentSlice, customWindowLevel, customWindowWidth)
+            : renderSliceToImageData(viewType, currentSlice, windowPreset))
         : null;
     const maskImageData = isLoaded && showSegmentation && hasMask
-        ? renderMaskSliceToImageData('AXIAL', crosshair.z)
+        ? renderMaskSliceToImageData(viewType, currentSlice)
         : null;
+
+    // Sync external currentIndex to internal crosshair
+    useEffect(() => {
+        if (currentIndex !== undefined && currentIndex !== currentSlice) {
+            updateCrosshair(viewType, currentIndex);
+        }
+    }, [currentIndex, currentSlice, updateCrosshair, viewType]);
+
 
     // Render CT slice
     useEffect(() => {
-        if (!imageData || !canvasRef.current) return;
+        if (loading || !imageData || !canvasRef.current) return;
 
         const canvas = canvasRef.current;
         if (canvas.width !== imageData.width || canvas.height !== imageData.height) {
@@ -92,11 +131,11 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         if (ctx) {
             ctx.putImageData(imageData, 0, 0);
         }
-    }, [imageData]);
+    }, [imageData, loading]);
 
     // Render mask overlay
     useEffect(() => {
-        if (!maskCanvasRef.current) return;
+        if (loading || !maskCanvasRef.current) return;
 
         const maskCanvas = maskCanvasRef.current;
         const ctx = maskCanvas.getContext('2d', { alpha: true });
@@ -117,10 +156,10 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
             // Clear mask when not showing
             ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         }
-    }, [maskImageData, showSegmentation, segmentationOpacity]);
+    }, [maskImageData, showSegmentation, segmentationOpacity, loading]);
 
-    const dims = getViewDimensions('AXIAL');
     const sliceCount = dims?.maxSlice || totalSlices;
+    const spacingAspect = dims ? (dims.spacing.y / dims.spacing.x) : 1;
 
     // Use native event listener for wheel to avoid passive issues
     useEffect(() => {
@@ -129,38 +168,20 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
 
         const onWheel = (e: WheelEvent) => {
             e.preventDefault();
-            handleScroll('AXIAL', Math.sign(e.deltaY));
+            // Calculate new index and sync it correctly
+            const delta = Math.sign(e.deltaY);
+            const newIndex = Math.max(0, Math.min(sliceCount - 1, currentSlice - delta));
+
+            if (newIndex !== currentSlice) {
+                updateCrosshair(viewType, newIndex);
+                onIndexChange?.(newIndex);
+            }
         };
 
         container.addEventListener('wheel', onWheel, { passive: false });
+        // Make sure to add dependencies otherwise the handlers have stale state
         return () => container.removeEventListener('wheel', onWheel);
-    }, [handleScroll]);
-
-    // Handle pan
-    const handleMouseDown = useCallback((e: React.MouseEvent) => {
-        if (e.button === 0 && e.ctrlKey) {
-            setIsDragging(true);
-            dragStartRef.current = { x: e.clientX - pan.x, y: e.clientY - pan.y };
-        }
-    }, [pan]);
-
-    const handleMouseMove = useCallback((e: React.MouseEvent) => {
-        if (isDragging) {
-            setPan({
-                x: e.clientX - dragStartRef.current.x,
-                y: e.clientY - dragStartRef.current.y,
-            });
-        }
-    }, [isDragging]);
-
-    const handleMouseUp = useCallback(() => {
-        setIsDragging(false);
-    }, []);
-
-    const resetView = useCallback(() => {
-        setZoom(1);
-        setPan({ x: 0, y: 0 });
-    }, []);
+    }, [currentSlice, sliceCount, onIndexChange, updateCrosshair, viewType]);
 
     // Loading state
     if (loading) {
@@ -239,28 +260,6 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                 {viewLabel}
             </div>
 
-            {/* Window Preset Badge */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: 8,
-                    left: 80,
-                    zIndex: 10,
-                    background: useCustomWindow ? 'rgba(59, 130, 246, 0.2)' : 'rgba(0,0,0,0.7)',
-                    backdropFilter: 'blur(4px)',
-                    padding: '4px 8px',
-                    borderRadius: 4,
-                    fontSize: '0.65rem',
-                    fontWeight: 500,
-                    color: useCustomWindow ? '#3b82f6' : '#94a3b8',
-                    border: useCustomWindow ? '1px solid rgba(59, 130, 246, 0.4)' : '1px solid rgba(255,255,255,0.1)',
-                }}
-            >
-                {useCustomWindow
-                    ? `WL: ${customWindowLevel} / WW: ${customWindowWidth}`
-                    : windowPreset.replace('_', ' ')}
-            </div>
-
             {/* Segmentation Indicator */}
             {showSegmentation && hasMask && (
                 <div
@@ -309,7 +308,7 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                     color: '#aaa',
                 }}
             >
-                {crosshair.z + 1}/{sliceCount}
+                {currentSlice + 1}/{sliceCount}
             </div>
 
             {/* Canvas Container */}
@@ -319,7 +318,7 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    cursor: isDragging ? 'grabbing' : 'crosshair',
+                    cursor: isDragging ? 'grabbing' : isZooming ? 'ns-resize' : 'crosshair',
                 }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
@@ -339,6 +338,8 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         style={{
                             display: 'block',
                             imageRendering: 'pixelated',
+                            width: imageData ? imageData.width : undefined,
+                            height: imageData ? imageData.height * spacingAspect : undefined,
                         }}
                     />
 
@@ -353,8 +354,18 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                             imageRendering: 'pixelated',
                             pointerEvents: 'none',
                             mixBlendMode: 'normal',
+                            width: imageData ? imageData.width : undefined,
+                            height: imageData ? imageData.height * spacingAspect : undefined,
                         }}
                     />
+
+                    {/* Crosshair Overlay */}
+                    {(viewMode === 'MPR' || viewMode === 'MPR_3D' || activeTool === 'crosshair') && crosshairPos && (
+                        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'none' }}>
+                            <div style={{ position: 'absolute', top: `${crosshairPos.cy}%`, left: 0, right: 0, height: `${1/zoom}px`, background: 'rgba(244, 63, 94, 0.7)', transform: 'translateY(-50%)' }} />
+                            <div style={{ position: 'absolute', left: `${crosshairPos.cx}%`, top: 0, bottom: 0, width: `${1/zoom}px`, background: 'rgba(244, 63, 94, 0.7)', transform: 'translateX(-50%)' }} />
+                        </div>
+                    )}
                 </div>
 
                 {/* Loading placeholder */}
@@ -370,6 +381,9 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                     </div>
                 )}
             </div>
+
+            {/* Window Preset Control Overlay */}
+            <WindowPresetControl />
 
             {/* Bottom Controls */}
             {showControls && (
@@ -390,19 +404,23 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         type="range"
                         min={0}
                         max={sliceCount - 1}
-                        value={crosshair.z}
-                        onChange={(e) => setCrosshair(prev => ({ ...prev, z: parseInt(e.target.value) }))}
+                        value={currentSlice}
+                        onChange={(e) => {
+                            const newIndex = parseInt(e.target.value);
+                            updateCrosshair(viewType, newIndex);
+                            onIndexChange?.(newIndex);
+                        }}
                         style={{ flex: 1, height: 4 }}
                     />
                     <button
-                        onClick={() => setZoom(z => Math.min(z * 1.25, 5))}
+                        onClick={() => setZoom(z => Math.min(z * 1.25, 20))}
                         style={btnStyle}
                         title="Zoom In"
                     >
                         <ZoomIn size={14} />
                     </button>
                     <button
-                        onClick={() => setZoom(z => Math.max(z / 1.25, 0.5))}
+                        onClick={() => setZoom(z => Math.max(z / 1.25, 0.1))}
                         style={btnStyle}
                         title="Zoom Out"
                     >
