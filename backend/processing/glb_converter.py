@@ -11,6 +11,7 @@ Key features:
 - UV and vertex color preservation
 """
 
+import sys
 import subprocess
 import tempfile
 import shutil
@@ -122,7 +123,7 @@ def _convert_with_draco(
             capture_output=True,
             text=True,
             timeout=120,  # 2 minute timeout
-            shell=True if subprocess.sys.platform == 'win32' else False
+            shell=True if sys.platform == 'win32' else False
         )
         
         if result.returncode != 0:

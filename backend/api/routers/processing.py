@@ -15,9 +15,30 @@ from models.enums import CaseStatus
 from storage.repository import CaseRepository
 from services.pipeline import PipelineService
 from api.dependencies import get_repository, get_pipeline_service
+from config import settings
 
 
 router = APIRouter(tags=["Processing"])
+
+
+# --- Helpers for Hybrid Environment (Local / Modal) ---
+
+def is_running_in_modal() -> bool:
+    """Check if the code is executing inside a Modal container."""
+    try:
+        import modal
+        return modal.is_local() is False
+    except ImportError:
+        return False
+
+def _reload_if_modal():
+    """Reload reads from Modal Volume to avoid stale cached data."""
+    if is_running_in_modal():
+        try:
+            from modal_app import data_volume
+            data_volume.reload()
+        except ImportError:
+            pass
 
 
 @router.post("/cases/{case_id}/process", response_model=ProcessingResponse, summary="Start AI processing")
@@ -28,9 +49,11 @@ async def trigger_processing(
 ):
     """
     Trigger the AI processing pipeline for a case.
-    Processing runs in a thread pool to avoid blocking async requests.
+    Processing runs in a thread pool to avoid blocking async requests,
+    or runs on a dedicated Modal GPU worker if deployed.
     Use GET /cases/{case_id}/status to check progress.
     """
+    _reload_if_modal()
     status = repo.get_status(case_id)
 
     if status == "error" and not repo.case_exists(case_id):
@@ -43,8 +66,12 @@ async def trigger_processing(
             estimated_time_seconds=15.0
         )
 
-    # Run CPU-heavy pipeline in a thread to keep async event loop free
-    asyncio.get_event_loop().run_in_executor(None, pipeline.process_case, case_id)
+    if is_running_in_modal():
+        from modal_app import process_case_gpu
+        process_case_gpu.spawn(case_id)
+    else:
+        # Run CPU-heavy pipeline in a thread to keep async event loop free
+        asyncio.get_event_loop().run_in_executor(None, pipeline.process_case, case_id)
 
     return ProcessingResponse(
         case_id=case_id,
@@ -59,6 +86,7 @@ async def get_pipeline_status(
     pipeline: PipelineService = Depends(get_pipeline_service)
 ):
     """Get detailed status of pipeline stages and available artifacts."""
+    _reload_if_modal()
     return JSONResponse(content=pipeline.get_pipeline_status(case_id))
 
 
@@ -68,6 +96,7 @@ async def get_mask_volume(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get the full segmentation mask as raw binary data (uint8)."""
+    _reload_if_modal()
     mask = repo.load_mask(case_id)
     if mask is None:
         raise HTTPException(status_code=404, detail="Mask not found")
@@ -91,6 +120,7 @@ async def get_mask_slice(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get a single segmentation mask slice."""
+    _reload_if_modal()
     mask = repo.load_mask_mmap(case_id)
     if mask is None:
         raise HTTPException(status_code=404, detail="Mask not found")
@@ -117,6 +147,7 @@ async def get_implicit_info(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get metadata about the implicit representation (SDF)."""
+    _reload_if_modal()
     status = repo.get_status(case_id)
 
     if status not in [CaseStatus.READY.value, "ready"]:

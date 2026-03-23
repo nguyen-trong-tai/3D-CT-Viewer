@@ -20,6 +20,7 @@ from storage.repository import CaseRepository
 from models.enums import CaseStatus
 from processing import (
     segment_volume_baseline,
+    segment_lung_nodules_ai,
     compute_sdf,
     compute_sdf_downsampled,
     get_optimal_downsample_factor,
@@ -78,7 +79,8 @@ class PipelineService:
         self,
         case_id: str,
         force_recompute: bool = False,
-        segmentation_threshold: float = -600.0
+        segmentation_threshold: float = -600.0,
+        segmentation_method: str = "lung_nodules"
     ) -> PipelineResult:
         """
         Execute the full processing pipeline for a case.
@@ -117,7 +119,7 @@ class PipelineService:
             
             # Stage 2: Segmentation
             stage_result = self._stage_segmentation(
-                case_id, volume, segmentation_threshold, force_recompute
+                case_id, volume, segmentation_threshold, force_recompute, segmentation_method
             )
             result.stages.append(stage_result)
             
@@ -213,7 +215,8 @@ class PipelineService:
         case_id: str,
         volume: np.ndarray,
         threshold: float,
-        force_recompute: bool
+        force_recompute: bool,
+        segmentation_method: str = "baseline"
     ) -> PipelineStageResult:
         """Stage 2: Segment the CT volume."""
         start = time.time()
@@ -231,7 +234,16 @@ class PipelineService:
                 )
             
             # Perform segmentation
-            mask = segment_volume_baseline(volume, threshold=threshold)
+            if segmentation_method == "lung_nodules":
+                print(f"[Pipeline Stage 2] Chạy AI TotalSegmentator (Task: lung_nodules)...")
+                mask = segment_lung_nodules_ai(volume, spacing=tuple(self.repo.load_ct_metadata(case_id)["spacing"]))
+            else:
+                print(f"[Pipeline Stage 2] Chạy Baseline Thresholding (Threshold: {threshold} HU)...")
+                mask = segment_volume_baseline(volume, threshold=threshold)
+            
+            # Khởi tạo mesh placeholder nếu không có voxel nào (tránh crash pipeline)
+            if np.sum(mask > 0) == 0:
+                print(f"[Pipeline Stage 2] Trả về mảng rỗng do không tìm thấy structure.")
             
             # Store result
             self.repo.save_mask(case_id, mask)

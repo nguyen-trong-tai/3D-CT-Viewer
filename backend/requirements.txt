@@ -20,6 +20,6 @@ nibabel>=5.0.0
 scikit-image>=0.21.0
 trimesh>=4.0.0
 pygltflib>=1.16.0  # Required for GLTF/GLB export
-
-# Cloud Deployment (Optional)
+SimpleITK
+TotalSegmentator>=2.10.0 # Bổ sung Segmentator AI
 modal>=0.55.0

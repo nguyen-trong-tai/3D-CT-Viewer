@@ -20,6 +20,8 @@ from .loader import (
 
 from .segmentation import (
     segment_volume_baseline,
+    segment_volume_total_segmentator,
+    segment_lung_nodules_ai,
     segment_lung,
     segment_tissue,
     segment_bone,
@@ -64,6 +66,8 @@ __all__ = [
     "extract_dicom_metadata",
     # Segmentation
     "segment_volume_baseline",
+    "segment_volume_total_segmentator",
+    "segment_lung_nodules_ai",
     "segment_lung",
     "segment_tissue",
     "segment_bone",

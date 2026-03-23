@@ -54,7 +54,6 @@ def load_dicom_from_files(file_paths: List[str]) -> Tuple[np.ndarray, Tuple[floa
     
     Args:
         file_paths: List of paths to DICOM files
-        
     Returns:
         Tuple of volume and spacing
     """

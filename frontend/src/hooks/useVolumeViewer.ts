@@ -439,9 +439,6 @@ export function useVolumeViewer(caseId: string | null) {
         return imageData;
     }, [volume, getViewDimensions]);
 
-    /**
-     * Render mask slice to ImageData
-     */
     const renderMaskSliceToImageData = useCallback((
         view: MPRView,
         index: number
@@ -458,12 +455,15 @@ export function useVolumeViewer(caseId: string | null) {
         const imageData = new ImageData(width, height);
         const pixels = imageData.data;
 
+        const strideX = dimY * dimZ;
+        const strideY = dimZ;
+
         switch (view) {
             case 'AXIAL': {
                 if (index < 0 || index >= dimZ) return null;
                 for (let y = 0; y < dimY; y++) {
                     for (let x = 0; x < dimX; x++) {
-                        const srcIdx = x + y * dimX + index * dimX * dimY;
+                        const srcIdx = x * strideX + y * strideY + index;
                         const dstIdx = (x + y * width) << 2;
                         if (data[srcIdx] > 0) {
                             pixels[dstIdx] = 239;     // R
@@ -480,7 +480,7 @@ export function useVolumeViewer(caseId: string | null) {
                 if (index < 0 || index >= dimY) return null;
                 for (let z = 0; z < dimZ; z++) {
                     for (let x = 0; x < dimX; x++) {
-                        const srcIdx = x + index * dimX + z * dimX * dimY;
+                        const srcIdx = x * strideX + index * strideY + z;
                         const dstIdx = (x + (dimZ - 1 - z) * width) << 2;
                         if (data[srcIdx] > 0) {
                             pixels[dstIdx] = 239;
@@ -497,7 +497,7 @@ export function useVolumeViewer(caseId: string | null) {
                 if (index < 0 || index >= dimX) return null;
                 for (let z = 0; z < dimZ; z++) {
                     for (let y = 0; y < dimY; y++) {
-                        const srcIdx = index + y * dimX + z * dimX * dimY;
+                        const srcIdx = index * strideX + y * strideY + z;
                         const dstIdx = (y + (dimZ - 1 - z) * width) << 2;
                         if (data[srcIdx] > 0) {
                             pixels[dstIdx] = 239;

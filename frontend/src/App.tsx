@@ -1,7 +1,8 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { MainLayout } from './components/Layout/MainLayout';
 import { SliceViewer } from './components/CTViewer/SliceViewer';
 import { ModelViewer } from './components/MeshViewer/ModelViewer';
+import VTKHybridViewer from './components/CTViewer/VTKHybridViewer';
 import { UploadPage } from './components/Entry/UploadPage';
 import { useViewerStore } from './stores/viewerStore';
 import { casesApi } from './services/api';
@@ -21,6 +22,7 @@ function App() {
   const showWireframe = useViewerStore(s => s.showWireframe);
   const onUploadComplete = useViewerStore(s => s.onUploadComplete);
   const setPipelineSteps = useViewerStore(s => s.setPipelineSteps);
+  const [showVTK, setShowVTK] = useState(false);
 
   // Fetch pipeline status when in visualization mode
   useEffect(() => {
@@ -131,14 +133,34 @@ function App() {
       }
       viewer3D={
         metadata ? (
-          <ModelViewer
-            caseId={metadata.id}
-            currentSliceIndex={sliceIndex}
-            voxelSpacing={metadata.voxelSpacing}
-            showWireframe={showWireframe}
-            totalSlices={metadata.totalSlices}
-            showSliceIndicator={false}
-          />
+          showVTK ? (
+            <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+              <button 
+                onClick={() => setShowVTK(false)}
+                style={{ position: 'absolute', top: 10, right: 10, zIndex: 100, padding: '5px 10px', background: '#3b82f6', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+              >
+                Back to Three.js
+              </button>
+              <VTKHybridViewer caseId={metadata.id} />
+            </div>
+          ) : (
+            <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+              <button 
+                onClick={() => setShowVTK(true)}
+                style={{ position: 'absolute', top: 10, right: 10, zIndex: 100, padding: '5px 10px', background: '#eab308', color: 'black', border: 'none', borderRadius: '4px', cursor: 'pointer' }}
+              >
+                Try VTK.js PoC
+              </button>
+              <ModelViewer
+                caseId={metadata.id}
+                currentSliceIndex={sliceIndex}
+                voxelSpacing={metadata.voxelSpacing}
+                showWireframe={showWireframe}
+                totalSlices={metadata.totalSlices}
+                showSliceIndicator={false}
+              />
+            </div>
+          )
         ) : null
       }
     />

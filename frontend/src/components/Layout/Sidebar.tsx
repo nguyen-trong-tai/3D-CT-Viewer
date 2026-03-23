@@ -42,14 +42,12 @@ export function Sidebar() {
     customWindowWidth,
     showSegmentation,
     segmentationOpacity,
-    showWireframe,
     applyPreset,
     setUseCustomWindow,
     setCustomWindowLevel,
     setCustomWindowWidth,
     setShowSegmentation,
     setSegmentationOpacity,
-    setShowWireframe,
     resetCase,
   } = useViewerStore();
 

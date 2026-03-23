@@ -164,6 +164,19 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     caseId = uploadRes.case_id;
                 }
 
+                // Wait for background worker to parse DICOM/NIfTI and save the numpy volume
+                setProgressLabel('Converting DICOM/NIfTI to 3D Volume (Running in Background)...');
+                let isUploaded = false;
+                while (!isUploaded) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const currentStatus = await casesApi.getStatus(caseId);
+                    if (currentStatus.status === 'uploaded' || currentStatus.status === 'ready') {
+                        isUploaded = true;
+                    } else if (currentStatus.status === 'error') {
+                        throw new Error(currentStatus.message || 'Error processing raw data into volume.');
+                    }
+                }
+
                 // Mark upload complete
                 updateStepStatus('load_volume', 'completed');
 
@@ -295,7 +308,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             setErrorMsg('Lost connection to the server.');
                         }
                     }
-                }, 1000);
+                }, 3000);
             } catch (err) {
                 console.error(err);
                 setUploadState('error');

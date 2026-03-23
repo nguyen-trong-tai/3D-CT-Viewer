@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@kitware/vtk.js": "^35.3.2",
+    "itk-wasm": "^1.0.0-b.196"
+  }
+}

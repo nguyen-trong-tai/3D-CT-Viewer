@@ -9,24 +9,55 @@ deterministic, reproducible results.
 import numpy as np
 from scipy import ndimage
 from typing import Tuple, Optional
-
 from config import settings
 
+import os
+try:
+    import torch
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+try:
+    from totalsegmentator.python_api import totalsegmentator as _totalseg_fn
+
+    #from totalsegmentator.python_api import totalsegmentator
+    import nibabel as nib
+    TOTALSEG_AVAILABLE = True
+except ImportError:
+    TOTALSEG_AVAILABLE = False
+_loaded_tasks: set[str] = set()   # track task nào đã warm
+
+def _warmup_task(task: str):
+    """
+    Sau lần đầu, TotalSegmentator cache model nội bộ.
+    """
+    if task in _loaded_tasks:
+        return  # Đã load rồi, bỏ qua
+
+    print(f"[TotalSeg] Warming up task '{task}'...")
+    dummy = nib.Nifti1Image(
+        np.zeros((64, 64, 64), dtype=np.float32), np.eye(4)
+    )
+    try:
+        _totalseg_fn(dummy, task=task, quiet=True)
+    except Exception:
+        pass  # Bỏ qua lỗi inference — chỉ cần model được load
+
+    _loaded_tasks.add(task)
+    print(f"[TotalSeg] Task '{task}' warmed up — model in VRAM.")
 
 def segment_volume_baseline(
     volume: np.ndarray,
-    threshold: float = None
+    threshold: float = None,
+    use_ai: bool = False,
+    model_path: str = None
 ) -> np.ndarray:
     """
-    Baseline segmentation using HU thresholding.
-    
-    This is a simple but effective approach for demonstrating
-    the 3D reconstruction pipeline. It segments tissues above
-    the specified threshold.
-    
     Args:
         volume: CT volume in HU, shape (X, Y, Z)
         threshold: HU threshold for segmentation (default: -600 for soft tissue)
+        use_ai: Cờ bật chế độ AI segmentation thay cho threshold
+        model_path: Đường dẫn tới pre-trained model checkpoint (.pth)
         
     Returns:
         Binary mask (uint8), same shape as input
@@ -34,26 +65,71 @@ def segment_volume_baseline(
     Note:
         This is decision-support data, not clinical truth.
     """
+    if use_ai:
+        print("[Segmentation] Sử dụng AI Model pretrained thay cho Threshold...")
+        return segment_volume_pretrained_ai(volume, model_path)
+        
     if threshold is None:
         threshold = settings.DEFAULT_TISSUE_THRESHOLD
     
     # Simple thresholding - fast and deterministic
+    print(f"[Segmentation] Đoạn này phân vùng bằng Threshold cơ bản: {threshold} HU")
     mask = (volume > threshold).astype(np.uint8)
     
     return mask
 
 
+def segment_volume_total_segmentator(
+    volume: np.ndarray,
+    task: str = "total",
+    spacing: tuple = (1.0, 1.0, 1.0)
+) -> np.ndarray:
+    """
+    segmentation AI siêu tốc bằng TotalSegmentator 
+    """
+    if not TOTALSEG_AVAILABLE:
+        raise ImportError("Chưa cài đặt TotalSegmentator. Hãy chạy: pip install TotalSegmentator")
+    os.environ["TOTALSEG_HOME_DIR"] = os.environ.get("TOTALSEG_HOME_DIR", "")
+
+    # Đảm bảo model đã warm trước khi inference thật
+    _warmup_task(task)
+    print(f"[AI Segmentation] segment bằng TotalSegmentator (Task: {task})...")
+    affine = np.diag([spacing[0], spacing[1], spacing[2], 1.0])
+    dummy_nifti = nib.Nifti1Image(volume, affine)
+    
+    # Suy luận nhanh
+    seg_nifti = _totalseg_fn(dummy_nifti, task=task)
+    mask = seg_nifti.get_fdata()
+    
+    return mask
+
+def segment_lung_nodules_ai(volume: np.ndarray, spacing: tuple = (1.0, 1.0, 1.0)) -> np.ndarray:
+    """
+    Args:
+        volume: CT volume array (HU chuẩn).
+        spacing: Spacing of the volume (default: (1.0, 1.0, 1.0)).
+    Returns:
+        Binary mask (uint8) với label 1 là Nodule.
+    """
+    # 1. Dự đoán bằng TotalSegmentator
+    mask_multiclass = segment_volume_total_segmentator(volume, task="lung_nodules", spacing=spacing)
+    
+    # 2. Xử lý Trích xuất Nhãn
+    # lung_mask  = (mask_multiclass == 1).astype(np.uint8)
+    nodule_mask = (mask_multiclass == 1).astype(np.uint8)
+    # 3. Post-Process & Debugging Analysis
+    nodule_voxels = np.sum(nodule_mask > 0)
+    if nodule_voxels == 0:
+        print("[AI Segmentation] KHÔNG tìm thấy bất kỳ nốt sần phổi nào trong thể tích này.")
+    else:
+        print(f"[AI Segmentation] Thành công. Tìm thấy {nodule_voxels:,} voxels thuộc về nốt sần.")
+    
+    return nodule_mask
+
 def segment_lung(volume: np.ndarray) -> np.ndarray:
     """
-    Segment lung regions from CT volume.
-    
-    Uses HU thresholding with air detection:
-    - Air in lungs: approximately -1000 to -300 HU
-    - Connected component analysis to identify lung fields
-    
     Args:
         volume: CT volume in HU, shape (X, Y, Z)
-        
     Returns:
         Binary mask of lung regions (uint8)
     """
@@ -65,10 +141,6 @@ def segment_lung(volume: np.ndarray) -> np.ndarray:
         (volume > low_threshold) & 
         (volume < high_threshold)
     ).astype(np.uint8)
-    
-    # Optional: fill holes and clean up with morphological operations
-    # This is kept simple for speed and reproducibility
-    
     return lung_mask
 
 
@@ -77,33 +149,22 @@ def segment_tissue(
     threshold: float = None
 ) -> np.ndarray:
     """
-    Segment soft tissue regions from CT volume.
-    
-    Uses simple thresholding - tissue typically has HU > -300.
-    
     Args:
         volume: CT volume in HU, shape (X, Y, Z)
         threshold: HU threshold (default: -600)
-        
     Returns:
         Binary mask of tissue (uint8)
     """
     if threshold is None:
         threshold = settings.DEFAULT_TISSUE_THRESHOLD
-    
     return (volume > threshold).astype(np.uint8)
 
 
 def segment_bone(volume: np.ndarray, threshold: float = 300.0) -> np.ndarray:
     """
-    Segment bone structures from CT volume.
-    
-    Bone typically has HU > 300 (cortical bone > 700).
-    
     Args:
         volume: CT volume in HU, shape (X, Y, Z)
         threshold: HU threshold for bone (default: 300)
-        
     Returns:
         Binary mask of bone (uint8)
     """

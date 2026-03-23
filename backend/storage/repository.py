@@ -43,11 +43,7 @@ class CaseRepository:
     def case_exists(self, case_id: str) -> bool:
         """Check if a case exists."""
         return self._case_dir(case_id).exists()
-    
-    # =========================================================================
-    # Case Lifecycle Management
-    # =========================================================================
-    
+        # Case Lifecycle Management    
     def create_case(self, case_id: str) -> bool:
         """
         Create a new case directory and initialize status.
@@ -82,11 +78,7 @@ class CaseRepository:
             return False
         shutil.rmtree(case_path, ignore_errors=True)
         return True
-    
-    # =========================================================================
-    # Status Management
-    # =========================================================================
-    
+        # Status Management    
     def update_status(self, case_id: str, status: str, message: str = None):
         """Update the status of a case."""
         case_path = self._case_dir(case_id)
@@ -131,11 +123,7 @@ class CaseRepository:
         if not status_file.exists():
             return None
         return self._load_json(status_file)
-    
-    # =========================================================================
-    # CT Volume Storage
-    # =========================================================================
-    
+        # CT Volume Storage    
     def save_ct_volume(
         self, 
         case_id: str, 
@@ -190,11 +178,7 @@ class CaseRepository:
         if not path.exists():
             return None
         return self._load_json(path)
-    
-    # =========================================================================
-    # Extra Metadata (Patient Info, Study Details)
-    # =========================================================================
-    
+        # Extra Metadata (Patient Info, Study Details)    
     def save_extra_metadata(self, case_id: str, metadata: Dict[str, Any]):
         """Save additional metadata (patient info, study details, etc.)."""
         case_path = self._case_dir(case_id)
@@ -206,11 +190,7 @@ class CaseRepository:
         if not path.exists():
             return None
         return self._load_json(path)
-    
-    # =========================================================================
-    # Segmentation Mask Storage
-    # =========================================================================
-    
+        # Segmentation Mask Storage    
     def save_mask(self, case_id: str, mask: np.ndarray):
         """Save segmentation mask as uint8 (0 or 1)."""
         case_path = self._case_dir(case_id)
@@ -233,11 +213,7 @@ class CaseRepository:
     def mask_exists(self, case_id: str) -> bool:
         """Check if segmentation mask exists for a case."""
         return (self._case_dir(case_id) / "mask_volume.npy").exists()
-    
-    # =========================================================================
-    # SDF Storage
-    # =========================================================================
-    
+        # SDF Storage    
     def save_sdf(self, case_id: str, sdf: np.ndarray):
         """Save SDF volume as float32 for space efficiency."""
         case_path = self._case_dir(case_id)
@@ -254,9 +230,7 @@ class CaseRepository:
         """Check if SDF exists for a case."""
         return (self._case_dir(case_id) / "sdf_volume.npy").exists()
     
-    # =========================================================================
     # Mesh Storage
-    # =========================================================================
     
     def save_mesh(self, case_id: str, mesh: trimesh.Trimesh):
         """
@@ -310,11 +284,7 @@ class CaseRepository:
         """Check if mesh exists for a case (GLB or legacy OBJ)."""
         case_path = self._case_dir(case_id)
         return (case_path / "mesh.glb").exists() or (case_path / "mesh.obj").exists()
-    
-    # =========================================================================
-    # Artifact Information
-    # =========================================================================
-    
+        # Artifact Information    
     def get_available_artifacts(self, case_id: str) -> Dict[str, bool]:
         """Get a dictionary of available artifacts for a case."""
         case_path = self._case_dir(case_id)
@@ -326,11 +296,7 @@ class CaseRepository:
             "mesh": (case_path / "mesh.glb").exists() or (case_path / "mesh.obj").exists(),
             "extra_metadata": (case_path / "extra_metadata.json").exists(),
         }
-    
-    # =========================================================================
-    # Helper Methods
-    # =========================================================================
-    
+        # Helper Methods    
     def _save_json(self, path: Path, data: Dict[str, Any]):
         """Save data to JSON file."""
         with open(path, "w", encoding="utf-8") as f:

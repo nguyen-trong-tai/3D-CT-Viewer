@@ -4,7 +4,7 @@ Cases Router — Upload and Case Management
 Handles file uploads (DICOM/NIfTI), batch uploads, and case lifecycle.
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends, BackgroundTasks
 from typing import List, Optional
 import uuid
 import numpy as np
@@ -14,7 +14,6 @@ import os
 import json
 import asyncio
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 
 import pydicom
 
@@ -24,8 +23,6 @@ from storage.repository import CaseRepository
 from processing import (
     load_dicom_series,
     load_nifti,
-    parse_dicom_bytes,
-    process_dicom_slice,
     extract_dicom_metadata,
 )
 from api.dependencies import get_repository
@@ -34,52 +31,156 @@ from config import settings
 
 router = APIRouter(tags=["Cases"])
 
-_dicom_executor = ThreadPoolExecutor(max_workers=settings.MAX_WORKERS)
 _batch_sessions: dict = {}
 
 
+# --- Helpers for Hybrid Environment (Local / Modal) ---
+
+def is_running_in_modal() -> bool:
+    """Check if the code is executing inside a Modal container."""
+    try:
+        import modal
+        return modal.is_local() is False
+    except ImportError:
+        return False
+
+def get_temp_dir(prefix: str) -> str:
+    """Get a temp directory inside the shared storage root so background Modal workers can access it."""
+    temp_base = settings.STORAGE_ROOT / "temp_uploads"
+    temp_base.mkdir(parents=True, exist_ok=True)
+    return tempfile.mkdtemp(prefix=prefix, dir=str(temp_base))
+
+def _commit_if_modal():
+    """Commit writes to Modal Volume so other containers can see them."""
+    if is_running_in_modal():
+        try:
+            from modal_app import data_volume
+            data_volume.commit()
+        except ImportError:
+            pass
+
+def _reload_if_modal():
+    """Reload reads from Modal Volume to avoid stale cached data."""
+    if is_running_in_modal():
+        try:
+            from modal_app import data_volume
+            data_volume.reload()
+        except ImportError:
+            pass
+
+
+# --- Background Tasks ---
+
+def process_single_upload_task(case_id: str, tmp_path: str, filename: str, repo: CaseRepository):
+    """Background task to process a single ZIP or NIfTI upload."""
+    try:
+        repo.update_status(case_id, CaseStatus.UPLOADING.value, "Processing volume data...")
+        
+        if filename.lower().endswith('.zip'):
+            volume, spacing = load_dicom_series(tmp_path)
+        elif filename.lower().endswith(('.nii', '.nii.gz')):
+            volume, spacing = load_nifti(tmp_path)
+        else:
+            raise ValueError(f"Unsupported file format: {filename}")
+            
+        repo.save_ct_volume(case_id, volume, spacing)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def process_dicom_directory_task(case_id: str, temp_dir: str, repo: CaseRepository, extra_metadata: Optional[dict]):
+    """Background task to process a directory full of DICOM files."""
+    try:
+        repo.update_status(case_id, CaseStatus.UPLOADING.value, "Processing DICOM directory...")
+        
+        dicom_files = []
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                if file.lower().endswith('.dcm'):
+                    dicom_files.append(os.path.join(root, file))
+                    
+        if not dicom_files:
+            raise ValueError("No DICOM files found in batch directory")
+            
+        # Load using optimized loader
+        from processing.loader import load_dicom_from_files
+        volume, spacing = load_dicom_from_files(dicom_files)
+        
+        repo.save_ct_volume(case_id, volume, spacing)
+        
+        # Save or extract metadata
+        if extra_metadata is None:
+            extra_metadata = {}
+            
+        # Extract metadata from the first file
+        try:
+            ds = pydicom.dcmread(dicom_files[0], stop_before_pixels=True)
+            dicom_meta = extract_dicom_metadata(ds)
+            if dicom_meta:
+                extra_metadata.update({"dicom": dicom_meta})
+        except Exception as meta_ex:
+            print(f"[Metadata Extraction Error]: {meta_ex}")
+        
+        if extra_metadata:
+            repo.save_extra_metadata(case_id, extra_metadata)
+            
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+# --- Endpoints ---
+
 @router.post("/cases", response_model=CaseResponse, summary="Upload a CT file")
 async def upload_case(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     repo: CaseRepository = Depends(get_repository)
 ):
     """
     Upload a single CT file (ZIP containing DICOM series or NIfTI file).
 
-    Supported formats:
-    - `.zip` containing DICOM files (`.dcm`)
-    - `.nii` or `.nii.gz` NIfTI volumes
-
-    Returns a case_id to use for subsequent API calls.
+    Returns a case_id to use for subsequent API calls. Task is processed in background.
     """
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
+    repo.update_status(case_id, CaseStatus.UPLOADING.value, "Receiving file...")
 
     try:
         filename = file.filename or ""
         suffixes = Path(filename).suffixes
         suffix = "".join(suffixes).lower()
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        if not filename.lower().endswith(('.zip', '.nii', '.nii.gz')):
+            error_msg = f"Unsupported file format: {suffix}. Use .zip (DICOM) or .nii (NIfTI)"
+            repo.update_status(case_id, CaseStatus.ERROR.value, error_msg)
+            raise HTTPException(status_code=400, detail=error_msg)
+
+        # Save to shared storage so background containers can access it
+        temp_base = settings.STORAGE_ROOT / "temp_uploads"
+        temp_base.mkdir(parents=True, exist_ok=True)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=str(temp_base)) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
-        try:
-            if filename.lower().endswith('.zip'):
-                volume, spacing = load_dicom_series(tmp_path)
-            elif filename.lower().endswith(('.nii', '.nii.gz')):
-                volume, spacing = load_nifti(tmp_path)
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file format: {suffix}. Use .zip (DICOM) or .nii/.nii.gz (NIfTI)"
-                )
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        _commit_if_modal()
 
-        repo.save_ct_volume(case_id, volume, spacing)
-        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
+        if is_running_in_modal():
+            from modal_app import process_upload_modal
+            process_upload_modal.spawn(case_id, tmp_path, filename)
+        else:
+            background_tasks.add_task(process_single_upload_task, case_id, tmp_path, filename, repo)
+            
+        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADING.value)
 
     except HTTPException:
         raise
@@ -92,13 +193,15 @@ async def upload_case(
 
 @router.post("/cases/dicom", response_model=CaseResponse, summary="Upload DICOM files directly")
 async def upload_dicom_files(
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
     metadata: Optional[str] = Form(None),
     repo: CaseRepository = Depends(get_repository)
 ):
-    """Upload multiple DICOM files in a single request."""
+    """Upload multiple DICOM files in a single request. Processed in background."""
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
+    repo.update_status(case_id, CaseStatus.UPLOADING.value, "Receiving files...")
 
     try:
         if not files:
@@ -115,58 +218,23 @@ async def upload_dicom_files(
         if not dcm_files:
             raise HTTPException(status_code=400, detail="No valid DICOM files (.dcm) found")
 
-        async def read_file_async(f: UploadFile) -> tuple:
-            content = await f.read()
-            return (f.filename, content)
+        temp_dir = get_temp_dir(f"dicom_{case_id}_")
+        
+        # Save files directly to disk piece by piece to avoid RAM bloat
+        for f in dcm_files:
+            file_path = os.path.join(temp_dir, os.path.basename(f.filename or str(uuid.uuid4())))
+            with open(file_path, 'wb') as tmp_file:
+                shutil.copyfileobj(f.file, tmp_file)
 
-        file_contents = await asyncio.gather(*[read_file_async(f) for f in dcm_files])
+        _commit_if_modal()
 
-        loop = asyncio.get_event_loop()
-        parse_tasks = [
-            loop.run_in_executor(_dicom_executor, parse_dicom_bytes, content)
-            for _, content in file_contents
-        ]
-        dicom_datasets = await asyncio.gather(*parse_tasks)
-
-        if not dicom_datasets:
-            raise HTTPException(status_code=400, detail="No valid DICOM files could be parsed")
-
-        dicom_datasets = sorted(
-            dicom_datasets,
-            key=lambda x: float(getattr(x, 'ImagePositionPatient', [0, 0, 0])[2])
-        )
-
-        try:
-            pixel_spacing = dicom_datasets[0].PixelSpacing
-            slice_thickness = dicom_datasets[0].SliceThickness
-            spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(slice_thickness))
-        except AttributeError:
-            raise HTTPException(
-                status_code=400,
-                detail="DICOM files missing required spacing attributes (PixelSpacing, SliceThickness)"
-            )
-
-        process_tasks = [
-            loop.run_in_executor(_dicom_executor, process_dicom_slice, ds)
-            for ds in dicom_datasets
-        ]
-        volume_slices = await asyncio.gather(*process_tasks)
-
-        volume_np = np.stack(volume_slices, axis=-1)
-        volume_np = np.transpose(volume_np, (1, 0, 2))
-        repo.save_ct_volume(case_id, volume_np, spacing)
-
-        if extra_metadata:
-            repo.save_extra_metadata(case_id, extra_metadata)
-
-        if dicom_datasets:
-            dicom_meta = extract_dicom_metadata(dicom_datasets[0])
-            if dicom_meta:
-                existing_meta = extra_metadata or {}
-                existing_meta.update({"dicom": dicom_meta})
-                repo.save_extra_metadata(case_id, existing_meta)
-
-        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
+        if is_running_in_modal():
+            from modal_app import process_dicom_dir_modal
+            process_dicom_dir_modal.spawn(case_id, temp_dir, extra_metadata)
+        else:
+            background_tasks.add_task(process_dicom_directory_task, case_id, temp_dir, repo, extra_metadata)
+            
+        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADING.value)
 
     except HTTPException:
         raise
@@ -184,14 +252,17 @@ async def init_batch_upload(repo: CaseRepository = Depends(get_repository)):
     """Initialize a batch upload session for uploading DICOM files in chunks."""
     case_id = str(uuid.uuid4())
     repo.create_case(case_id)
+    repo.update_status(case_id, CaseStatus.UPLOADING.value, "Batch initialized")
 
-    temp_dir = tempfile.mkdtemp(prefix=f"batch_{case_id}_")
+    temp_dir = get_temp_dir(f"batch_{case_id}_")
+    
     _batch_sessions[case_id] = {
         "temp_dir": temp_dir,
-        "files_received": 0.
+        "files_received": 0
     }
 
-    return CaseResponse(case_id=case_id, status="batch_initialized")
+    _commit_if_modal()
+    return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADING.value)
 
 
 @router.post("/cases/batch/{case_id}/files", summary="Upload batch files")
@@ -207,71 +278,41 @@ async def upload_batch_files(
     temp_dir = session["temp_dir"]
 
     saved_count = 0
-    for file in files:
-        if file.filename:
-            file_path = os.path.join(temp_dir, os.path.basename(file.filename))
-            with open(file_path, 'wb') as f:
-                content = await file.read()
-                f.write(content)
+    for f in files:
+        if f.filename:
+            file_path = os.path.join(temp_dir, os.path.basename(f.filename))
+            with open(file_path, 'wb') as tmp:
+                shutil.copyfileobj(f.file, tmp)
             saved_count += 1
 
     session["files_received"] += saved_count
 
+    _commit_if_modal()
     return {"case_id": case_id, "files_saved": saved_count, "total_received": session["files_received"]}
 
 
 @router.post("/cases/batch/{case_id}/finalize", response_model=CaseResponse, summary="Finalize batch upload")
 async def finalize_batch_upload(
     case_id: str,
+    background_tasks: BackgroundTasks,
     repo: CaseRepository = Depends(get_repository)
 ):
-    """Process all uploaded files and create the CT volume."""
+    """Process all uploaded files and create the CT volume in the background."""
     if case_id not in _batch_sessions:
         raise HTTPException(status_code=404, detail="Batch session not found")
 
     session = _batch_sessions[case_id]
     temp_dir = session["temp_dir"]
+    
+    _batch_sessions.pop(case_id, None)
 
-    try:
-        dicom_files = []
-        for root, _, files in os.walk(temp_dir):
-            for file in files:
-                if file.lower().endswith('.dcm'):
-                    dicom_files.append(os.path.join(root, file))
-
-        if not dicom_files:
-            raise HTTPException(status_code=400, detail="No DICOM files found in batch")
-
-        slices = [pydicom.dcmread(f) for f in dicom_files]
-        slices.sort(key=lambda x: float(x.ImagePositionPatient[2]))
-
-        pixel_spacing = slices[0].PixelSpacing
-        slice_thickness = slices[0].SliceThickness
-        spacing = (float(pixel_spacing[0]), float(pixel_spacing[1]), float(slice_thickness))
-
-        volume_slices = []
-        for s in slices:
-            slope = getattr(s, 'RescaleSlope', 1)
-            intercept = getattr(s, 'RescaleIntercept', 0)
-            slice_data = s.pixel_array.astype(np.float64) * slope + intercept
-            volume_slices.append(slice_data)
-
-        volume_np = np.stack(volume_slices, axis=-1)
-        volume_np = np.transpose(volume_np, (1, 0, 2))
-        repo.save_ct_volume(case_id, volume_np, spacing)
-
-        return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADED.value)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        repo.update_status(case_id, CaseStatus.ERROR.value, str(e))
-        raise HTTPException(status_code=500, detail=f"Batch finalize failed: {str(e)}")
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        _batch_sessions.pop(case_id, None)
+    if is_running_in_modal():
+        from modal_app import process_dicom_dir_modal
+        process_dicom_dir_modal.spawn(case_id, temp_dir, None)
+    else:
+        background_tasks.add_task(process_dicom_directory_task, case_id, temp_dir, repo, None)
+        
+    return CaseResponse(case_id=case_id, status=CaseStatus.UPLOADING.value)
 
 
 @router.get("/cases/{case_id}/status", response_model=StatusResponse, summary="Get case status")
@@ -280,6 +321,7 @@ async def get_status(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get the current processing status of a case."""
+    _reload_if_modal()
     status = repo.get_status(case_id)
     status_info = repo.get_status_info(case_id)
 
@@ -296,6 +338,7 @@ async def list_artifacts(
     repo: CaseRepository = Depends(get_repository)
 ):
     """List all available artifacts for a case."""
+    _reload_if_modal()
     if not repo.case_exists(case_id):
         raise HTTPException(status_code=404, detail="Case not found")
     artifacts = repo.get_available_artifacts(case_id)

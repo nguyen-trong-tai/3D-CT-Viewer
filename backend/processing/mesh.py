@@ -1,8 +1,5 @@
 """
 Mesh Generation Module
-
-Extracts 3D surface meshes from SDF volumes using Marching Cubes.
-Outputs are in physical coordinates (mm) for medical accuracy.
 """
 
 import numpy as np
@@ -20,12 +17,6 @@ def extract_mesh(
     step_size: int = 1
 ) -> trimesh.Trimesh:
     """
-    Extract a surface mesh from SDF using Marching Cubes.
-    
-    The mesh is generated at the zero level set (surface where SDF=0).
-    Vertex coordinates are scaled by voxel spacing to produce
-    geometry in physical units (millimeters).
-    
     Args:
         sdf: Signed Distance Function volume
         spacing: Voxel spacing (sx, sy, sz) in mm
