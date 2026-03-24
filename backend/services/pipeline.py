@@ -1,7 +1,7 @@
 """
 Pipeline Service
 
-Orchestrates the AI processing pipeline:
+Orchestrates the CT processing pipeline:
 CT Volume → Segmentation → SDF → Mesh
 
 This service coordinates all processing stages and manages
@@ -20,11 +20,11 @@ from storage.repository import CaseRepository
 from models.enums import CaseStatus
 from processing import (
     segment_volume_baseline,
-    segment_lung_nodules_ai,
-    compute_sdf,
+    compute_sdf_fast,
     compute_sdf_downsampled,
     get_optimal_downsample_factor,
     extract_mesh,
+    get_optimal_mesh_step_size,
     compute_mesh_stats,
 )
 
@@ -80,7 +80,6 @@ class PipelineService:
         case_id: str,
         force_recompute: bool = False,
         segmentation_threshold: float = -600.0,
-        segmentation_method: str = "lung_nodules"
     ) -> PipelineResult:
         """
         Execute the full processing pipeline for a case.
@@ -98,50 +97,83 @@ class PipelineService:
         """
         result = PipelineResult(case_id=case_id, success=False)
         total_start = time.time()
+        lock_acquired = False
         
         try:
             # Mark pipeline as active
+            lock_acquired = self.repo.acquire_processing_lock(case_id)
+            if not lock_acquired:
+                raise ValueError("Case is already locked for processing")
+
             self._active_pipelines[case_id] = True
             self.repo.update_status(case_id, CaseStatus.PROCESSING.value)
             
             # Stage 1: Load CT Volume
-            stage_result = self._stage_load_volume(case_id)
+            self.repo.update_pipeline_stage(case_id, "load_volume", "running")
+            stage_result, volume, metadata = self._stage_load_volume(case_id)
             result.stages.append(stage_result)
+            self.repo.update_pipeline_stage(
+                case_id,
+                stage_result.name,
+                stage_result.status.value,
+                duration_seconds=stage_result.duration_seconds,
+                message=stage_result.message,
+                output_shape=stage_result.output_shape,
+            )
             
             if stage_result.status == PipelineStageStatus.FAILED:
                 raise ValueError(f"Failed to load volume: {stage_result.message}")
-            
-            volume = self.repo.load_ct_volume(case_id)
-            metadata = self.repo.load_ct_metadata(case_id)
             spacing = tuple(metadata["spacing"])
             
             print(f"[Pipeline] Volume loaded: {volume.shape}, spacing: {spacing}")
             
             # Stage 2: Segmentation
-            stage_result = self._stage_segmentation(
-                case_id, volume, segmentation_threshold, force_recompute, segmentation_method
+            self.repo.update_pipeline_stage(case_id, "segmentation", "running")
+            stage_result, mask = self._stage_segmentation(
+                case_id, volume, segmentation_threshold, force_recompute
             )
             result.stages.append(stage_result)
+            self.repo.update_pipeline_stage(
+                case_id,
+                stage_result.name,
+                stage_result.status.value,
+                duration_seconds=stage_result.duration_seconds,
+                message=stage_result.message,
+                output_shape=stage_result.output_shape,
+            )
             
             if stage_result.status == PipelineStageStatus.FAILED:
                 raise ValueError(f"Segmentation failed: {stage_result.message}")
-            
-            mask = self.repo.load_mask(case_id)
-            
+
             # Stage 3: SDF Computation
-            stage_result = self._stage_sdf(case_id, mask, force_recompute)
+            self.repo.update_pipeline_stage(case_id, "sdf", "running")
+            stage_result, sdf_volume = self._stage_sdf(case_id, mask, force_recompute)
             result.stages.append(stage_result)
+            self.repo.update_pipeline_stage(
+                case_id,
+                stage_result.name,
+                stage_result.status.value,
+                duration_seconds=stage_result.duration_seconds,
+                message=stage_result.message,
+                output_shape=stage_result.output_shape,
+            )
             
             if stage_result.status == PipelineStageStatus.FAILED:
                 raise ValueError(f"SDF computation failed: {stage_result.message}")
-            
-            sdf_volume = self.repo.load_sdf(case_id)
-            
+
             # Stage 4: Mesh Extraction
+            self.repo.update_pipeline_stage(case_id, "mesh", "running")
             stage_result = self._stage_mesh(
                 case_id, sdf_volume, spacing, force_recompute
             )
             result.stages.append(stage_result)
+            self.repo.update_pipeline_stage(
+                case_id,
+                stage_result.name,
+                stage_result.status.value,
+                duration_seconds=stage_result.duration_seconds,
+                message=stage_result.message,
+            )
             
             if stage_result.status == PipelineStageStatus.FAILED:
                 raise ValueError(f"Mesh extraction failed: {stage_result.message}")
@@ -176,10 +208,14 @@ class PipelineService:
             
         finally:
             self._active_pipelines.pop(case_id, None)
+            if lock_acquired:
+                self.repo.release_processing_lock(case_id)
         
         return result
     
-    def _stage_load_volume(self, case_id: str) -> PipelineStageResult:
+    def _stage_load_volume(
+        self, case_id: str
+    ) -> tuple[PipelineStageResult, Optional[np.ndarray], Optional[Dict[str, Any]]]:
         """Stage 1: Verify volume is loaded and accessible."""
         start = time.time()
         
@@ -188,26 +224,38 @@ class PipelineService:
             metadata = self.repo.load_ct_metadata(case_id)
             
             if volume is None or metadata is None:
-                return PipelineStageResult(
-                    name="load_volume",
-                    status=PipelineStageStatus.FAILED,
-                    message="Volume or metadata not found"
+                return (
+                    PipelineStageResult(
+                        name="load_volume",
+                        status=PipelineStageStatus.FAILED,
+                        message="Volume or metadata not found"
+                    ),
+                    None,
+                    None,
                 )
-            
-            return PipelineStageResult(
-                name="load_volume",
-                status=PipelineStageStatus.COMPLETED,
-                duration_seconds=time.time() - start,
-                output_shape=volume.shape,
-                message=f"Loaded volume: {volume.shape}"
+
+            return (
+                PipelineStageResult(
+                    name="load_volume",
+                    status=PipelineStageStatus.COMPLETED,
+                    duration_seconds=time.time() - start,
+                    output_shape=volume.shape,
+                    message=f"Loaded volume: {volume.shape}"
+                ),
+                volume,
+                metadata,
             )
             
         except Exception as e:
-            return PipelineStageResult(
-                name="load_volume",
-                status=PipelineStageStatus.FAILED,
-                duration_seconds=time.time() - start,
-                message=str(e)
+            return (
+                PipelineStageResult(
+                    name="load_volume",
+                    status=PipelineStageStatus.FAILED,
+                    duration_seconds=time.time() - start,
+                    message=str(e)
+                ),
+                None,
+                None,
             )
     
     def _stage_segmentation(
@@ -216,8 +264,7 @@ class PipelineService:
         volume: np.ndarray,
         threshold: float,
         force_recompute: bool,
-        segmentation_method: str = "baseline"
-    ) -> PipelineStageResult:
+    ) -> tuple[PipelineStageResult, Optional[np.ndarray]]:
         """Stage 2: Segment the CT volume."""
         start = time.time()
         
@@ -225,21 +272,30 @@ class PipelineService:
             # Check if mask already exists
             if not force_recompute and self.repo.mask_exists(case_id):
                 mask = self.repo.load_mask(case_id)
-                return PipelineStageResult(
-                    name="segmentation",
-                    status=PipelineStageStatus.SKIPPED,
-                    duration_seconds=time.time() - start,
-                    output_shape=mask.shape,
-                    message="Using existing mask"
+                if mask is None:
+                    return (
+                        PipelineStageResult(
+                            name="segmentation",
+                            status=PipelineStageStatus.FAILED,
+                            duration_seconds=time.time() - start,
+                            message="Mask manifest exists but artifact could not be loaded"
+                        ),
+                        None,
+                    )
+                return (
+                    PipelineStageResult(
+                        name="segmentation",
+                        status=PipelineStageStatus.SKIPPED,
+                        duration_seconds=time.time() - start,
+                        output_shape=mask.shape,
+                        message="Using existing mask"
+                    ),
+                    mask,
                 )
             
-            # Perform segmentation
-            if segmentation_method == "lung_nodules":
-                print(f"[Pipeline Stage 2] Chạy AI TotalSegmentator (Task: lung_nodules)...")
-                mask = segment_lung_nodules_ai(volume, spacing=tuple(self.repo.load_ct_metadata(case_id)["spacing"]))
-            else:
-                print(f"[Pipeline Stage 2] Chạy Baseline Thresholding (Threshold: {threshold} HU)...")
-                mask = segment_volume_baseline(volume, threshold=threshold)
+            # Perform deterministic baseline segmentation only.
+            print(f"[Pipeline Stage 2] Running baseline threshold segmentation (Threshold: {threshold} HU)...")
+            mask = segment_volume_baseline(volume, threshold=threshold)
             
             # Khởi tạo mesh placeholder nếu không có voxel nào (tránh crash pipeline)
             if np.sum(mask > 0) == 0:
@@ -248,22 +304,28 @@ class PipelineService:
             # Store result
             self.repo.save_mask(case_id, mask)
             
-            voxel_count = int(np.sum(mask > 0))
-            
-            return PipelineStageResult(
-                name="segmentation",
-                status=PipelineStageStatus.COMPLETED,
-                duration_seconds=time.time() - start,
-                output_shape=mask.shape,
-                message=f"Segmented {voxel_count:,} voxels"
+            voxel_count = int(mask.sum())
+
+            return (
+                PipelineStageResult(
+                    name="segmentation",
+                    status=PipelineStageStatus.COMPLETED,
+                    duration_seconds=time.time() - start,
+                    output_shape=mask.shape,
+                    message=f"Segmented {voxel_count:,} voxels"
+                ),
+                mask,
             )
             
         except Exception as e:
-            return PipelineStageResult(
-                name="segmentation",
-                status=PipelineStageStatus.FAILED,
-                duration_seconds=time.time() - start,
-                message=str(e)
+            return (
+                PipelineStageResult(
+                    name="segmentation",
+                    status=PipelineStageStatus.FAILED,
+                    duration_seconds=time.time() - start,
+                    message=str(e)
+                ),
+                None,
             )
     
     def _stage_sdf(
@@ -271,7 +333,7 @@ class PipelineService:
         case_id: str,
         mask: np.ndarray,
         force_recompute: bool
-    ) -> PipelineStageResult:
+    ) -> tuple[PipelineStageResult, Optional[np.ndarray]]:
         """Stage 3: Compute Signed Distance Function."""
         start = time.time()
         
@@ -279,12 +341,25 @@ class PipelineService:
             # Check if SDF already exists
             if not force_recompute and self.repo.sdf_exists(case_id):
                 sdf = self.repo.load_sdf(case_id)
-                return PipelineStageResult(
-                    name="sdf",
-                    status=PipelineStageStatus.SKIPPED,
-                    duration_seconds=time.time() - start,
-                    output_shape=sdf.shape,
-                    message="Using existing SDF"
+                if sdf is None:
+                    return (
+                        PipelineStageResult(
+                            name="sdf",
+                            status=PipelineStageStatus.FAILED,
+                            duration_seconds=time.time() - start,
+                            message="SDF manifest exists but artifact could not be loaded"
+                        ),
+                        None,
+                    )
+                return (
+                    PipelineStageResult(
+                        name="sdf",
+                        status=PipelineStageStatus.SKIPPED,
+                        duration_seconds=time.time() - start,
+                        output_shape=sdf.shape,
+                        message="Using existing SDF"
+                    ),
+                    sdf,
                 )
             
             # Determine optimal downsample factor based on volume size
@@ -294,26 +369,35 @@ class PipelineService:
                 print(f"[Pipeline] SDF: Using downsample factor {downsample_factor}")
                 sdf = compute_sdf_downsampled(mask, factor=downsample_factor)
             else:
-                sdf = compute_sdf(mask)
+                sdf = compute_sdf_fast(mask)
+
+            if sdf.dtype != np.float32:
+                sdf = sdf.astype(np.float32, copy=False)
             
             # Store result (not full SDF to save space - mesh is what matters)
             # But PRD requires intermediate artifacts to be stored
             self.repo.save_sdf(case_id, sdf)
             
-            return PipelineStageResult(
-                name="sdf",
-                status=PipelineStageStatus.COMPLETED,
-                duration_seconds=time.time() - start,
-                output_shape=sdf.shape,
-                message=f"SDF computed (factor={downsample_factor})"
+            return (
+                PipelineStageResult(
+                    name="sdf",
+                    status=PipelineStageStatus.COMPLETED,
+                    duration_seconds=time.time() - start,
+                    output_shape=sdf.shape,
+                    message=f"SDF computed (factor={downsample_factor})"
+                ),
+                sdf,
             )
             
         except Exception as e:
-            return PipelineStageResult(
-                name="sdf",
-                status=PipelineStageStatus.FAILED,
-                duration_seconds=time.time() - start,
-                message=str(e)
+            return (
+                PipelineStageResult(
+                    name="sdf",
+                    status=PipelineStageStatus.FAILED,
+                    duration_seconds=time.time() - start,
+                    message=str(e)
+                ),
+                None,
             )
     
     def _stage_mesh(
@@ -337,7 +421,8 @@ class PipelineService:
                 )
             
             # Extract mesh
-            mesh = extract_mesh(sdf, spacing)
+            mesh_step_size = get_optimal_mesh_step_size(sdf.shape)
+            mesh = extract_mesh(sdf, spacing, step_size=mesh_step_size)
             
             # Store result
             self.repo.save_mesh(case_id, mesh)
@@ -349,7 +434,10 @@ class PipelineService:
                 name="mesh",
                 status=PipelineStageStatus.COMPLETED,
                 duration_seconds=time.time() - start,
-                message=f"{stats['vertex_count']:,} vertices, {stats['face_count']:,} faces"
+                message=(
+                    f"{stats['vertex_count']:,} vertices, "
+                    f"{stats['face_count']:,} faces (step_size={mesh_step_size})"
+                )
             )
             
         except Exception as e:
@@ -391,48 +479,33 @@ class PipelineService:
         """
         status = self.repo.get_status(case_id)
         artifacts = self.repo.get_available_artifacts(case_id)
-        
+        pipeline_state = self.repo.get_pipeline_state(case_id)
+
         stages = []
-        
-        # Determine stage statuses based on artifacts
-        if artifacts.get("ct_volume"):
-            stages.append({
-                "name": "load_volume",
-                "status": "completed"
-            })
-        
-        if artifacts.get("segmentation_mask"):
-            stages.append({
-                "name": "segmentation",
-                "status": "completed"
-            })
-        elif status == CaseStatus.PROCESSING.value:
-            stages.append({
-                "name": "segmentation",
-                "status": "running" if len(stages) == 1 else "pending"
-            })
-        
-        if artifacts.get("sdf"):
-            stages.append({
-                "name": "sdf",
-                "status": "completed"
-            })
-        elif status == CaseStatus.PROCESSING.value:
-            stages.append({
-                "name": "sdf",
-                "status": "running" if len(stages) == 2 else "pending"
-            })
-        
-        if artifacts.get("mesh"):
-            stages.append({
-                "name": "mesh",
-                "status": "completed"
-            })
-        elif status == CaseStatus.PROCESSING.value:
-            stages.append({
-                "name": "mesh",
-                "status": "running" if len(stages) == 3 else "pending"
-            })
+        if pipeline_state:
+            for stage_name in ["load_volume", "segmentation", "sdf", "mesh"]:
+                payload = pipeline_state.get(stage_name, {"status": "pending"})
+                stages.append({
+                    "name": stage_name,
+                    "status": payload.get("status", "pending"),
+                    "duration_seconds": payload.get("duration_seconds"),
+                    "message": payload.get("message"),
+                })
+        else:
+            if artifacts.get("ct_volume"):
+                stages.append({"name": "load_volume", "status": "completed"})
+            if artifacts.get("segmentation_mask"):
+                stages.append({"name": "segmentation", "status": "completed"})
+            elif status == CaseStatus.PROCESSING.value:
+                stages.append({"name": "segmentation", "status": "running" if len(stages) == 1 else "pending"})
+            if artifacts.get("sdf"):
+                stages.append({"name": "sdf", "status": "completed"})
+            elif status == CaseStatus.PROCESSING.value:
+                stages.append({"name": "sdf", "status": "running" if len(stages) == 2 else "pending"})
+            if artifacts.get("mesh"):
+                stages.append({"name": "mesh", "status": "completed"})
+            elif status == CaseStatus.PROCESSING.value:
+                stages.append({"name": "mesh", "status": "running" if len(stages) == 3 else "pending"})
         
         return {
             "case_id": case_id,

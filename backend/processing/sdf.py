@@ -106,7 +106,7 @@ def compute_sdf_downsampled(
         SDF at original resolution (approximate)
     """
     if factor <= 1:
-        return compute_sdf(mask, spacing)
+        return compute_sdf_fast(mask, spacing)
     
     # Downsample mask using slicing (fastest method)
     small_mask = mask[::factor, ::factor, ::factor]
@@ -117,7 +117,7 @@ def compute_sdf_downsampled(
         small_spacing = tuple(s * factor for s in spacing)
     
     # Compute SDF on smaller volume
-    small_sdf = compute_sdf(small_mask, small_spacing)
+    small_sdf = compute_sdf_fast(small_mask, small_spacing)
     
     # Scale distances by factor (voxels are larger)
     if spacing is None:

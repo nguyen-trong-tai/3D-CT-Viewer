@@ -20,8 +20,6 @@ from .loader import (
 
 from .segmentation import (
     segment_volume_baseline,
-    segment_volume_total_segmentator,
-    segment_lung_nodules_ai,
     segment_lung,
     segment_tissue,
     segment_bone,
@@ -41,6 +39,7 @@ from .sdf import (
 
 from .mesh import (
     extract_mesh,
+    get_optimal_mesh_step_size,
     extract_mesh_from_mask,
     smooth_mesh_laplacian,
     decimate_mesh,
@@ -66,8 +65,6 @@ __all__ = [
     "extract_dicom_metadata",
     # Segmentation
     "segment_volume_baseline",
-    "segment_volume_total_segmentator",
-    "segment_lung_nodules_ai",
     "segment_lung",
     "segment_tissue",
     "segment_bone",
@@ -83,6 +80,7 @@ __all__ = [
     "normalize_sdf",
     # Mesh
     "extract_mesh",
+    "get_optimal_mesh_step_size",
     "extract_mesh_from_mask",
     "smooth_mesh_laplacian",
     "decimate_mesh",

@@ -83,7 +83,7 @@ def load_dicom_from_bytes_list(
     for content in file_contents:
         try:
             ds = pydicom.dcmread(BytesIO(content))
-            if hasattr(ds, 'pixel_array'):
+            if "PixelData" in ds:
                 slices.append(ds)
         except Exception:
             # Skip invalid DICOM files
@@ -110,7 +110,7 @@ def load_nifti(file_path: str) -> Tuple[np.ndarray, Tuple[float, float, float]]:
     img = nib.load(file_path)
     
     # NIfTI's get_fdata() automatically applies slope/intercept
-    volume = img.get_fdata()
+    volume = img.get_fdata(dtype=np.float32)
     
     # Extract spacing from header
     header = img.header
@@ -138,12 +138,17 @@ def process_dicom_slice(ds: pydicom.Dataset) -> np.ndarray:
     
     Thread-safe function for parallel processing.
     """
-    slope = getattr(ds, 'RescaleSlope', 1)
-    intercept = getattr(ds, 'RescaleIntercept', 0)
-    
-    # Apply linear transformation: HU = slope * raw + intercept
-    slice_data = ds.pixel_array.astype(np.float64) * slope + intercept
-    return slice_data
+    slope = float(getattr(ds, 'RescaleSlope', 1) or 1)
+    intercept = float(getattr(ds, 'RescaleIntercept', 0) or 0)
+    raw_pixels = ds.pixel_array
+
+    if slope == 1.0 and intercept == 0.0:
+        return raw_pixels.astype(np.int16, copy=False)
+
+    # float32 is sufficient for HU conversion and halves memory versus float64.
+    slice_data = raw_pixels.astype(np.float32, copy=False)
+    slice_data = slice_data * slope + intercept
+    return slice_data.astype(np.float32, copy=False)
 
 
 def extract_dicom_metadata(ds: pydicom.Dataset) -> dict:
@@ -203,7 +208,7 @@ def _process_dicom_files(
     for path in file_paths:
         try:
             ds = pydicom.dcmread(path)
-            if hasattr(ds, 'pixel_array'):
+            if "PixelData" in ds:
                 slices.append(ds)
         except Exception:
             continue

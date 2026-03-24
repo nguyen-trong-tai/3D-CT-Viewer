@@ -10,11 +10,24 @@ from typing import Tuple, Optional
 from config import settings
 
 
+def get_optimal_mesh_step_size(shape: Tuple[int, int, int]) -> int:
+    """Choose a coarser marching-cubes step size for large volumes."""
+    total_voxels = int(np.prod(shape))
+
+    if total_voxels > settings.SDF_VOXEL_THRESHOLD_LARGE:
+        return max(1, settings.MESH_STEP_SIZE_HUGE)
+    if total_voxels > settings.SDF_VOXEL_THRESHOLD_MEDIUM:
+        return max(1, settings.MESH_STEP_SIZE_LARGE)
+    if total_voxels > settings.SDF_VOXEL_THRESHOLD_SMALL:
+        return max(1, settings.MESH_STEP_SIZE_MEDIUM)
+    return 1
+
+
 def extract_mesh(
     sdf: np.ndarray,
     spacing: Tuple[float, float, float],
     level: float = None,
-    step_size: int = 1
+    step_size: int | None = None
 ) -> trimesh.Trimesh:
     """
     Args:
@@ -28,6 +41,9 @@ def extract_mesh(
     """
     if level is None:
         level = settings.MESH_LEVEL_SET
+    if step_size is None:
+        step_size = get_optimal_mesh_step_size(sdf.shape)
+    step_size = max(1, int(step_size))
     
     # Validate minimum volume size for marching cubes
     min_size = 2
