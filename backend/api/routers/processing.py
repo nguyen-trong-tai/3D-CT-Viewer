@@ -10,66 +10,46 @@ import numpy as np
 import json
 import asyncio
 
-from models import ProcessingResponse, MaskSliceResponse, ImplicitMetadataResponse
-from models.enums import CaseStatus
-from storage.repository import CaseRepository
-from services.pipeline import PipelineService
-from api.dependencies import get_repository, get_pipeline_service
+from api.dependencies import get_artifact_service, get_case_service, get_pipeline_service, get_repository
 from config import settings
+from models import ArtifactUrlResponse, ProcessingResponse, MaskSliceResponse, ImplicitMetadataResponse
+from models.enums import CaseStatus
+from services.artifact_service import ArtifactService
+from services.case_service import CaseService
+from services.pipeline import PipelineService
+from storage.repository import CaseRepository
+from workers.runtime import spawn_process_case
 
 
 router = APIRouter(tags=["Processing"])
 
 
-# --- Helpers for Hybrid Environment (Local / Modal) ---
-
-def is_running_in_modal() -> bool:
-    """Check if the code is executing inside a Modal container."""
-    try:
-        import modal
-        return modal.is_local() is False
-    except ImportError:
-        return False
-
-def _reload_if_modal():
-    """Reload reads from Modal Volume to avoid stale cached data."""
-    if is_running_in_modal():
-        try:
-            from modal_app import data_volume
-            data_volume.reload()
-        except ImportError:
-            pass
-
-
-@router.post("/cases/{case_id}/process", response_model=ProcessingResponse, summary="Start AI processing")
+@router.post("/cases/{case_id}/process", response_model=ProcessingResponse, summary="Start processing")
 async def trigger_processing(
     case_id: str,
     repo: CaseRepository = Depends(get_repository),
-    pipeline: PipelineService = Depends(get_pipeline_service)
+    case_service: CaseService = Depends(get_case_service),
+    pipeline: PipelineService = Depends(get_pipeline_service),
 ):
     """
-    Trigger the AI processing pipeline for a case.
+    Trigger the processing pipeline for a case.
     Processing runs in a thread pool to avoid blocking async requests,
-    or runs on a dedicated Modal GPU worker if deployed.
+    or runs on a dedicated Modal worker if deployed.
     Use GET /cases/{case_id}/status to check progress.
     """
-    _reload_if_modal()
-    status = repo.get_status(case_id)
-
-    if status == "error" and not repo.case_exists(case_id):
+    repo.sync_for_read(scope="state")
+    state = case_service.can_start_processing(case_id)
+    if state == "missing":
         raise HTTPException(status_code=404, detail="Case not found")
 
-    if status == CaseStatus.PROCESSING.value:
+    if state == "processing":
         return ProcessingResponse(
             case_id=case_id,
             status="already_processing",
             estimated_time_seconds=15.0
         )
 
-    if is_running_in_modal():
-        from modal_app import process_case_gpu
-        process_case_gpu.spawn(case_id)
-    else:
+    if not spawn_process_case(case_id):
         # Run CPU-heavy pipeline in a thread to keep async event loop free
         asyncio.get_event_loop().run_in_executor(None, pipeline.process_case, case_id)
 
@@ -83,10 +63,11 @@ async def trigger_processing(
 @router.get("/cases/{case_id}/pipeline", summary="Get detailed pipeline status")
 async def get_pipeline_status(
     case_id: str,
+    repo: CaseRepository = Depends(get_repository),
     pipeline: PipelineService = Depends(get_pipeline_service)
 ):
     """Get detailed status of pipeline stages and available artifacts."""
-    _reload_if_modal()
+    repo.sync_for_read(scope="all")
     return JSONResponse(content=pipeline.get_pipeline_status(case_id))
 
 
@@ -96,7 +77,7 @@ async def get_mask_volume(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get the full segmentation mask as raw binary data (uint8)."""
-    _reload_if_modal()
+    repo.sync_for_read(scope="artifact")
     mask = repo.load_mask(case_id)
     if mask is None:
         raise HTTPException(status_code=404, detail="Mask not found")
@@ -113,6 +94,73 @@ async def get_mask_volume(
     return Response(content=mask_bytes, headers=headers)
 
 
+@router.get("/cases/{case_id}/mask/preview-volume", summary="Get preview segmentation mask")
+async def get_mask_preview_volume(
+    case_id: str,
+    repo: CaseRepository = Depends(get_repository)
+):
+    """Get the downsampled segmentation mask as raw binary data (uint8)."""
+    repo.sync_for_read(scope="artifact")
+    mask = repo.load_mask_preview(case_id)
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Preview mask not found")
+
+    meta = repo.load_ct_metadata(case_id) or {}
+    headers = {
+        "X-Volume-Shape": json.dumps(list(mask.shape)),
+        "X-Volume-Spacing": json.dumps(meta.get("preview_spacing") or meta.get("spacing") or [1, 1, 1]),
+        "Content-Type": "application/octet-stream",
+    }
+
+    return Response(content=mask.astype(np.uint8).tobytes(), headers=headers)
+
+
+@router.get("/cases/{case_id}/mask/volume-url", response_model=ArtifactUrlResponse, summary="Get mask volume download URL")
+async def get_mask_volume_url(
+    case_id: str,
+    artifact_service: ArtifactService = Depends(get_artifact_service),
+):
+    """Get a presigned download URL for the full segmentation mask stored in R2."""
+    try:
+        url = artifact_service.get_artifact_download_url(
+            case_id,
+            "segmentation_mask",
+            expires_in_seconds=settings.ARTIFACT_URL_TTL_SECONDS,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Mask volume URL not available")
+
+    return ArtifactUrlResponse(
+        case_id=case_id,
+        artifact="segmentation_mask",
+        url=url,
+        expires_in_seconds=settings.ARTIFACT_URL_TTL_SECONDS,
+    )
+
+
+@router.get("/cases/{case_id}/mask/preview-volume-url", response_model=ArtifactUrlResponse, summary="Get preview mask volume download URL")
+async def get_mask_preview_volume_url(
+    case_id: str,
+    artifact_service: ArtifactService = Depends(get_artifact_service),
+):
+    """Get a presigned download URL for the preview segmentation mask stored in R2."""
+    try:
+        url = artifact_service.get_artifact_download_url(
+            case_id,
+            "segmentation_mask_preview",
+            expires_in_seconds=settings.ARTIFACT_URL_TTL_SECONDS,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Preview mask volume URL not available")
+
+    return ArtifactUrlResponse(
+        case_id=case_id,
+        artifact="segmentation_mask_preview",
+        url=url,
+        expires_in_seconds=settings.ARTIFACT_URL_TTL_SECONDS,
+    )
+
+
 @router.get("/cases/{case_id}/mask/slices/{slice_index}", response_model=MaskSliceResponse, summary="Get single mask slice")
 async def get_mask_slice(
     case_id: str,
@@ -120,7 +168,7 @@ async def get_mask_slice(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get a single segmentation mask slice."""
-    _reload_if_modal()
+    repo.sync_for_read(scope="artifact")
     mask = repo.load_mask_mmap(case_id)
     if mask is None:
         raise HTTPException(status_code=404, detail="Mask not found")
@@ -147,7 +195,7 @@ async def get_implicit_info(
     repo: CaseRepository = Depends(get_repository)
 ):
     """Get metadata about the implicit representation (SDF)."""
-    _reload_if_modal()
+    repo.sync_for_read(scope="all")
     status = repo.get_status(case_id)
 
     if status not in [CaseStatus.READY.value, "ready"]:

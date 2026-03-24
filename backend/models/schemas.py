@@ -56,13 +56,15 @@ class StatusResponse(BaseModel):
     case_id: str
     status: str
     message: Optional[str] = Field(None, description="Additional status information")
+    expires_at: Optional[str] = Field(None, description="UTC timestamp when the case will be auto-deleted")
     
     class Config:
         json_schema_extra = {
             "example": {
                 "case_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "status": "ready",
-                "message": "All processing complete"
+                "message": "All processing complete",
+                "expires_at": "2026-03-25T12:00:00"
             }
         }
 
@@ -94,6 +96,22 @@ class MetadataResponse(BaseModel):
         None,
         description="Image orientation if available"
     )
+    preview_available: bool = Field(
+        default=False,
+        description="Whether a downsampled preview volume is available"
+    )
+    preview_volume_shape: Optional[VolumeShape] = Field(
+        None,
+        description="Preview volume dimensions in voxels when available"
+    )
+    preview_voxel_spacing_mm: Optional[VoxelSpacing] = Field(
+        None,
+        description="Preview voxel spacing in mm when available"
+    )
+    preview_mask_available: bool = Field(
+        default=False,
+        description="Whether a downsampled preview mask is available"
+    )
     
     class Config:
         json_schema_extra = {
@@ -101,7 +119,11 @@ class MetadataResponse(BaseModel):
                 "volume_shape": {"x": 512, "y": 512, "z": 200},
                 "voxel_spacing_mm": {"x": 0.5, "y": 0.5, "z": 1.0},
                 "num_slices": 200,
-                "hu_range": {"min": -1024, "max": 3071}
+                "hu_range": {"min": -1024, "max": 3071},
+                "preview_available": True,
+                "preview_volume_shape": {"x": 256, "y": 256, "z": 100},
+                "preview_voxel_spacing_mm": {"x": 1.0, "y": 1.0, "z": 2.0},
+                "preview_mask_available": True
             }
         }
 
@@ -243,7 +265,15 @@ class ArtifactList(BaseModel):
         }
 
 
-# ============================================================================
+class ArtifactUrlResponse(BaseModel):
+    """Presigned or resolved download URL for an artifact."""
+    case_id: str
+    artifact: str
+    url: str
+    expires_in_seconds: int
+
+
+# ============================================================================ 
 # Error Handling
 # ============================================================================
 
@@ -288,3 +318,68 @@ class BulkUploadStatus(BaseModel):
     files_received: int
     total_expected: Optional[int] = None
     status: str
+
+
+class BatchInitResponse(CaseResponse):
+    """Extended response for initializing a batch upload session."""
+    storage_kind: str = Field(..., description="Storage backend used for the staged upload")
+    direct_upload_enabled: bool = Field(
+        default=False,
+        description="Whether the client should upload files directly to object storage",
+    )
+    upload_url_ttl_seconds: Optional[int] = Field(
+        default=None,
+        description="TTL for presigned upload URLs when direct upload is enabled",
+    )
+    recommended_upload_concurrency: Optional[int] = Field(
+        default=None,
+        description="Suggested client-side concurrency for direct uploads",
+    )
+
+
+class BatchUploadFileDescriptor(BaseModel):
+    """Client-side description of a file that needs an upload target."""
+    client_id: str = Field(..., description="Stable client-side identifier for matching files to targets")
+    filename: str = Field(..., description="Original file name")
+    size_bytes: Optional[int] = Field(default=None, description="File size in bytes")
+    content_type: Optional[str] = Field(default=None, description="Browser-reported content type")
+
+
+class BatchUploadTarget(BaseModel):
+    """Presigned target for a single direct-to-object-store upload."""
+    client_id: str
+    filename: str
+    object_key: str
+    upload_url: str
+    method: str = Field(default="PUT", description="HTTP method required by the upload target")
+
+
+class BatchUploadPresignRequest(BaseModel):
+    """Request one upload target per file in a chunk."""
+    files: List[BatchUploadFileDescriptor]
+
+
+class BatchUploadPresignResponse(BaseModel):
+    """Presigned upload targets for a chunk of files."""
+    case_id: str
+    expires_in_seconds: int
+    targets: List[BatchUploadTarget]
+
+
+class BatchUploadCompleteItem(BaseModel):
+    """Single completed object-store upload recorded against the session."""
+    client_id: str
+    filename: str
+    object_key: str
+
+
+class BatchUploadCompleteRequest(BaseModel):
+    """Mark a chunk of direct uploads as committed."""
+    uploads: List[BatchUploadCompleteItem]
+
+
+class BatchUploadProgressResponse(BaseModel):
+    """Progress response for batch upload staging."""
+    case_id: str
+    files_saved: int
+    total_received: int

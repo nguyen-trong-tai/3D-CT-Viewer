@@ -11,19 +11,33 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+from api.dependencies import ensure_runtime_dependencies, reset_dependencies
 from api.router import router
 from config import settings
+from services.retention_service import RetentionCleanupService
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     # Startup
+    settings.refresh_from_env()
+    reset_dependencies()
+    repository = ensure_runtime_dependencies()
+    retention_service = RetentionCleanupService(repository)
+    retention_service.start()
+    app.state.retention_service = retention_service
     print(f"[Backend] Starting {settings.APP_NAME}")
     print(f"[Backend] Storage root: {settings.STORAGE_ROOT}")
+    print(
+        f"[Backend] Runtime mode: {settings.runtime_mode_label()} "
+        f"(distributed_mode={settings.DISTRIBUTED_RUNTIME_MODE})"
+    )
     print(f"[Backend] Max workers: {settings.MAX_WORKERS}")
+    print(f"[Backend] Case retention: {settings.CASE_RETENTION_SECONDS}s")
     yield
     # Shutdown
+    retention_service.stop()
     print("[Backend] Shutting down...")
 
 
@@ -67,7 +81,13 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Simple health check endpoint."""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "runtime_mode": settings.runtime_mode_label(),
+        "distributed_runtime_mode": settings.DISTRIBUTED_RUNTIME_MODE,
+        "redis_enabled": settings.should_use_redis_state(),
+        "r2_enabled": settings.should_use_r2_object_store(),
+    }
 
 
 if __name__ == "__main__":
