@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useMemo, useState } from 'react';
 import { useVolumeViewer } from '../../hooks/useVolumeViewer';
 import { RotateCcw, ZoomIn, ZoomOut, Loader2 } from 'lucide-react';
 import { type WindowPresetKey, type MPRView } from '../../types';
@@ -45,6 +45,7 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+    const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
 
     const {
         isLoaded,
@@ -160,6 +161,44 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
 
     const sliceCount = dims?.maxSlice || totalSlices;
     const spacingAspect = dims ? (dims.spacing.y / dims.spacing.x) : 1;
+    const fittedCanvasSize = useMemo(() => {
+        if (!dims || containerSize.width <= 0 || containerSize.height <= 0) {
+            return null;
+        }
+
+        const sourceWidth = dims.width;
+        const sourceHeight = dims.height * spacingAspect;
+        const horizontalPadding = 24;
+        const verticalPadding = showControls ? 40 : 24;
+        const availableWidth = Math.max(containerSize.width - horizontalPadding * 2, 1);
+        const availableHeight = Math.max(containerSize.height - verticalPadding * 2, 1);
+        const fitScale = Math.min(availableWidth / sourceWidth, availableHeight / sourceHeight);
+
+        return {
+            width: Math.max(1, Math.floor(sourceWidth * fitScale)),
+            height: Math.max(1, Math.floor(sourceHeight * fitScale)),
+        };
+    }, [containerSize.height, containerSize.width, dims, showControls, spacingAspect]);
+
+    useEffect(() => {
+        const container = containerRef.current;
+        if (!container) return;
+
+        const updateSize = () => {
+            const rect = container.getBoundingClientRect();
+            setContainerSize({
+                width: rect.width,
+                height: rect.height,
+            });
+        };
+
+        updateSize();
+
+        const observer = new ResizeObserver(updateSize);
+        observer.observe(container);
+
+        return () => observer.disconnect();
+    }, []);
 
     // Use native event listener for wheel to avoid passive issues
     useEffect(() => {
@@ -330,6 +369,11 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         position: 'relative',
                         transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
                         transition: isDragging ? 'none' : 'transform 0.1s ease-out',
+                        transformOrigin: 'center center',
+                        width: fittedCanvasSize ? `${fittedCanvasSize.width}px` : undefined,
+                        height: fittedCanvasSize ? `${fittedCanvasSize.height}px` : undefined,
+                        maxWidth: '100%',
+                        maxHeight: '100%',
                     }}
                 >
                     {/* CT Canvas (base layer) */}
@@ -338,8 +382,8 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         style={{
                             display: 'block',
                             imageRendering: 'pixelated',
-                            width: imageData ? imageData.width : undefined,
-                            height: imageData ? imageData.height * spacingAspect : undefined,
+                            width: '100%',
+                            height: '100%',
                         }}
                     />
 
@@ -354,8 +398,8 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                             imageRendering: 'pixelated',
                             pointerEvents: 'none',
                             mixBlendMode: 'normal',
-                            width: imageData ? imageData.width : undefined,
-                            height: imageData ? imageData.height * spacingAspect : undefined,
+                            width: '100%',
+                            height: '100%',
                         }}
                     />
 

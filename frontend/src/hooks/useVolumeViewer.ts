@@ -8,11 +8,13 @@ interface VolumeData {
     data: Int16Array;
     shape: [number, number, number]; // [X, Y, Z]
     spacing: [number, number, number];
+    resolution: 'preview' | 'full';
 }
 
 interface MaskData {
     data: Uint8Array;
     shape: [number, number, number];
+    resolution: 'preview' | 'full';
 }
 
 // Global cache for volume data (shared across all hook instances)
@@ -64,6 +66,21 @@ export function useVolumeViewer(caseId: string | null) {
     // Progress throttling
     const lastProgressRef = useRef(0);
 
+    const getCenteredCrosshair = useCallback((shape: [number, number, number]) => ({
+        x: Math.floor(shape[0] / 2),
+        y: Math.floor(shape[1] / 2),
+        z: Math.floor(shape[2] / 2),
+    }), []);
+
+    const clampCrosshairToShape = useCallback((
+        nextShape: [number, number, number],
+        nextCrosshair: { x: number; y: number; z: number }
+    ) => ({
+        x: Math.max(0, Math.min(nextShape[0] - 1, nextCrosshair.x)),
+        y: Math.max(0, Math.min(nextShape[1] - 1, nextCrosshair.y)),
+        z: Math.max(0, Math.min(nextShape[2] - 1, nextCrosshair.z)),
+    }), []);
+
     /**
      * Load volume data from backend (with global deduplication)
      */
@@ -80,11 +97,7 @@ export function useVolumeViewer(caseId: string | null) {
         if (cachedVolume) {
             console.log('[VolumeViewer] Using cached volume for:', caseId);
             setVolume(cachedVolume);
-            setCrosshair({
-                x: Math.floor(cachedVolume.shape[0] / 2),
-                y: Math.floor(cachedVolume.shape[1] / 2),
-                z: Math.floor(cachedVolume.shape[2] / 2),
-            });
+            setCrosshair(getCenteredCrosshair(cachedVolume.shape));
 
             const cachedMask = globalMaskCache.get(caseId);
             if (cachedMask) {
@@ -107,11 +120,7 @@ export function useVolumeViewer(caseId: string | null) {
             const vol = globalVolumeCache.get(caseId);
             if (vol) {
                 setVolume(vol);
-                setCrosshair({
-                    x: Math.floor(vol.shape[0] / 2),
-                    y: Math.floor(vol.shape[1] / 2),
-                    z: Math.floor(vol.shape[2] / 2),
-                });
+                setCrosshair(getCenteredCrosshair(vol.shape));
             }
             const msk = globalMaskCache.get(caseId);
             if (msk) setMask(msk);
@@ -135,20 +144,29 @@ export function useVolumeViewer(caseId: string | null) {
             try {
                 console.log('[VolumeViewer] Loading CT volume for case:', caseId);
 
-                const volumeResult = await ctApi.getVolumeBinary(caseId, (loaded, total) => {
+                const previewVolumeResult = await ctApi.getPreviewVolumeBinary(caseId, (loaded, total) => {
+                    const progress = Math.round((loaded / total) * 55);
+                    if (progress - lastProgressRef.current >= 5) {
+                        lastProgressRef.current = progress;
+                        setLoadProgress(progress);
+                    }
+                });
+                const volumeResult = previewVolumeResult ?? await ctApi.getVolumeBinary(caseId, (loaded, total) => {
                     const progress = Math.round((loaded / total) * 80);
                     if (progress - lastProgressRef.current >= 5) {
                         lastProgressRef.current = progress;
                         setLoadProgress(progress);
                     }
                 });
+                const volumeResolution = previewVolumeResult ? 'preview' : 'full';
 
-                console.log('[VolumeViewer] Volume loaded, shape:', volumeResult.shape);
+                console.log('[VolumeViewer] Volume loaded, shape:', volumeResult.shape, 'resolution:', volumeResolution);
 
                 const volumeData: VolumeData = {
                     data: volumeResult.data,
                     shape: volumeResult.shape,
                     spacing: volumeResult.spacing,
+                    resolution: volumeResolution,
                 };
 
                 // Store in global cache (evict oldest if over limit)
@@ -156,18 +174,25 @@ export function useVolumeViewer(caseId: string | null) {
                 globalVolumeCache.set(caseId, volumeData);
                 setVolume(volumeData);
 
-                setCrosshair({
-                    x: Math.floor(volumeResult.shape[0] / 2),
-                    y: Math.floor(volumeResult.shape[1] / 2),
-                    z: Math.floor(volumeResult.shape[2] / 2),
-                });
+                setCrosshair(getCenteredCrosshair(volumeResult.shape));
 
                 // Try to load mask
                 try {
-                    lastProgressRef.current = 80;
-                    setLoadProgress(85);
-                    const maskResult = await maskApi.getMaskVolumeBinary(caseId, (loaded, total) => {
-                        const progress = 80 + Math.round((loaded / total) * 20);
+                    lastProgressRef.current = previewVolumeResult ? 55 : 80;
+                    setLoadProgress(previewVolumeResult ? 60 : 85);
+                    const previewMaskResult = await maskApi.getPreviewMaskVolumeBinary(caseId, (loaded, total) => {
+                        const progressBase = previewVolumeResult ? 60 : 85;
+                        const progressSpan = previewVolumeResult ? 40 : 15;
+                        const progress = progressBase + Math.round((loaded / total) * progressSpan);
+                        if (progress - lastProgressRef.current >= 5) {
+                            lastProgressRef.current = progress;
+                            setLoadProgress(progress);
+                        }
+                    });
+                    const maskResult = previewMaskResult ?? await maskApi.getMaskVolumeBinary(caseId, (loaded, total) => {
+                        const progressBase = previewVolumeResult ? 60 : 85;
+                        const progressSpan = previewVolumeResult ? 40 : 15;
+                        const progress = progressBase + Math.round((loaded / total) * progressSpan);
                         if (progress - lastProgressRef.current >= 5) {
                             lastProgressRef.current = progress;
                             setLoadProgress(progress);
@@ -178,10 +203,11 @@ export function useVolumeViewer(caseId: string | null) {
                         const maskData: MaskData = {
                             data: maskResult.data,
                             shape: maskResult.shape,
+                            resolution: previewMaskResult ? 'preview' : 'full',
                         };
                         globalMaskCache.set(caseId, maskData);
                         setMask(maskData);
-                        console.log('[VolumeViewer] Mask loaded');
+                        console.log('[VolumeViewer] Mask loaded, resolution:', maskData.resolution);
                     }
                 } catch {
                     console.log('[VolumeViewer] No mask available');
@@ -201,7 +227,7 @@ export function useVolumeViewer(caseId: string | null) {
 
         globalLoadingPromises.set(caseId, loadPromise);
         await loadPromise;
-    }, [caseId]);
+    }, [caseId, getCenteredCrosshair, setCrosshair]);
 
     // Auto-load on caseId change
     useEffect(() => {
@@ -542,8 +568,13 @@ export function useVolumeViewer(caseId: string | null) {
             case 'CORONAL': newY = sliceIndex; break;
             case 'SAGITTAL': newX = sliceIndex; break;
         }
-        setCrosshair({ x: newX, y: newY, z: newZ });
-    }, [setCrosshair]);
+        if (!volume) {
+            setCrosshair({ x: newX, y: newY, z: newZ });
+            return;
+        }
+
+        setCrosshair(clampCrosshairToShape(volume.shape, { x: newX, y: newY, z: newZ }));
+    }, [clampCrosshairToShape, setCrosshair, volume]);
 
     /**
      * Handle scroll in a specific view

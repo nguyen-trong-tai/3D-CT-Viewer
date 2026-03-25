@@ -164,8 +164,12 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     caseId = uploadRes.case_id;
                 }
 
+                updateStepStatus('load_volume', 'running');
+                setUploadState('processing');
+                setProgress(100);
+                setProgressLabel('Upload complete. Preparing 3D volume on the server...');
+
                 // Wait for background worker to parse DICOM/NIfTI and save the numpy volume
-                setProgressLabel('Converting DICOM/NIfTI to 3D Volume (Running in Background)...');
                 let isUploaded = false;
                 while (!isUploaded) {
                     await new Promise(resolve => setTimeout(resolve, 2000));
@@ -181,7 +185,6 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                 updateStepStatus('load_volume', 'completed');
 
                 // Processing phase
-                setUploadState('processing');
                 setProgress(0);
                 setProgressLabel('Starting AI pipeline...');
                 await casesApi.processCase(caseId);

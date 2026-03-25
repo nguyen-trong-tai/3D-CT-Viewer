@@ -9,7 +9,7 @@ interface PipelineVisualizerProps {
 
 /**
  * Pipeline Visualizer Component
- * Displays the AI processing stages as per PRD:
+ * Displays the processing stages as per PRD:
  * CT → Segmentation → SDF → Marching Cubes → Mesh
  */
 export const PipelineVisualizer: React.FC<PipelineVisualizerProps> = ({ steps, compact = false }) => {
@@ -83,7 +83,7 @@ export const PipelineVisualizer: React.FC<PipelineVisualizerProps> = ({ steps, c
                             color: 'var(--text-muted)',
                         }}
                     >
-                        AI Pipeline
+                        Processing Pipeline
                     </span>
                 </div>
             )}
