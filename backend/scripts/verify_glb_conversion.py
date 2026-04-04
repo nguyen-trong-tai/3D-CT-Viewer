@@ -9,11 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import trimesh
 
-from processing.glb_converter import (
-    convert_mesh_to_glb,
-    get_glb_stats,
-    compare_mesh_sizes,
-)
+from processing.glb_converter import GLBConverter
 
 
 def create_test_mesh() -> trimesh.Trimesh:
@@ -49,17 +45,17 @@ def run_verification():
         # Step 3: Convert to GLB with Draco
         print("\n[3] Converting to Draco-compressed GLB...")
         glb_path = temp_path / "test_mesh.glb"
-        success, message = convert_mesh_to_glb(mesh, glb_path, apply_draco=True)
+        success, message = GLBConverter.convert_mesh_to_glb(mesh, glb_path, apply_draco=True)
         
         print(f"    Success: {success}")
         print(f"    Message: {message}")
         
         if success and glb_path.exists():
-            stats = get_glb_stats(glb_path)
+            stats = GLBConverter.get_glb_stats(glb_path)
             print(f"    GLB size: {stats['size_kb']:.2f} KB")
             
             # Calculate reduction
-            comparison = compare_mesh_sizes(obj_path, glb_path)
+            comparison = GLBConverter.compare_mesh_sizes(obj_path, glb_path)
             if comparison:
                 print(f"\n[4] Compression Results:")
                 print(f"    OBJ: {comparison['obj_size_kb']:.2f} KB")
