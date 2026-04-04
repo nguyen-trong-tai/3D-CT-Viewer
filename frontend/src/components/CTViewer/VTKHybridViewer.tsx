@@ -16,13 +16,12 @@ import vtkInteractorStyleTrackballCamera from '@kitware/vtk.js/Interaction/Style
 
 import { ctApi, meshApi } from '../../services/api';
 import * as THREE from 'three';
-import { GLTFLoader, DRACOLoader } from 'three-stdlib';
+import { GLTFLoader } from 'three-stdlib';
+import { createDracoLoader } from '../../utils/draco';
 
 interface VTKHybridViewerProps {
     caseId: string;
 }
-
-const DRACO_DECODER_PATH = 'https://www.gstatic.com/draco/versioned/decoders/1.5.6/';
 
 const VTKHybridViewer: React.FC<VTKHybridViewerProps> = ({ caseId }) => {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
@@ -123,8 +122,7 @@ const VTKHybridViewer: React.FC<VTKHybridViewerProps> = ({ caseId }) => {
                     // --- LOAD MESH ---
                     setLoadingMsg("Loading 3D Mesh...");
                     const loader = new GLTFLoader();
-                    const dracoLoader = new DRACOLoader();
-                    dracoLoader.setDecoderPath(DRACO_DECODER_PATH);
+                    const dracoLoader = createDracoLoader();
                     loader.setDRACOLoader(dracoLoader);
 
                     loader.load(meshApi.getMeshUrl(caseId), (gltf: any) => {
