@@ -490,21 +490,21 @@ class CaseRepository:
     
     # Mesh Storage
     
-    def save_mesh(self, case_id: str, mesh: trimesh.Trimesh):
+    def save_mesh(self, case_id: str, mesh: trimesh.Trimesh | trimesh.Scene):
         """
-        Save mesh in Draco-compressed GLB format.
+        Save a mesh or multi-part mesh scene in Draco-compressed GLB format.
         
         This provides 80-90% file size reduction compared to OBJ
         and includes pre-computed normals for frontend performance.
         """
-        from processing.glb_converter import convert_mesh_to_glb
+        from processing.glb_converter import GLBConverter
         
         case_path = self._case_dir(case_id)
         case_path.mkdir(parents=True, exist_ok=True)
         glb_path = case_path / "mesh.glb"
         
         # Convert mesh to Draco-compressed GLB
-        success, message = convert_mesh_to_glb(mesh, glb_path, apply_draco=True)
+        success, message = GLBConverter.convert_mesh_to_glb(mesh, glb_path, apply_draco=True)
         
         if success:
             print(f"[Repository] Mesh saved as GLB: {message}")
@@ -517,8 +517,8 @@ class CaseRepository:
         else:
             print(f"[Repository] GLB conversion warning: {message}")
     
-    def load_mesh(self, case_id: str) -> Optional[trimesh.Trimesh]:
-        """Load mesh from file (supports both GLB and legacy OBJ)."""
+    def load_mesh(self, case_id: str) -> Optional[trimesh.Trimesh | trimesh.Scene]:
+        """Load mesh or multi-part mesh scene from file."""
         # Try GLB first (new format)
         glb_path = self._case_dir(case_id) / "mesh.glb"
         if glb_path.exists():

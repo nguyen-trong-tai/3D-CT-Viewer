@@ -19,13 +19,10 @@ import numpy as np
 from storage.repository import CaseRepository
 from models.enums import CaseStatus
 from processing import (
-    segment_volume_baseline,
-    compute_sdf_fast,
-    compute_sdf_downsampled,
-    get_optimal_downsample_factor,
-    extract_mesh,
-    get_optimal_mesh_step_size,
-    compute_mesh_stats,
+    LungSegmenter,
+    HUPreprocessor,
+    MeshProcessor,
+    SDFProcessor,
 )
 
 
@@ -58,10 +55,20 @@ class PipelineResult:
     error_message: Optional[str] = None
 
 
+@dataclass
+class SegmentationComponent:
+    """Normalized segmentation component for downstream mesh generation."""
+    key: str
+    display_name: str
+    mask: np.ndarray
+    color_hex: str
+    render_2d: bool = False
+    render_3d: bool = True
+
+
 class PipelineService:
     """
     Orchestrates the full CT → 3D processing pipeline.
-    
     Pipeline stages:
     1. Load CT volume from storage
     2. Segmentation (threshold-based)
@@ -74,7 +81,11 @@ class PipelineService:
     def __init__(self, repository: CaseRepository):
         self.repo = repository
         self._active_pipelines: Dict[str, bool] = {}
-    
+        self.segmenter = LungSegmenter(
+            hu_threshold=    -400,
+            min_lung_volume= 50_000,
+            fill_holes=      True,
+        )
     def process_case(
         self,
         case_id: str,
@@ -129,8 +140,8 @@ class PipelineService:
             
             # Stage 2: Segmentation
             self.repo.update_pipeline_stage(case_id, "segmentation", "running")
-            stage_result, mask = self._stage_segmentation(
-                case_id, volume, segmentation_threshold, force_recompute
+            stage_result, mask, mesh_components = self._stage_segmentation(
+                case_id, volume, metadata, segmentation_threshold, force_recompute
             )
             result.stages.append(stage_result)
             self.repo.update_pipeline_stage(
@@ -164,7 +175,7 @@ class PipelineService:
             # Stage 4: Mesh Extraction
             self.repo.update_pipeline_stage(case_id, "mesh", "running")
             stage_result = self._stage_mesh(
-                case_id, sdf_volume, spacing, force_recompute
+                case_id, sdf_volume, spacing, mesh_components, force_recompute
             )
             result.stages.append(stage_result)
             self.repo.update_pipeline_stage(
@@ -220,8 +231,18 @@ class PipelineService:
         start = time.time()
         
         try:
-            volume = self.repo.load_ct_volume(case_id)
             metadata = self.repo.load_ct_metadata(case_id)
+
+            volume = None
+            load_mode = "mmap"
+            try:
+                volume = self.repo.load_ct_volume_mmap(case_id)
+            except Exception:
+                volume = None
+
+            if volume is None:
+                volume = self.repo.load_ct_volume(case_id)
+                load_mode = "eager"
             
             if volume is None or metadata is None:
                 return (
@@ -240,7 +261,7 @@ class PipelineService:
                     status=PipelineStageStatus.COMPLETED,
                     duration_seconds=time.time() - start,
                     output_shape=volume.shape,
-                    message=f"Loaded volume: {volume.shape}"
+                    message=f"Loaded volume: {volume.shape} ({load_mode})"
                 ),
                 volume,
                 metadata,
@@ -262,40 +283,50 @@ class PipelineService:
         self,
         case_id: str,
         volume: np.ndarray,
+        metadata: Optional[Dict[str, Any]],
         threshold: float,
         force_recompute: bool,
-    ) -> tuple[PipelineStageResult, Optional[np.ndarray]]:
+    ) -> tuple[PipelineStageResult, Optional[np.ndarray], list[SegmentationComponent]]:
         """Stage 2: Segment the CT volume."""
         start = time.time()
         
         try:
-            # Check if mask already exists
-            if not force_recompute and self.repo.mask_exists(case_id):
-                mask = self.repo.load_mask(case_id)
-                if mask is None:
-                    return (
-                        PipelineStageResult(
-                            name="segmentation",
-                            status=PipelineStageStatus.FAILED,
-                            duration_seconds=time.time() - start,
-                            message="Mask manifest exists but artifact could not be loaded"
-                        ),
-                        None,
-                    )
-                return (
-                    PipelineStageResult(
-                        name="segmentation",
-                        status=PipelineStageStatus.SKIPPED,
-                        duration_seconds=time.time() - start,
-                        output_shape=mask.shape,
-                        message="Using existing mask"
-                    ),
-                    mask,
-                )
+            # # Check if mask already exists
+            # if not force_recompute and self.repo.mask_exists(case_id):
+            #     mask = self.repo.load_mask(case_id)
+            #     if mask is None:
+            #         return (
+            #             PipelineStageResult(
+            #                 name="segmentation",
+            #                 status=PipelineStageStatus.FAILED,
+            #                 duration_seconds=time.time() - start,
+            #                 message="Mask manifest exists but artifact could not be loaded"
+            #             ),
+            #             None,
+            #         )
+            #     return (
+            #         PipelineStageResult(
+            #             name="segmentation",
+            #             status=PipelineStageStatus.SKIPPED,
+            #             duration_seconds=time.time() - start,
+            #             output_shape=mask.shape,
+            #             message="Using existing mask"
+            #         ),
+            #         mask,
+            #     )
             
             # Perform deterministic baseline segmentation only.
-            print(f"[Pipeline Stage 2] Running baseline threshold segmentation (Threshold: {threshold} HU)...")
-            mask = segment_volume_baseline(volume, threshold=threshold)
+            print(f"[Pipeline Stage 2] Running baseline segmentation (Threshold: {threshold} HU)...")
+            volume = self._prepare_volume_for_segmentation(volume, metadata)
+            segmenter = LungSegmenter(
+                hu_threshold=threshold,
+                min_lung_volume=self.segmenter.min_lung_volume,
+                fill_holes=self.segmenter.fill_holes,
+                body_threshold=self.segmenter.body_threshold,
+                min_component_slices=self.segmenter.min_component_slices,
+            )
+            segmentation_result = segmenter.segment(volume)
+            mask, mesh_components = self._normalize_segmentation_result(segmentation_result)
             
             # Khởi tạo mesh placeholder nếu không có voxel nào (tránh crash pipeline)
             if np.sum(mask > 0) == 0:
@@ -312,9 +343,13 @@ class PipelineService:
                     status=PipelineStageStatus.COMPLETED,
                     duration_seconds=time.time() - start,
                     output_shape=mask.shape,
-                    message=f"Segmented {voxel_count:,} voxels"
+                    message=(
+                        f"Segmented {voxel_count:,} voxels; "
+                        f"{len(mesh_components)} 3D components"
+                    )
                 ),
                 mask,
+                mesh_components,
             )
             
         except Exception as e:
@@ -326,6 +361,7 @@ class PipelineService:
                     message=str(e)
                 ),
                 None,
+                [],
             )
     
     def _stage_sdf(
@@ -363,13 +399,13 @@ class PipelineService:
                 )
             
             # Determine optimal downsample factor based on volume size
-            downsample_factor = get_optimal_downsample_factor(mask.shape)
+            downsample_factor = SDFProcessor.get_optimal_downsample_factor(mask.shape)
             
             if downsample_factor > 1:
                 print(f"[Pipeline] SDF: Using downsample factor {downsample_factor}")
-                sdf = compute_sdf_downsampled(mask, factor=downsample_factor)
+                sdf = SDFProcessor.compute_downsampled(mask, factor=downsample_factor)
             else:
-                sdf = compute_sdf_fast(mask)
+                sdf = SDFProcessor.compute_fast(mask)
 
             if sdf.dtype != np.float32:
                 sdf = sdf.astype(np.float32, copy=False)
@@ -405,6 +441,7 @@ class PipelineService:
         case_id: str,
         sdf: np.ndarray,
         spacing: tuple,
+        mesh_components: list[SegmentationComponent],
         force_recompute: bool
     ) -> PipelineStageResult:
         """Stage 4: Extract surface mesh using Marching Cubes."""
@@ -420,23 +457,66 @@ class PipelineService:
                     message="Using existing mesh"
                 )
             
-            # Extract mesh
-            mesh_step_size = get_optimal_mesh_step_size(sdf.shape)
-            mesh = extract_mesh(sdf, spacing, step_size=mesh_step_size)
-            
-            # Store result
+            component_meshes: list[tuple[str, Any]] = []
+            total_vertices = 0
+            total_faces = 0
+
+            for component in mesh_components:
+                if not np.any(component.mask):
+                    continue
+
+                component_sdf, downsample_factor = self._compute_mask_sdf(component.mask)
+                mesh_step_size = MeshProcessor.get_optimal_step_size(component_sdf.shape)
+                component_mesh = MeshProcessor.extract_mesh(
+                    component_sdf,
+                    spacing,
+                    step_size=mesh_step_size,
+                )
+
+                if len(component_mesh.vertices) == 0 or len(component_mesh.faces) == 0:
+                    continue
+
+                colored_mesh = MeshProcessor.apply_color(
+                    component_mesh,
+                    self._hex_to_rgba(component.color_hex),
+                )
+                component_meshes.append((component.key, colored_mesh))
+
+                component_stats = MeshProcessor.compute_stats(colored_mesh)
+                total_vertices += int(component_stats["vertex_count"])
+                total_faces += int(component_stats["face_count"])
+                print(
+                    "[Pipeline] Mesh component "
+                    f"{component.key}: faces={component_stats['face_count']}, "
+                    f"downsample={downsample_factor}, step={mesh_step_size}"
+                )
+
+            if component_meshes:
+                mesh_scene = MeshProcessor.build_scene(component_meshes)
+                self.repo.save_mesh(case_id, mesh_scene)
+                return PipelineStageResult(
+                    name="mesh",
+                    status=PipelineStageStatus.COMPLETED,
+                    duration_seconds=time.time() - start,
+                    message=(
+                        f"{len(component_meshes)} components, "
+                        f"{total_vertices:,} vertices, {total_faces:,} faces"
+                    )
+                )
+
+            # Fallback to the legacy single-mesh path when no component meshes exist.
+            mesh_step_size = MeshProcessor.get_optimal_step_size(sdf.shape)
+            mesh = MeshProcessor.extract_mesh(sdf, spacing, step_size=mesh_step_size)
             self.repo.save_mesh(case_id, mesh)
-            
-            # Compute stats
-            stats = compute_mesh_stats(mesh)
-            
+            stats = MeshProcessor.compute_stats(mesh)
+
             return PipelineStageResult(
                 name="mesh",
                 status=PipelineStageStatus.COMPLETED,
                 duration_seconds=time.time() - start,
                 message=(
                     f"{stats['vertex_count']:,} vertices, "
-                    f"{stats['face_count']:,} faces (step_size={mesh_step_size})"
+                    f"{stats['face_count']:,} faces (fallback, step_size={mesh_step_size})"
                 )
             )
             
@@ -447,6 +527,163 @@ class PipelineService:
                 duration_seconds=time.time() - start,
                 message=str(e)
             )
+
+    @staticmethod
+    def _normalize_segmentation_result(
+        segmentation_result: Dict[str, Any]
+    ) -> tuple[np.ndarray, list[SegmentationComponent]]:
+        """
+        Normalize segmentation outputs into a combined overlay mask and 3D components.
+
+        Current segmenters can return legacy top-level masks or a future-proof
+        `components` dictionary. The combined overlay mask remains unchanged so
+        frontend 2D overlays keep working without modification.
+        """
+        raw_components = segmentation_result.get("components")
+        components: list[SegmentationComponent] = []
+
+        if isinstance(raw_components, dict) and raw_components:
+            for key, payload in raw_components.items():
+                if isinstance(payload, dict):
+                    mask = payload.get("mask")
+                    display_name = str(payload.get("name") or key.replace("_", " ").title())
+                    color_hex = str(payload.get("color") or PipelineService._default_component_color(key))
+                    render_2d = bool(payload.get("render_2d", False))
+                    render_3d = bool(payload.get("render_3d", True))
+                else:
+                    mask = payload
+                    display_name = key.replace("_", " ").title()
+                    color_hex = PipelineService._default_component_color(key)
+                    render_2d = False
+                    render_3d = True
+
+                if mask is None:
+                    continue
+
+                components.append(
+                    SegmentationComponent(
+                        key=key,
+                        display_name=display_name,
+                        mask=np.asarray(mask, dtype=np.uint8),
+                        color_hex=color_hex,
+                        render_2d=render_2d,
+                        render_3d=render_3d,
+                    )
+                )
+        else:
+            fallback_specs = (
+                ("lung", "lung_mask", "Lungs", True, False),
+                ("left_lung", "left_mask", "Left Lung", False, True),
+                ("right_lung", "right_mask", "Right Lung", False, True),
+            )
+            for key, source_key, display_name, render_2d, render_3d in fallback_specs:
+                mask = segmentation_result.get(source_key)
+                if mask is None:
+                    continue
+                components.append(
+                    SegmentationComponent(
+                        key=key,
+                        display_name=display_name,
+                        mask=np.asarray(mask, dtype=np.uint8),
+                        color_hex=PipelineService._default_component_color(key),
+                        render_2d=render_2d,
+                        render_3d=render_3d,
+                    )
+                )
+
+        combined_mask = segmentation_result.get("lung_mask")
+        if combined_mask is None:
+            overlay_sources = [component.mask for component in components if component.render_2d]
+            if not overlay_sources:
+                overlay_sources = [component.mask for component in components]
+            if not overlay_sources:
+                raise ValueError("Segmentation result did not contain any masks")
+            combined_mask = np.logical_or.reduce([mask.astype(bool) for mask in overlay_sources]).astype(np.uint8)
+        else:
+            combined_mask = np.asarray(combined_mask, dtype=np.uint8)
+
+        renderable_components = [
+            component
+            for component in components
+            if component.render_3d and np.any(component.mask)
+        ]
+
+        if not renderable_components and np.any(combined_mask):
+            renderable_components = [
+                SegmentationComponent(
+                    key="lung",
+                    display_name="Lungs",
+                    mask=combined_mask,
+                    color_hex=PipelineService._default_component_color("lung"),
+                    render_2d=True,
+                    render_3d=True,
+                )
+            ]
+
+        return combined_mask, renderable_components
+
+    @staticmethod
+    def _compute_mask_sdf(mask: np.ndarray) -> tuple[np.ndarray, int]:
+        """Compute an SDF for an individual component mask."""
+        downsample_factor = SDFProcessor.get_optimal_downsample_factor(mask.shape)
+        if downsample_factor > 1:
+            sdf = SDFProcessor.compute_downsampled(mask, factor=downsample_factor)
+        else:
+            sdf = SDFProcessor.compute_fast(mask)
+
+        if sdf.dtype != np.float32:
+            sdf = sdf.astype(np.float32, copy=False)
+
+        return sdf, downsample_factor
+
+    @staticmethod
+    def _default_component_color(component_key: str) -> str:
+        palette = {
+            "lung": "#ef4444",
+            "left_lung": "#60a5fa",
+            "right_lung": "#34d399",
+        }
+        return palette.get(component_key, "#f59e0b")
+
+    @staticmethod
+    def _prepare_volume_for_segmentation(
+        volume: np.ndarray,
+        metadata: Optional[Dict[str, Any]],
+    ) -> np.ndarray:
+        """Skip a full-volume clip pass when persisted HU metadata is already in range."""
+        if PipelineService._is_hu_range_within_clip_bounds(metadata):
+            return volume
+        return HUPreprocessor.clip_hu(volume)
+
+    @staticmethod
+    def _is_hu_range_within_clip_bounds(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Check whether stored HU range guarantees the volume is already clip-safe."""
+        if not isinstance(metadata, dict):
+            return False
+
+        hu_range = metadata.get("hu_range")
+        if not isinstance(hu_range, dict):
+            return False
+
+        try:
+            hu_min = float(hu_range["min"])
+            hu_max = float(hu_range["max"])
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        return (
+            hu_min >= HUPreprocessor.HU_CLIP_MIN
+            and hu_max <= HUPreprocessor.HU_CLIP_MAX
+        )
+
+    @staticmethod
+    def _hex_to_rgba(color_hex: str) -> tuple[int, int, int, int]:
+        value = color_hex.strip().lstrip("#")
+        if len(value) == 6:
+            value += "ff"
+        if len(value) != 8:
+            raise ValueError(f"Invalid color: {color_hex}")
+        return tuple(int(value[index:index + 2], 16) for index in range(0, 8, 2))
     
     def start_pipeline_async(self, case_id: str, **kwargs) -> bool:
         """
