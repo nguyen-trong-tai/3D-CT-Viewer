@@ -52,7 +52,11 @@ class AISegmentationService:
         self._nodule_pipeline_error: str | None = None
 
     def segment(self, volume_xyz: np.ndarray, spacing_xyz_mm: tuple[float, float, float]) -> dict[str, Any]:
+        import time
+        time_start = time.time()
         lung_result = self.lung_segmenter.segment(volume_xyz)
+        end_time = time.time()
+        print(f"Lung segmentation completed in {end_time - time_start:.2f} seconds.", flush=True)
         left_mask = np.asarray(lung_result.get("left_mask"), dtype=bool)
         right_mask = np.asarray(lung_result.get("right_mask"), dtype=bool)
         lung_mask = np.asarray(lung_result.get("lung_mask"), dtype=bool)

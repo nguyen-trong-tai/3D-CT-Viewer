@@ -1,0 +1,102 @@
+# Pipeline overview
+┌────────────────────────────┐
+│        Input CT (DICOM)    │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│  DICOM Parsing + 3D Volume │
+│  - Sort slices             │
+│  - HU conversion           │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│      Preprocessing         │
+│  - Resample spacing        │
+│  - Normalize (HU window)   │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│    Lung Segmentation       │
+│  → lung_mask              │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│  Candidate Detection       │
+│  (Stage 1)                │
+│  - Within lung_mask        │
+│  - Output: centers         │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│   Patch Extraction         │
+│  - Crop 128x128 patches    │
+│  - Around each candidate   │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│  Nodule Segmentation       │
+│  (Stage 2)                │
+│  - Model inference         │
+│  - Output: local mask      │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│  Local Mask Filtering      │
+│  - Remove empty / noise    │
+│  - Shape / size check      │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│  Map to Global Volume      │
+│  - Place mask đúng vị trí  │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│      Mask Fusion           │
+│  - Overlap merging         │
+│  - Probability fusion      │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│   3D Post-processing       │
+│  - Threshold               │
+│  - Connected components    │
+│  - Remove small objects    │
+└────────────┬───────────────┘
+             ↓
+┌────────────────────────────┐
+│   Final Output             │
+│  → 3D Nodule Mask          │
+│  (Binary / Instance)       │
+└────────────────────────────┘
+
+# Flow chi tiết Stage 1 (detection)
+Input: CT volume + lung_mask
+        ↓
+Filter region inside lung_mask
+        ↓
+Candidate generation:
+  - Detector model (DeepLung or Yolo)
+        ↓
+Output: candidate_list
+  [
+    (x1, y1, z1),
+    (x2, y2, z2),
+    ...
+  ]
+
+# Flow chi tiết stage 2(segmentation)
+For each candidate:
+    ↓
+Crop patch (128x128)
+    ↓
+Run segmentation model
+    ↓
+Output: local_mask
+    ↓
+Check validity:
+  - empty?
+  - too small?
+  - shape ok?
+    ↓
+Keep or discard

@@ -14,7 +14,7 @@ class NoduleMaskPipelineConfig:
     target_spacing_xyz: tuple[float, float, float] = (1.0, 1.0, 1.0)
     det_score_threshold: float = -3.0
     det_nms_threshold: float = 0.1
-    candidate_top_k: int = 8
+    candidate_top_k: int = 5
     min_component_volume_mm3: float = 10.0
     foreground_threshold: float = 0.45
     local_filter_mode: str = "binary_slice"
@@ -32,8 +32,8 @@ class NoduleMaskPipelineConfig:
     postprocess_lung_mask_dilation_iters: int = 1
     center_fallback_radius_vox: float = 6.0
     modal_device: str = "cuda"
-    capture_detector_debug: bool = True
-    capture_segmentor_debug: bool = True
+    capture_detector_debug: bool = False
+    capture_segmentor_debug: bool = False
 
 
 @dataclass

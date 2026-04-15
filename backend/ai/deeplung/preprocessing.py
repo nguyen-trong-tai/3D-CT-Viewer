@@ -55,7 +55,7 @@ class DeepLungDetectorConfig:
     tile_margin: int = 32
     score_threshold: float = -3.0
     nms_threshold: float = 0.1
-    batch_size: int = 4
+    batch_size: int = 8
     device: str = "cpu"
 
 

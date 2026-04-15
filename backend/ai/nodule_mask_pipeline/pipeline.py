@@ -58,7 +58,7 @@ class NoduleMaskPipeline:
             raise ValueError(f"Expected a 3D CT volume, got shape {volume_xyz.shape}")
         if spacing_xyz.shape != (3,):
             raise ValueError(f"Expected spacing_xyz_mm with 3 elements, got {spacing_xyz}")
-
+        start_time = time.time()
         resolved_lung_mask_xyz = self.lung_mask_stage.resolve(volume_xyz, lung_mask_xyz)
         prepared = self.resampled_volume_stage.prepare(
             volume_xyz=volume_xyz,
@@ -69,6 +69,8 @@ class NoduleMaskPipeline:
         if not resolved_lung_mask_xyz.any() or not prepared.resampled_lung_mask_xyz.any():
             print("Skipping nodule segmentation because lung mask is empty after preparation.", flush=True)
             return self._build_empty_result(prepared)
+        end_time = time.time()
+        print(f"Preprocessing completed in {end_time - start_time:.2f} seconds.", flush=True)
 
         print("Running detector stage...", flush=True)
         detector_start_time = time.time()
@@ -79,6 +81,8 @@ class NoduleMaskPipeline:
         segmentor_start_time = time.time()
         segmentor_output = self.candidate_segmentation_stage.run(prepared, detector_output)
         print(f"Segmentor accepted {segmentor_output.accepted_candidate_count} candidates.", flush=True)
+        segmentor_end_time = time.time()
+        post_processor_start_time = time.time()
         final_mask_resampled_xyz = self.post_processor.post_process_probability_volume(
             segmentor_output.probability_volume_resampled_xyz,
             prepared.resampled_lung_mask_xyz,
@@ -92,8 +96,9 @@ class NoduleMaskPipeline:
             target_shape_xyz=tuple(int(value) for value in volume_xyz.shape),
         )
         component_stats = self.post_processor.compute_component_stats(final_mask_xyz, prepared.spacing_xyz_mm)
-        segmentor_end_time = time.time()
+        post_processor_end_time = time.time()
         print(f"Segmentor stage completed in {segmentor_end_time - segmentor_start_time:.2f} seconds.", flush=True)
+        print(f"Post-processing completed in {post_processor_end_time - post_processor_start_time:.2f} seconds.", flush=True)
 
         return NoduleMaskPipelineResult(
             final_mask_xyz=final_mask_xyz,

@@ -78,16 +78,26 @@ class MedicalVolumeLoader:
         cls,
         file_paths: List[str],
     ) -> Tuple[List[pydicom.Dataset], Tuple[float, float, float], pydicom.Dataset]:
-        """Read DICOM files once, select the primary series, and return ordered datasets."""
+        """Select the primary series from headers first, then load only that series' datasets."""
         if not file_paths:
             raise ValueError("No DICOM files provided")
 
         started_at = perf_counter()
-        dataset_entries = cls._load_candidate_dicom_datasets(file_paths)
-        if not dataset_entries:
+        headers = cls._load_candidate_dicom_file_headers(file_paths)
+        if not headers:
             raise ValueError("No valid DICOM files found")
 
-        selected_entries = cls._select_primary_series_headers(dataset_entries)
+        selected_headers = cls._select_primary_series_headers(headers)
+        selected_entries = cls._load_dataset_entries_from_selected_headers(selected_headers)
+        if len(selected_entries) != len(selected_headers):
+            # Fall back to the legacy full scan when header-first selection cannot be decoded
+            # completely. This keeps series selection and pipeline output stable for partially
+            # corrupt or mixed-content folders while still accelerating the common case.
+            dataset_entries = cls._load_candidate_dicom_datasets(file_paths)
+            if not dataset_entries:
+                raise ValueError("No valid DICOM files found")
+            selected_entries = cls._select_primary_series_headers(dataset_entries)
+
         spacing = cls._extract_spacing(selected_entries[0]["header"])
         selected_datasets = [entry["dataset"] for entry in selected_entries]
         print(
@@ -376,6 +386,37 @@ class MedicalVolumeLoader:
         datasets: List[dict[str, Any]] = []
         for path in file_paths:
             entry = read_dataset(path)
+            if entry is not None:
+                datasets.append(entry)
+        return datasets
+
+    @classmethod
+    def _load_dataset_entries_from_selected_headers(
+        cls,
+        selected_headers: List[dict[str, Any]],
+    ) -> List[dict[str, Any]]:
+        def read_selected_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+            path = str(entry["source"])
+            try:
+                dataset = pydicom.dcmread(path)
+                if cls._looks_like_image_slice(dataset) and "PixelData" in dataset:
+                    return {
+                        "source": path,
+                        "header": dataset,
+                        "dataset": dataset,
+                    }
+            except Exception:
+                return None
+            return None
+
+        if len(selected_headers) >= 8:
+            max_workers = cls._dicom_worker_count(len(selected_headers))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                return [entry for entry in executor.map(read_selected_entry, selected_headers) if entry is not None]
+
+        datasets: List[dict[str, Any]] = []
+        for header_entry in selected_headers:
+            entry = read_selected_entry(header_entry)
             if entry is not None:
                 datasets.append(entry)
         return datasets

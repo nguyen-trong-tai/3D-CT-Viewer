@@ -316,6 +316,8 @@ class PipelineService:
             # Perform deterministic baseline segmentation only.
             print(f"[Pipeline Stage 2] Running baseline segmentation (Threshold: {threshold} HU)...")
             volume = self._prepare_volume_for_segmentation(volume, metadata)
+            print(f"prepare volume complete in:. {time.time() - start:.2f} seconds.")
+            
             spacing = tuple(float(value) for value in (metadata or {}).get("spacing", (1.0, 1.0, 1.0)))
             segmentation_result = self.ai_segmenter.segment(volume, spacing)
             mask, mesh_components, manifest = self._normalize_segmentation_result(segmentation_result)
