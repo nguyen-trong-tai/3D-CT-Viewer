@@ -20,6 +20,7 @@ type UploadState = 'idle' | 'uploading' | 'error';
 
 const TRANSFER_PROGRESS_MAX = 88;
 const ACQUISITION_PROGRESS_MAX = 99;
+const VIEWER_ARTIFACT_PROBE_INTERVAL_MS = 3000;
 
 const normalizeCaseStatus = (status?: StatusResponse['status']): CaseMetadata['status'] => {
     switch (status) {
@@ -34,6 +35,49 @@ const normalizeCaseStatus = (status?: StatusResponse['status']): CaseMetadata['s
     }
 };
 
+const readFileEntry = async (fileEntry: FileSystemFileEntry): Promise<File | null> => {
+    return new Promise((resolve) => {
+        fileEntry.file(
+            (value) => resolve(value),
+            () => resolve(null)
+        );
+    });
+};
+
+const readDirectoryEntries = async (dirEntry: FileSystemDirectoryEntry): Promise<File[]> => {
+    return new Promise((resolve) => {
+        const reader = dirEntry.createReader();
+        const files: File[] = [];
+
+        const readBatch = () => {
+            reader.readEntries(async (entries) => {
+                if (entries.length === 0) {
+                    resolve(files);
+                    return;
+                }
+
+                const batchFiles = await Promise.all(
+                    entries.map(async (entry): Promise<File[]> => {
+                        if (entry.isFile) {
+                            const file = await readFileEntry(entry as FileSystemFileEntry);
+                            return file ? [file] : [];
+                        }
+                        if (entry.isDirectory) {
+                            return readDirectoryEntries(entry as FileSystemDirectoryEntry);
+                        }
+                        return [];
+                    })
+                );
+                files.push(...batchFiles.flat());
+
+                readBatch();
+            });
+        };
+
+        readBatch();
+    });
+};
+
 export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
     const [dragActive, setDragActive] = useState(false);
     const [uploadState, setUploadState] = useState<UploadState>('idle');
@@ -43,39 +87,6 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const folderInputRef = useRef<HTMLInputElement>(null);
-
-    const readDirectoryEntries = async (dirEntry: FileSystemDirectoryEntry): Promise<File[]> => {
-        return new Promise((resolve) => {
-            const reader = dirEntry.createReader();
-            const files: File[] = [];
-
-            const readBatch = () => {
-                reader.readEntries(async (entries) => {
-                    if (entries.length === 0) {
-                        resolve(files);
-                        return;
-                    }
-
-                    for (const entry of entries) {
-                        if (entry.isFile) {
-                            const fileEntry = entry as FileSystemFileEntry;
-                            const file = await new Promise<File>((res) => {
-                                fileEntry.file((value) => res(value));
-                            });
-                            files.push(file);
-                        } else if (entry.isDirectory) {
-                            const subFiles = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-                            files.push(...subFiles);
-                        }
-                    }
-
-                    readBatch();
-                });
-            };
-
-            readBatch();
-        });
-    };
 
     const buildCaseMetadata = useCallback(async (caseId: string): Promise<CaseMetadata> => {
         ctApi.invalidateMetadata(caseId);
@@ -151,7 +162,14 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
             const applyStatus = (status: Pick<StatusResponse, 'progress_percent' | 'current_stage'>) => {
                 updateAcquisitionProgress(status.progress_percent, status.current_stage);
             };
-            const hasViewerArtifact = async () => {
+            let lastArtifactProbeAt = 0;
+            const hasViewerArtifact = async (force = false) => {
+                const now = Date.now();
+                if (!force && now - lastArtifactProbeAt < VIEWER_ARTIFACT_PROBE_INTERVAL_MS) {
+                    return false;
+                }
+                lastArtifactProbeAt = now;
+
                 try {
                     const artifacts = await casesApi.getArtifacts(caseId);
                     return Boolean(
@@ -161,14 +179,14 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     return false;
                 }
             };
-            const evaluateStatus = async (status: StatusResponse) => {
+            const evaluateStatus = async (status: StatusResponse, forceArtifactProbe = false) => {
                 applyStatus(status);
 
                 if (status.status === 'error') {
                     throw new Error(status.message || 'Error processing raw data into volume.');
                 }
 
-                if (isReady(status.status) || await hasViewerArtifact()) {
+                if (isReady(status.status) || await hasViewerArtifact(forceArtifactProbe)) {
                     return status;
                 }
 
@@ -176,7 +194,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
             };
 
             const initialStatus = await casesApi.getStatus(caseId);
-            const initialReadyStatus = await evaluateStatus(initialStatus);
+            const initialReadyStatus = await evaluateStatus(initialStatus, true);
             if (initialReadyStatus) {
                 return initialReadyStatus;
             }
@@ -292,20 +310,22 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                 if ('length' in items && items[0] && 'webkitGetAsEntry' in items[0]) {
                     setProgressLabel('Reading folder structure...');
 
-                    for (let i = 0; i < items.length; i += 1) {
-                        const item = items[i] as DataTransferItem;
-                        const entry = item.webkitGetAsEntry?.();
+                    const topLevelFiles = await Promise.all(
+                        Array.from({ length: items.length }, async (_, index): Promise<File[]> => {
+                            const item = items[index] as DataTransferItem;
+                            const entry = item.webkitGetAsEntry?.();
 
-                        if (entry?.isDirectory) {
-                            const dirFiles = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
-                            fileArray.push(...dirFiles);
-                        } else if (entry?.isFile) {
-                            const file = item.getAsFile();
-                            if (file) {
-                                fileArray.push(file);
+                            if (entry?.isDirectory) {
+                                return readDirectoryEntries(entry as FileSystemDirectoryEntry);
                             }
-                        }
-                    }
+                            if (entry?.isFile) {
+                                const file = item.getAsFile();
+                                return file ? [file] : [];
+                            }
+                            return [];
+                        })
+                    );
+                    fileArray = topLevelFiles.flat();
                 } else {
                     fileArray = Array.from(items as FileList);
                 }
@@ -366,7 +386,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                 setErrorMsg(err instanceof Error ? err.message : 'Upload failed');
             }
         },
-        [buildCaseMetadata, onUploadComplete, readDirectoryEntries, setTransferProgress, updateAcquisitionProgress, waitForCaseUploadReady]
+        [buildCaseMetadata, onUploadComplete, setTransferProgress, waitForCaseUploadReady]
     );
 
     const handleDrag = (event: React.DragEvent) => {

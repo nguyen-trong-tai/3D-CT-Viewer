@@ -42,6 +42,7 @@ const MAX_CACHED_VOLUMES = 2;
 const globalVolumeCache = new Map<string, VolumeData>();
 const globalMaskCache = new Map<string, MaskData>();
 const globalLoadingPromises = new Map<string, Promise<void>>();
+const globalMaskLoadingPromises = new Map<string, Promise<MaskData | null>>();
 
 function evictOldestCache() {
     if (globalVolumeCache.size > MAX_CACHED_VOLUMES) {
@@ -78,8 +79,6 @@ export function useVolumeViewer(caseId: string | null) {
     // ImageData cache for ultra-fast rendering
     const imageDataCache = useRef(new Map<string, ImageData>());
 
-    // Loading guard to prevent duplicate loads
-    const loadingRef = useRef(false);
     const loadedCaseRef = useRef<string | null>(null);
 
     // Progress throttling
@@ -123,27 +122,50 @@ export function useVolumeViewer(caseId: string | null) {
     }, [clampCrosshairToShape]);
 
     const loadMaskArtifacts = useCallback(async (targetCaseId: string, preferPreview: boolean) => {
-        try {
-            const previewMaskResult = preferPreview
-                ? await maskApi.getPreviewMaskVolumeBinary(targetCaseId)
-                : null;
-            const maskResult = previewMaskResult ?? await maskApi.getMaskVolumeBinary(targetCaseId);
-
-            if (!maskResult) {
-                return false;
-            }
-
-            const maskData: MaskData = {
-                data: maskResult.data,
-                shape: maskResult.shape,
-                resolution: previewMaskResult ? 'preview' : 'full',
-            };
-            globalMaskCache.set(targetCaseId, maskData);
-            setMask(maskData);
+        const cachedMask = globalMaskCache.get(targetCaseId);
+        if (cachedMask && (preferPreview || cachedMask.resolution === 'full')) {
+            setMask(cachedMask);
             return true;
-        } catch {
+        }
+
+        const requestKey = `${targetCaseId}:${preferPreview ? 'preview' : 'full'}`;
+        const existingPromise = globalMaskLoadingPromises.get(requestKey);
+        const loadPromise = existingPromise ?? (async (): Promise<MaskData | null> => {
+            try {
+                const previewMaskResult = preferPreview
+                    ? await maskApi.getPreviewMaskVolumeBinary(targetCaseId)
+                    : null;
+                const maskResult = previewMaskResult ?? await maskApi.getMaskVolumeBinary(targetCaseId);
+
+                if (!maskResult) {
+                    return null;
+                }
+
+                const maskData: MaskData = {
+                    data: maskResult.data,
+                    shape: maskResult.shape,
+                    resolution: previewMaskResult ? 'preview' : 'full',
+                };
+                globalMaskCache.set(targetCaseId, maskData);
+                return maskData;
+            } catch {
+                return null;
+            } finally {
+                globalMaskLoadingPromises.delete(requestKey);
+            }
+        })();
+
+        if (!existingPromise) {
+            globalMaskLoadingPromises.set(requestKey, loadPromise);
+        }
+
+        const maskData = await loadPromise;
+        if (!maskData) {
             return false;
         }
+
+        setMask(maskData);
+        return true;
     }, []);
 
     const upgradePreviewVolume = useCallback(async (
@@ -196,6 +218,12 @@ export function useVolumeViewer(caseId: string | null) {
             return;
         }
 
+        if (loadedCaseRef.current && loadedCaseRef.current !== caseId) {
+            setVolume(null);
+            setMask(null);
+            imageDataCache.current.clear();
+        }
+
         // Check global cache first
         const cachedVolume = globalVolumeCache.get(caseId);
         if (cachedVolume) {
@@ -206,6 +234,8 @@ export function useVolumeViewer(caseId: string | null) {
             const cachedMask = globalMaskCache.get(caseId);
             if (cachedMask) {
                 setMask(cachedMask);
+            } else {
+                setMask(null);
             }
 
             loadedCaseRef.current = caseId;
@@ -227,7 +257,11 @@ export function useVolumeViewer(caseId: string | null) {
                 setCrosshair(getCenteredCrosshair(vol.shape));
             }
             const msk = globalMaskCache.get(caseId);
-            if (msk) setMask(msk);
+            if (msk) {
+                setMask(msk);
+            } else {
+                setMask(null);
+            }
 
             loadedCaseRef.current = caseId;
             setLoadProgress(100);
@@ -236,11 +270,11 @@ export function useVolumeViewer(caseId: string | null) {
         }
 
         // Start new loading
-        loadingRef.current = true;
         lastProgressRef.current = 0;
         setLoading(true);
         setLoadProgress(0);
         setError(null);
+        setMask(null);
         imageDataCache.current.clear();
 
         // Create and store promise
@@ -277,45 +311,7 @@ export function useVolumeViewer(caseId: string | null) {
                 evictOldestCache();
                 globalVolumeCache.set(caseId, volumeData);
                 setVolume(volumeData);
-
                 setCrosshair(getCenteredCrosshair(volumeResult.shape));
-
-                // Try to load mask
-                try {
-                    lastProgressRef.current = previewVolumeResult ? 55 : 80;
-                    setLoadProgress(previewVolumeResult ? 60 : 85);
-                    const previewMaskResult = await maskApi.getPreviewMaskVolumeBinary(caseId, (loaded, total) => {
-                        const progressBase = previewVolumeResult ? 60 : 85;
-                        const progressSpan = previewVolumeResult ? 40 : 15;
-                        const progress = progressBase + Math.round((loaded / total) * progressSpan);
-                        if (progress - lastProgressRef.current >= 5) {
-                            lastProgressRef.current = progress;
-                            setLoadProgress(progress);
-                        }
-                    });
-                    const maskResult = previewMaskResult ?? await maskApi.getMaskVolumeBinary(caseId, (loaded, total) => {
-                        const progressBase = previewVolumeResult ? 60 : 85;
-                        const progressSpan = previewVolumeResult ? 40 : 15;
-                        const progress = progressBase + Math.round((loaded / total) * progressSpan);
-                        if (progress - lastProgressRef.current >= 5) {
-                            lastProgressRef.current = progress;
-                            setLoadProgress(progress);
-                        }
-                    });
-
-                    if (maskResult) {
-                        const maskData: MaskData = {
-                            data: maskResult.data,
-                            shape: maskResult.shape,
-                            resolution: previewMaskResult ? 'preview' : 'full',
-                        };
-                        globalMaskCache.set(caseId, maskData);
-                        setMask(maskData);
-                        console.log('[VolumeViewer] Mask loaded, resolution:', maskData.resolution);
-                    }
-                } catch {
-                    console.log('[VolumeViewer] No mask available');
-                }
 
                 setLoadProgress(100);
                 loadedCaseRef.current = caseId;
@@ -323,7 +319,6 @@ export function useVolumeViewer(caseId: string | null) {
                 console.error('[VolumeViewer] Failed to load volume:', e);
                 setError(e instanceof Error ? e.message : 'Failed to load volume');
             } finally {
-                loadingRef.current = false;
                 setLoading(false);
                 globalLoadingPromises.delete(caseId);
             }
