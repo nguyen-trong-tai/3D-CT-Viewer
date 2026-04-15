@@ -2,6 +2,11 @@
 Segmentation Module
 
 Implements deterministic rule-based lung segmentation utilities for CT volumes.
+
+Implements Nodule segmentation (processing)
+    output: binary mask of each nodule
+            contour 2D for each slice
+            3D connected component
 """
 
 from __future__ import annotations

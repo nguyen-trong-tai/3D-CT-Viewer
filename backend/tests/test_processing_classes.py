@@ -78,27 +78,29 @@ class ProcessingClassTests(unittest.TestCase):
         right = np.zeros_like(combined)
         right[1:4, 1:7, 1:7] = 1
 
-        normalized_mask, components = PipelineService._normalize_segmentation_result(
+        normalized_mask, components, manifest = PipelineService._normalize_segmentation_result(
             {
-                "lung_mask": combined,
+                "labeled_mask": combined,
+                "manifest": {
+                    "version": 1,
+                    "has_labeled_mask": True,
+                    "labels": [],
+                },
                 "components": {
-                    "lung": {
-                        "name": "Lungs",
-                        "mask": combined,
-                        "color": "#ef4444",
-                        "render_2d": True,
-                        "render_3d": False,
-                    },
                     "left_lung": {
                         "name": "Left Lung",
                         "mask": left,
                         "color": "#60a5fa",
+                        "label_id": 1,
+                        "render_2d": True,
                         "render_3d": True,
                     },
                     "right_lung": {
                         "name": "Right Lung",
                         "mask": right,
                         "color": "#34d399",
+                        "label_id": 2,
+                        "render_2d": True,
                         "render_3d": True,
                     },
                 },
@@ -107,6 +109,7 @@ class ProcessingClassTests(unittest.TestCase):
 
         np.testing.assert_array_equal(normalized_mask, combined)
         self.assertEqual([component.key for component in components], ["left_lung", "right_lung"])
+        self.assertTrue(manifest["has_labeled_mask"])
 
     def test_stage_load_volume_prefers_memory_mapped_volume(self):
         repo = mock.Mock()

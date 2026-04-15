@@ -44,7 +44,7 @@ from .sdf import (
     get_optimal_downsample_factor,
     normalize_sdf,
 )
-from .segmentation import LungSegmenter
+from .Segmentation import LungSegmenter
 
 __all__ = [
     "MedicalVolumeLoader",

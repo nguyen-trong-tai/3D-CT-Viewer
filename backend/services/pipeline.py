@@ -19,11 +19,11 @@ import numpy as np
 from storage.repository import CaseRepository
 from models.enums import CaseStatus
 from processing import (
-    LungSegmenter,
     HUPreprocessor,
     MeshProcessor,
     SDFProcessor,
 )
+from services.ai_segmentation import AISegmentationService
 
 
 class PipelineStageStatus(str, Enum):
@@ -62,6 +62,8 @@ class SegmentationComponent:
     display_name: str
     mask: np.ndarray
     color_hex: str
+    label_id: int = 0
+    visible_by_default: bool = True
     render_2d: bool = False
     render_3d: bool = True
 
@@ -81,11 +83,7 @@ class PipelineService:
     def __init__(self, repository: CaseRepository):
         self.repo = repository
         self._active_pipelines: Dict[str, bool] = {}
-        self.segmenter = LungSegmenter(
-            hu_threshold=    -400,
-            min_lung_volume= 50_000,
-            fill_holes=      True,
-        )
+        self.ai_segmenter = AISegmentationService()
     def process_case(
         self,
         case_id: str,
@@ -318,24 +316,23 @@ class PipelineService:
             # Perform deterministic baseline segmentation only.
             print(f"[Pipeline Stage 2] Running baseline segmentation (Threshold: {threshold} HU)...")
             volume = self._prepare_volume_for_segmentation(volume, metadata)
-            segmenter = LungSegmenter(
-                hu_threshold=threshold,
-                min_lung_volume=self.segmenter.min_lung_volume,
-                fill_holes=self.segmenter.fill_holes,
-                body_threshold=self.segmenter.body_threshold,
-                min_component_slices=self.segmenter.min_component_slices,
-            )
-            segmentation_result = segmenter.segment(volume)
-            mask, mesh_components = self._normalize_segmentation_result(segmentation_result)
+            spacing = tuple(float(value) for value in (metadata or {}).get("spacing", (1.0, 1.0, 1.0)))
+            segmentation_result = self.ai_segmenter.segment(volume, spacing)
+            mask, mesh_components, manifest = self._normalize_segmentation_result(segmentation_result)
             
             # Khởi tạo mesh placeholder nếu không có voxel nào (tránh crash pipeline)
             if np.sum(mask > 0) == 0:
                 print(f"[Pipeline Stage 2] Trả về mảng rỗng do không tìm thấy structure.")
             
             # Store result
-            self.repo.save_mask(case_id, mask)
+            self.repo.save_mask(case_id, mask, manifest=manifest)
             
-            voxel_count = int(mask.sum())
+            voxel_count = int(np.count_nonzero(mask))
+            component_message = ", ".join(
+                f"{item['display_name']}={int(item['voxel_count']):,}"
+                for item in manifest.get("labels", [])
+                if int(item.get("voxel_count", 0)) > 0
+            ) or "no visible components"
 
             return (
                 PipelineStageResult(
@@ -344,8 +341,9 @@ class PipelineService:
                     duration_seconds=time.time() - start,
                     output_shape=mask.shape,
                     message=(
-                        f"Segmented {voxel_count:,} voxels; "
-                        f"{len(mesh_components)} 3D components"
+                        f"Labeled {voxel_count:,} voxels; "
+                        f"{len(mesh_components)} 3D components; "
+                        f"{component_message}"
                     )
                 ),
                 mask,
@@ -531,7 +529,7 @@ class PipelineService:
     @staticmethod
     def _normalize_segmentation_result(
         segmentation_result: Dict[str, Any]
-    ) -> tuple[np.ndarray, list[SegmentationComponent]]:
+    ) -> tuple[np.ndarray, list[SegmentationComponent], dict[str, Any]]:
         """
         Normalize segmentation outputs into a combined overlay mask and 3D components.
 
@@ -541,6 +539,7 @@ class PipelineService:
         """
         raw_components = segmentation_result.get("components")
         components: list[SegmentationComponent] = []
+        manifest = dict(segmentation_result.get("manifest") or {})
 
         if isinstance(raw_components, dict) and raw_components:
             for key, payload in raw_components.items():
@@ -548,12 +547,16 @@ class PipelineService:
                     mask = payload.get("mask")
                     display_name = str(payload.get("name") or key.replace("_", " ").title())
                     color_hex = str(payload.get("color") or PipelineService._default_component_color(key))
+                    label_id = int(payload.get("label_id") or PipelineService._default_component_label(key))
+                    visible_by_default = bool(payload.get("visible_by_default", True))
                     render_2d = bool(payload.get("render_2d", False))
                     render_3d = bool(payload.get("render_3d", True))
                 else:
                     mask = payload
                     display_name = key.replace("_", " ").title()
                     color_hex = PipelineService._default_component_color(key)
+                    label_id = PipelineService._default_component_label(key)
+                    visible_by_default = True
                     render_2d = False
                     render_3d = True
 
@@ -566,6 +569,8 @@ class PipelineService:
                         display_name=display_name,
                         mask=np.asarray(mask, dtype=np.uint8),
                         color_hex=color_hex,
+                        label_id=label_id,
+                        visible_by_default=visible_by_default,
                         render_2d=render_2d,
                         render_3d=render_3d,
                     )
@@ -586,16 +591,18 @@ class PipelineService:
                         display_name=display_name,
                         mask=np.asarray(mask, dtype=np.uint8),
                         color_hex=PipelineService._default_component_color(key),
+                        label_id=PipelineService._default_component_label(key),
+                        visible_by_default=True,
                         render_2d=render_2d,
                         render_3d=render_3d,
                     )
                 )
 
-        combined_mask = segmentation_result.get("lung_mask")
+        combined_mask = segmentation_result.get("labeled_mask")
         if combined_mask is None:
-            overlay_sources = [component.mask for component in components if component.render_2d]
-            if not overlay_sources:
-                overlay_sources = [component.mask for component in components]
+            combined_mask = segmentation_result.get("lung_mask")
+        if combined_mask is None:
+            overlay_sources = [component.mask for component in components]
             if not overlay_sources:
                 raise ValueError("Segmentation result did not contain any masks")
             combined_mask = np.logical_or.reduce([mask.astype(bool) for mask in overlay_sources]).astype(np.uint8)
@@ -615,12 +622,35 @@ class PipelineService:
                     display_name="Lungs",
                     mask=combined_mask,
                     color_hex=PipelineService._default_component_color("lung"),
+                    label_id=PipelineService._default_component_label("lung"),
+                    visible_by_default=True,
                     render_2d=True,
                     render_3d=True,
                 )
             ]
 
-        return combined_mask, renderable_components
+        if not manifest:
+            manifest = {
+                "version": 1,
+                "has_labeled_mask": bool(np.max(combined_mask) > 1),
+                "labels": [
+                    {
+                        "label_id": component.label_id,
+                        "key": component.key,
+                        "display_name": component.display_name,
+                        "color": component.color_hex,
+                        "available": bool(np.any(component.mask)),
+                        "visible_by_default": component.visible_by_default,
+                        "render_2d": component.render_2d,
+                        "render_3d": component.render_3d,
+                        "voxel_count": int(np.count_nonzero(component.mask)),
+                        "mesh_component_name": component.key,
+                    }
+                    for component in components
+                ],
+            }
+
+        return combined_mask, renderable_components, manifest
 
     @staticmethod
     def _compute_mask_sdf(mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -642,8 +672,19 @@ class PipelineService:
             "lung": "#ef4444",
             "left_lung": "#60a5fa",
             "right_lung": "#34d399",
+            "nodule": "#f97316",
         }
         return palette.get(component_key, "#f59e0b")
+
+    @staticmethod
+    def _default_component_label(component_key: str) -> int:
+        label_map = {
+            "left_lung": 1,
+            "right_lung": 2,
+            "nodule": 3,
+            "lung": 1,
+        }
+        return label_map.get(component_key, 0)
 
     @staticmethod
     def _prepare_volume_for_segmentation(
