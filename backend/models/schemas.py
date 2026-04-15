@@ -55,6 +55,14 @@ class StatusResponse(BaseModel):
     """Response for case status queries."""
     case_id: str
     status: str
+    viewer_ready: bool = Field(
+        default=False,
+        description="Whether the case has enough volume artifacts for the 2D viewer to open",
+    )
+    volume_ready: bool = Field(
+        default=False,
+        description="Whether the full-resolution CT volume artifact is available",
+    )
     message: Optional[str] = Field(None, description="Additional status information")
     expires_at: Optional[str] = Field(None, description="UTC timestamp when the case will be auto-deleted")
     current_stage: Optional[str] = Field(None, description="Current backend stage name when available")
@@ -65,6 +73,8 @@ class StatusResponse(BaseModel):
             "example": {
                 "case_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "status": "ready",
+                "viewer_ready": True,
+                "volume_ready": True,
                 "message": "All processing complete",
                 "expires_at": "2026-03-25T12:00:00",
                 "current_stage": "mesh",
@@ -85,6 +95,14 @@ class CaseEventStageSnapshot(BaseModel):
 class CaseEventSnapshot(BaseModel):
     """Compact pipeline snapshot embedded inside case SSE events."""
     overall_status: str
+    viewer_ready: bool = Field(
+        default=False,
+        description="Whether the case can already be opened in the 2D viewer",
+    )
+    volume_ready: bool = Field(
+        default=False,
+        description="Whether the full-resolution CT volume is available",
+    )
     stages: List[CaseEventStageSnapshot] = Field(default_factory=list)
     artifacts: Dict[str, bool] = Field(default_factory=dict)
 
@@ -94,6 +112,8 @@ class CaseEventPayload(BaseModel):
     type: str = Field(..., description="Event category")
     case_id: str = Field(..., description="Case identifier")
     status: Optional[str] = Field(None, description="Overall case status when applicable")
+    viewer_ready: Optional[bool] = Field(None, description="Whether the viewer can open immediately")
+    volume_ready: Optional[bool] = Field(None, description="Whether the full-resolution volume is ready")
     stage: Optional[str] = Field(None, description="Pipeline stage name for pipeline events")
     artifact: Optional[str] = Field(None, description="Artifact name for artifact readiness events")
     message: Optional[str] = Field(None, description="Human-readable event message")
@@ -395,6 +415,10 @@ class BatchInitResponse(CaseResponse):
     direct_upload_enabled: bool = Field(
         default=False,
         description="Whether the client should upload files directly to object storage",
+    )
+    preferred_upload_layout: str = Field(
+        default="archive_shards",
+        description="Recommended client-side packaging strategy for large folder uploads",
     )
     upload_url_ttl_seconds: Optional[int] = Field(
         default=None,

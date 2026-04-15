@@ -114,6 +114,8 @@ def _build_pipeline_snapshot(snapshot: dict) -> dict:
 
     return {
         "overall_status": status_payload.get("status"),
+        "viewer_ready": bool(status_payload.get("viewer_ready")),
+        "volume_ready": bool(status_payload.get("volume_ready")),
         "artifacts": snapshot.get("artifacts", {}),
         "stages": stages,
     }
@@ -131,6 +133,8 @@ def _build_case_events(snapshot: dict, previous_snapshot: Optional[dict]) -> lis
                 "type": _status_event_type(current_status.get("status")),
                 "case_id": snapshot["case_id"],
                 "status": current_status.get("status"),
+                "viewer_ready": current_status.get("viewer_ready"),
+                "volume_ready": current_status.get("volume_ready"),
                 "message": current_status.get("message"),
                 "current_stage": current_status.get("current_stage"),
                 "progress_percent": current_status.get("progress_percent"),
@@ -147,6 +151,8 @@ def _build_case_events(snapshot: dict, previous_snapshot: Optional[dict]) -> lis
                     "type": "pipeline_stage",
                     "case_id": snapshot["case_id"],
                     "status": stage_payload.get("status"),
+                    "viewer_ready": current_status.get("viewer_ready"),
+                    "volume_ready": current_status.get("volume_ready"),
                     "stage": stage_name,
                     "message": stage_payload.get("message"),
                     "duration_seconds": stage_payload.get("duration_seconds"),
@@ -162,6 +168,8 @@ def _build_case_events(snapshot: dict, previous_snapshot: Optional[dict]) -> lis
                 {
                     "type": "artifact_ready",
                     "case_id": snapshot["case_id"],
+                    "viewer_ready": current_status.get("viewer_ready"),
+                    "volume_ready": current_status.get("volume_ready"),
                     "artifact": artifact_name,
                     "snapshot": pipeline_snapshot,
                     "timestamp": _utc_now_iso(),

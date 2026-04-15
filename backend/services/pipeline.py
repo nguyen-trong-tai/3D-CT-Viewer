@@ -759,6 +759,8 @@ class PipelineService:
         """
         status = self.repo.get_status(case_id)
         artifacts = self.repo.get_available_artifacts(case_id)
+        volume_ready = bool(artifacts.get("ct_volume"))
+        viewer_ready = volume_ready or bool(artifacts.get("ct_volume_preview"))
         pipeline_state = self.repo.get_pipeline_state(case_id)
 
         stages = []
@@ -790,6 +792,8 @@ class PipelineService:
         return {
             "case_id": case_id,
             "overall_status": status,
+            "viewer_ready": viewer_ready,
+            "volume_ready": volume_ready,
             "is_running": self.is_pipeline_running(case_id),
             "stages": stages,
             "artifacts": artifacts

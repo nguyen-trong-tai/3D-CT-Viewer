@@ -18,6 +18,25 @@ from services.pipeline import PipelineService, PipelineStageStatus
 
 
 class ProcessingClassTests(unittest.TestCase):
+    @staticmethod
+    def _make_dicom_like_dataset(
+        series_uid: str,
+        z_position: float,
+        *,
+        with_pixel_data: bool = False,
+        slice_thickness: float = 1.25,
+    ) -> pydicom.Dataset:
+        ds = pydicom.Dataset()
+        ds.Rows = 2
+        ds.Columns = 2
+        ds.SeriesInstanceUID = series_uid
+        ds.ImagePositionPatient = [0.0, 0.0, float(z_position)]
+        ds.PixelSpacing = [1.0, 1.0]
+        ds.SliceThickness = slice_thickness
+        if with_pixel_data:
+            ds.PixelData = b"\x00\x00\x00\x00"
+        return ds
+
     def test_loader_metadata_extraction_works_from_class_api(self):
         ds = pydicom.Dataset()
         ds.PatientID = "patient-1"
@@ -29,6 +48,109 @@ class ProcessingClassTests(unittest.TestCase):
         self.assertEqual(meta["patient_id"], "patient-1")
         self.assertEqual(meta["modality"], "CT")
         self.assertEqual(meta["slice_thickness"], 1.25)
+
+    def test_load_selected_dicom_datasets_reads_full_data_only_for_primary_series(self):
+        header_entries = [
+            {"source": "series-b-1.dcm", "header": self._make_dicom_like_dataset("series-b", 1.0)},
+            {"source": "series-a-2.dcm", "header": self._make_dicom_like_dataset("series-a", 2.0)},
+            {"source": "series-a-0.dcm", "header": self._make_dicom_like_dataset("series-a", 0.0)},
+            {"source": "series-b-0.dcm", "header": self._make_dicom_like_dataset("series-b", 0.0)},
+            {"source": "series-a-1.dcm", "header": self._make_dicom_like_dataset("series-a", 1.0)},
+        ]
+        datasets_by_path = {
+            "series-a-0.dcm": self._make_dicom_like_dataset("series-a", 0.0, with_pixel_data=True),
+            "series-a-1.dcm": self._make_dicom_like_dataset("series-a", 1.0, with_pixel_data=True),
+            "series-a-2.dcm": self._make_dicom_like_dataset("series-a", 2.0, with_pixel_data=True),
+            "series-b-0.dcm": self._make_dicom_like_dataset("series-b", 0.0, with_pixel_data=True),
+            "series-b-1.dcm": self._make_dicom_like_dataset("series-b", 1.0, with_pixel_data=True),
+        }
+
+        with mock.patch.object(
+            MedicalVolumeLoader,
+            "_load_candidate_dicom_file_headers",
+            return_value=header_entries,
+        ):
+            with mock.patch.object(
+                MedicalVolumeLoader,
+                "_load_candidate_dicom_datasets",
+                side_effect=AssertionError("legacy fallback should not be used"),
+            ):
+                with mock.patch(
+                    "processing.loader.pydicom.dcmread",
+                    side_effect=lambda path: datasets_by_path[path],
+                ) as dcmread_mock:
+                    selected_datasets, spacing, representative_header = MedicalVolumeLoader.load_selected_dicom_datasets(
+                        list(datasets_by_path.keys())
+                    )
+
+        self.assertEqual(
+            [float(ds.ImagePositionPatient[2]) for ds in selected_datasets],
+            [0.0, 1.0, 2.0],
+        )
+        self.assertEqual(spacing, (1.0, 1.0, 1.25))
+        self.assertEqual(str(representative_header.SeriesInstanceUID), "series-a")
+        self.assertEqual(
+            {call.args[0] for call in dcmread_mock.call_args_list},
+            {"series-a-0.dcm", "series-a-1.dcm", "series-a-2.dcm"},
+        )
+
+    def test_load_selected_dicom_datasets_falls_back_to_legacy_scan_when_selected_headers_are_not_decodable(self):
+        header_entries = [
+            {"source": "series-a-2.dcm", "header": self._make_dicom_like_dataset("series-a", 2.0)},
+            {"source": "series-b-1.dcm", "header": self._make_dicom_like_dataset("series-b", 1.0)},
+            {"source": "series-a-0.dcm", "header": self._make_dicom_like_dataset("series-a", 0.0)},
+            {"source": "series-b-0.dcm", "header": self._make_dicom_like_dataset("series-b", 0.0)},
+            {"source": "series-a-1.dcm", "header": self._make_dicom_like_dataset("series-a", 1.0)},
+        ]
+        full_datasets = {
+            "series-a-0.dcm": self._make_dicom_like_dataset("series-a", 0.0, with_pixel_data=True),
+            "series-a-1.dcm": self._make_dicom_like_dataset("series-a", 1.0, with_pixel_data=False),
+            "series-a-2.dcm": self._make_dicom_like_dataset("series-a", 2.0, with_pixel_data=False),
+        }
+        fallback_entries = [
+            {
+                "source": "series-b-1.dcm",
+                "header": self._make_dicom_like_dataset("series-b", 1.0, with_pixel_data=True),
+                "dataset": self._make_dicom_like_dataset("series-b", 1.0, with_pixel_data=True),
+            },
+            {
+                "source": "series-a-0.dcm",
+                "header": self._make_dicom_like_dataset("series-a", 0.0, with_pixel_data=True),
+                "dataset": self._make_dicom_like_dataset("series-a", 0.0, with_pixel_data=True),
+            },
+            {
+                "source": "series-b-0.dcm",
+                "header": self._make_dicom_like_dataset("series-b", 0.0, with_pixel_data=True),
+                "dataset": self._make_dicom_like_dataset("series-b", 0.0, with_pixel_data=True),
+            },
+        ]
+
+        with mock.patch.object(
+            MedicalVolumeLoader,
+            "_load_candidate_dicom_file_headers",
+            return_value=header_entries,
+        ):
+            with mock.patch.object(
+                MedicalVolumeLoader,
+                "_load_candidate_dicom_datasets",
+                return_value=fallback_entries,
+            ) as fallback_mock:
+                with mock.patch(
+                    "processing.loader.pydicom.dcmread",
+                    side_effect=lambda path: full_datasets[path],
+                ):
+                    selected_datasets, spacing, representative_header = MedicalVolumeLoader.load_selected_dicom_datasets(
+                        list(full_datasets.keys())
+                    )
+
+        fallback_mock.assert_called_once()
+        self.assertEqual(
+            [float(ds.ImagePositionPatient[2]) for ds in selected_datasets],
+            [0.0, 1.0],
+        )
+        self.assertTrue(all(str(ds.SeriesInstanceUID) == "series-b" for ds in selected_datasets))
+        self.assertEqual(spacing, (1.0, 1.0, 1.25))
+        self.assertEqual(str(representative_header.SeriesInstanceUID), "series-b")
 
     def test_sdf_class_api_matches_wrapper(self):
         mask = np.zeros((8, 8, 8), dtype=np.uint8)

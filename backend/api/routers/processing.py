@@ -69,6 +69,12 @@ async def trigger_processing(
             estimated_time_seconds=15.0
         )
 
+    if state == "volume_not_ready":
+        raise HTTPException(
+            status_code=409,
+            detail="CT volume is not ready yet. Wait for volume_ready before starting processing.",
+        )
+
     if not spawn_process_case(case_id):
         # Run CPU-heavy pipeline in a thread to keep async event loop free
         asyncio.get_event_loop().run_in_executor(None, pipeline.process_case, case_id)

@@ -95,6 +95,15 @@ class R2ObjectStore(ObjectStore):
         response = self.client.get_object(Bucket=self.bucket, Key=object_key)
         return response["Body"].read()
 
+    def download_byte_range(self, object_key: str, start: int = 0, end: int | None = None) -> bytes:
+        range_header = f"bytes={max(0, start)}-" if end is None else f"bytes={max(0, start)}-{max(start, end)}"
+        response = self.client.get_object(
+            Bucket=self.bucket,
+            Key=object_key,
+            Range=range_header,
+        )
+        return response["Body"].read()
+
     def download_file(self, object_key: str, local_path: Path) -> Path:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         self.client.download_file(

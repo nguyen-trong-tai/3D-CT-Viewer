@@ -14,6 +14,7 @@ import tempfile
 import time
 import traceback
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +36,11 @@ from workers.runtime import (
 )
 
 UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
+OBJECT_STORE_HEADER_PROBE_BYTES = (
+    128 * 1024,
+    512 * 1024,
+    2 * 1024 * 1024,
+)
 
 
 @dataclass(frozen=True)
@@ -193,6 +199,20 @@ class UploadArtifactManager:
         self._require_object_store().download_file(object_key, destination)
         return str(destination)
 
+    def download_object_bytes(self, object_key: str) -> bytes:
+        """Download a full object into memory."""
+        return self._require_object_store().download_bytes(object_key)
+
+    def download_object_byte_range(
+        self,
+        object_key: str,
+        *,
+        start: int = 0,
+        end: int | None = None,
+    ) -> bytes:
+        """Download a byte range from an object."""
+        return self._require_object_store().download_byte_range(object_key, start=start, end=end)
+
     def delete_object_quietly(self, object_key: str) -> None:
         """Best-effort object cleanup for background workers."""
         if self.object_store is None:
@@ -337,6 +357,281 @@ class UploadBackgroundProcessor:
         finally:
             self.artifacts.delete_object_quietly(object_key)
 
+    def _prepare_uploaded_dicom_directory(self, case_id: str, temp_dir: str) -> List[str]:
+        expanded_archives = self._expand_uploaded_archives(case_id, temp_dir)
+        header_progress = 24.0 if expanded_archives else 20.0
+        self._update_upload_status(
+            case_id,
+            "Reading DICOM headers...",
+            current_stage="reading_dicom_headers",
+            progress_percent=header_progress,
+        )
+
+        dicom_files = self._collect_dicom_files(temp_dir)
+        if not dicom_files:
+            raise ValueError("No uploaded files found in batch directory")
+        return dicom_files
+
+    def _expand_uploaded_archives(self, case_id: str, temp_dir: str) -> int:
+        archive_paths = self._collect_archive_files(temp_dir)
+        if not archive_paths:
+            return 0
+
+        total_archives = len(archive_paths)
+        for index, archive_path in enumerate(archive_paths, start=1):
+            progress = 14.0 + (index - 1) / max(total_archives, 1) * 8.0
+            self._update_upload_status(
+                case_id,
+                f"Expanding upload archive shard {index}/{total_archives}...",
+                current_stage="expanding_archives",
+                progress_percent=progress,
+            )
+            extraction_root = Path(temp_dir) / f"_archive_{index:04d}"
+            self._extract_archive_to_directory(archive_path, extraction_root)
+
+        self._update_upload_status(
+            case_id,
+            f"Expanded {total_archives} upload archive shard(s).",
+            current_stage="expanding_archives",
+            progress_percent=22.0,
+        )
+        return total_archives
+
+    @staticmethod
+    def _extract_archive_to_directory(archive_path: str, extraction_root: Path) -> None:
+        extraction_root.mkdir(parents=True, exist_ok=True)
+        resolved_root = extraction_root.resolve()
+
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+
+                normalized_parts = [
+                    part
+                    for part in Path(member.filename).parts
+                    if part not in {"", ".", ".."}
+                ]
+                if not normalized_parts:
+                    continue
+
+                target_path = (resolved_root / Path(*normalized_parts)).resolve()
+                if target_path != resolved_root and resolved_root not in target_path.parents:
+                    raise ValueError(f"Unsafe archive entry detected in {archive_path}: {member.filename}")
+
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source, target_path.open("wb") as destination:
+                    shutil.copyfileobj(source, destination, length=UPLOAD_COPY_BUFFER_SIZE)
+
+    @staticmethod
+    def _collect_archive_files(temp_dir: str) -> List[str]:
+        archive_files: List[str] = []
+        for root, _, files in os.walk(temp_dir):
+            for file_name in files:
+                if file_name.lower().endswith(".zip"):
+                    archive_files.append(os.path.join(root, file_name))
+        return archive_files
+
+    @staticmethod
+    def _supports_header_first_object_ingest(object_keys: List[str]) -> bool:
+        if not object_keys:
+            return False
+        return not any(Path(object_key).suffix.lower() == ".zip" for object_key in object_keys)
+
+    def _try_load_dicom_volume_from_object_keys_header_first(
+        self,
+        case_id: str,
+        object_keys: List[str],
+        extra_metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Any, Any, Dict[str, Any]] | None:
+        if not self._supports_header_first_object_ingest(object_keys):
+            return None
+
+        header_started_at = time.perf_counter()
+        self._update_upload_status(
+            case_id,
+            "Inspecting DICOM headers in object storage...",
+            current_stage="reading_dicom_headers",
+            progress_percent=16.0,
+        )
+        headers = self._inspect_dicom_object_headers_from_object_store(case_id, object_keys)
+        if not headers:
+            return None
+
+        selected_headers = MedicalVolumeLoader._select_primary_series_headers(headers)
+        if not selected_headers:
+            return None
+
+        spacing = MedicalVolumeLoader._extract_spacing(selected_headers[0]["header"])
+        selected_object_keys = [str(entry["source"]) for entry in selected_headers]
+        print(
+            f"[UploadBackgroundProcessor] Selected {len(selected_object_keys)}/{len(object_keys)} object-backed DICOM slices "
+            f"for primary series for {case_id} in {time.perf_counter() - header_started_at:.2f}s"
+        )
+
+        download_started_at = time.perf_counter()
+        self._update_upload_status(
+            case_id,
+            "Downloading primary DICOM series from object storage...",
+            current_stage="receiving_upload",
+            progress_percent=32.0,
+        )
+        selected_datasets = self._download_selected_datasets_from_object_store(case_id, selected_object_keys)
+        if len(selected_datasets) != len(selected_object_keys):
+            return None
+
+        print(
+            f"[UploadBackgroundProcessor] Downloaded and parsed {len(selected_datasets)} selected DICOM objects for {case_id} "
+            f"in {time.perf_counter() - download_started_at:.2f}s"
+        )
+
+        parse_started_at = time.perf_counter()
+        self._update_upload_status(
+            case_id,
+            "Decoding DICOM slices...",
+            current_stage="decoding_dicom_slices",
+            progress_percent=55.0,
+        )
+        volume, spacing = MedicalVolumeLoader.build_volume_from_datasets(selected_datasets, spacing)
+        print(
+            f"[UploadBackgroundProcessor] Decoded primary object-backed DICOM series for {case_id} "
+            f"in {time.perf_counter() - parse_started_at:.2f}s"
+        )
+
+        metadata_payload = dict(extra_metadata or {})
+        try:
+            dicom_meta = MedicalVolumeLoader.extract_dicom_metadata(selected_datasets[0])
+            if dicom_meta:
+                metadata_payload["dicom"] = dicom_meta
+        except Exception as meta_exc:
+            print(f"[Metadata Extraction Error]: {meta_exc}")
+
+        return volume, spacing, metadata_payload
+
+    def _inspect_dicom_object_headers_from_object_store(
+        self,
+        case_id: str,
+        object_keys: List[str],
+    ) -> List[Dict[str, Any]]:
+        if not object_keys:
+            return []
+
+        max_workers = max(
+            1,
+            min(
+                len(object_keys),
+                settings.OBJECT_STORE_DOWNLOAD_CONCURRENCY,
+            ),
+        )
+        headers: list[Dict[str, Any] | None] = [None] * len(object_keys)
+        completed = 0
+
+        def inspect_one(index_and_key: tuple[int, str]) -> tuple[int, Dict[str, Any] | None]:
+            index, object_key = index_and_key
+            return index, self._probe_object_header(object_key)
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(inspect_one, (index, object_key))
+                    for index, object_key in enumerate(object_keys)
+                ]
+                for future in as_completed(futures):
+                    index, payload = future.result()
+                    headers[index] = payload
+                    completed += 1
+
+                    if completed == 1 or completed == len(object_keys) or completed % 16 == 0:
+                        progress = 16.0 + (completed / max(len(object_keys), 1)) * 12.0
+                        self._update_upload_status(
+                            case_id,
+                            f"Inspected {completed}/{len(object_keys)} object-backed DICOM headers...",
+                            current_stage="reading_dicom_headers",
+                            progress_percent=progress,
+                        )
+        except Exception:
+            traceback.print_exc()
+            return []
+
+        return [entry for entry in headers if entry is not None]
+
+    def _probe_object_header(self, object_key: str) -> Dict[str, Any] | None:
+        last_error: Exception | None = None
+        for probe_size in OBJECT_STORE_HEADER_PROBE_BYTES:
+            try:
+                content = self.artifacts.download_object_byte_range(
+                    object_key,
+                    start=0,
+                    end=probe_size - 1,
+                )
+                header = MedicalVolumeLoader.parse_dicom_bytes(content, stop_before_pixels=True)
+                if MedicalVolumeLoader._looks_like_image_slice(header):
+                    return {
+                        "source": object_key,
+                        "header": header,
+                    }
+                return None
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        return None
+
+    def _download_selected_datasets_from_object_store(
+        self,
+        case_id: str,
+        object_keys: List[str],
+    ) -> List[Any]:
+        if not object_keys:
+            return []
+
+        max_workers = max(
+            1,
+            min(
+                len(object_keys),
+                settings.OBJECT_STORE_DOWNLOAD_CONCURRENCY,
+            ),
+        )
+        datasets: list[Any | None] = [None] * len(object_keys)
+        completed = 0
+
+        def download_one(index_and_key: tuple[int, str]) -> tuple[int, Any | None]:
+            index, object_key = index_and_key
+            payload = self.artifacts.download_object_bytes(object_key)
+            dataset = MedicalVolumeLoader.parse_dicom_bytes(payload)
+            if MedicalVolumeLoader._looks_like_image_slice(dataset) and "PixelData" in dataset:
+                return index, dataset
+            return index, None
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(download_one, (index, object_key))
+                    for index, object_key in enumerate(object_keys)
+                ]
+                for future in as_completed(futures):
+                    index, dataset = future.result()
+                    datasets[index] = dataset
+                    completed += 1
+
+                    if completed == 1 or completed == len(object_keys) or completed % 16 == 0:
+                        progress = 32.0 + (completed / max(len(object_keys), 1)) * 18.0
+                        self._update_upload_status(
+                            case_id,
+                            (
+                                f"Downloaded {completed}/{len(object_keys)} selected DICOM objects "
+                                f"from object storage with concurrency={max_workers}..."
+                            ),
+                            current_stage="receiving_upload",
+                            progress_percent=progress,
+                        )
+        except Exception:
+            traceback.print_exc()
+            return []
+
+        return [dataset for dataset in datasets if dataset is not None]
+
     def process_dicom_directory(
         self,
         case_id: str,
@@ -346,16 +641,7 @@ class UploadBackgroundProcessor:
         """Background task to process a directory full of DICOM files."""
         try:
             overall_started_at = time.perf_counter()
-            self._update_upload_status(
-                case_id,
-                "Reading DICOM headers...",
-                current_stage="reading_dicom_headers",
-                progress_percent=20.0,
-            )
-
-            dicom_files = self._collect_dicom_files(temp_dir)
-            if not dicom_files:
-                raise ValueError("No uploaded files found in batch directory")
+            dicom_files = self._prepare_uploaded_dicom_directory(case_id, temp_dir)
 
             volume, spacing, metadata_payload = self._load_dicom_volume_from_paths(
                 case_id,
@@ -394,7 +680,7 @@ class UploadBackgroundProcessor:
     ) -> None:
         """Background task to process DICOM files staged in object storage."""
         overall_started_at = time.perf_counter()
-        temp_dir = self.artifacts.create_temp_dir(f"dicom_obj_{case_id}_")
+        temp_dir: str | None = None
         try:
             self._update_upload_status(
                 case_id,
@@ -402,18 +688,29 @@ class UploadBackgroundProcessor:
                 current_stage="receiving_upload",
                 progress_percent=10.0,
             )
-            download_started_at = time.perf_counter()
-            dicom_files = self._download_objects_to_directory_parallel(case_id, object_keys, temp_dir)
-            print(
-                f"[UploadBackgroundProcessor] Downloaded {len(dicom_files)} DICOM objects for {case_id} "
-                f"in {time.perf_counter() - download_started_at:.2f}s"
-            )
-
-            volume, spacing, metadata_payload = self._load_dicom_volume_from_paths(
+            object_load_result = self._try_load_dicom_volume_from_object_keys_header_first(
                 case_id,
-                dicom_files,
+                object_keys,
                 extra_metadata,
             )
+
+            if object_load_result is None:
+                temp_dir = self.artifacts.create_temp_dir(f"dicom_obj_{case_id}_")
+                download_started_at = time.perf_counter()
+                downloaded_paths = self._download_objects_to_directory_parallel(case_id, object_keys, temp_dir)
+                print(
+                    f"[UploadBackgroundProcessor] Downloaded {len(downloaded_paths)} upload object(s) for {case_id} "
+                    f"in {time.perf_counter() - download_started_at:.2f}s"
+                )
+                dicom_files = self._prepare_uploaded_dicom_directory(case_id, temp_dir)
+
+                volume, spacing, metadata_payload = self._load_dicom_volume_from_paths(
+                    case_id,
+                    dicom_files,
+                    extra_metadata,
+                )
+            else:
+                volume, spacing, metadata_payload = object_load_result
             preview_ready = self._publish_preview_first_best_effort(case_id, volume=volume, spacing=spacing)
 
             self._update_upload_status(
@@ -428,14 +725,15 @@ class UploadBackgroundProcessor:
             if not preview_ready:
                 self._generate_preview_best_effort(case_id, volume=volume, spacing=spacing)
             print(
-                f"[UploadBackgroundProcessor] Processed {len(object_keys)} object-backed DICOM files for {case_id} "
+                f"[UploadBackgroundProcessor] Processed {len(object_keys)} object-backed upload object(s) for {case_id} "
                 f"in {time.perf_counter() - overall_started_at:.2f}s"
             )
         except Exception as exc:
             traceback.print_exc()
             self.repo.update_status(case_id, CaseStatus.ERROR.value, str(exc))
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
             for object_key in object_keys:
                 self.artifacts.delete_object_quietly(object_key)
 
@@ -527,7 +825,7 @@ class UploadBackgroundProcessor:
                     self._update_upload_status(
                         case_id,
                         (
-                            f"Downloaded {completed}/{len(object_keys)} DICOM files from object storage "
+                            f"Downloaded {completed}/{len(object_keys)} staged upload object(s) from object storage "
                             f"with concurrency={max_workers}..."
                         ),
                         current_stage="receiving_upload",
@@ -548,6 +846,8 @@ class UploadBackgroundProcessor:
             for file_name in files:
                 lower_name = file_name.lower()
                 if lower_name == "metadata.json":
+                    continue
+                if lower_name.endswith(".zip"):
                     continue
 
                 file_path = os.path.join(root, file_name)
@@ -847,6 +1147,7 @@ class UploadService:
             "status": CaseStatus.UPLOADING.value,
             "storage_kind": session.storage_kind,
             "direct_upload_enabled": session.direct_upload_enabled,
+            "preferred_upload_layout": "raw_files" if session.direct_upload_enabled else "archive_shards",
             "upload_url_ttl_seconds": (
                 settings.UPLOAD_URL_TTL_SECONDS if session.direct_upload_enabled else None
             ),

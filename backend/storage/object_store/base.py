@@ -35,6 +35,10 @@ class ObjectStore(ABC):
     def download_bytes(self, object_key: str) -> bytes:
         """Download object contents as bytes."""
 
+    def download_byte_range(self, object_key: str, start: int = 0, end: int | None = None) -> bytes:
+        """Download a byte range from an object."""
+        raise NotImplementedError("This object store does not support ranged reads")
+
     @abstractmethod
     def download_file(self, object_key: str, local_path: Path) -> Path:
         """Download an object to a local path."""

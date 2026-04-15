@@ -17,14 +17,18 @@ class CaseService:
         self.repo = repo
 
     def get_status(self, case_id: str) -> Dict[str, Any]:
-        self.repo.sync_for_read(scope="state")
+        self.repo.sync_for_read(scope="all")
         status_info = self.repo.get_status_info(case_id) or {}
         status = status_info.get("status")
         if status is None:
             status = self.repo.get_status(case_id)
+        artifacts = self.repo.get_available_artifacts(case_id)
+        readiness = self._derive_readiness(artifacts)
         return {
             "case_id": case_id,
             "status": status,
+            "viewer_ready": readiness["viewer_ready"],
+            "volume_ready": readiness["volume_ready"],
             "message": status_info.get("message"),
             "expires_at": status_info.get("expires_at"),
             "current_stage": status_info.get("current_stage"),
@@ -40,6 +44,7 @@ class CaseService:
         status_info = self.repo.get_status_info(case_id) or {}
         status = status_info.get("status") or self.repo.get_status(case_id)
         artifacts = self.repo.get_available_artifacts(case_id)
+        readiness = self._derive_readiness(artifacts)
         pipeline_state = self.repo.get_pipeline_state(case_id)
 
         if pipeline_state:
@@ -60,6 +65,8 @@ class CaseService:
             "case_id": case_id,
             "status": {
                 "status": status,
+                "viewer_ready": readiness["viewer_ready"],
+                "volume_ready": readiness["volume_ready"],
                 "message": status_info.get("message"),
                 "expires_at": status_info.get("expires_at"),
                 "current_stage": status_info.get("current_stage"),
@@ -84,12 +91,25 @@ class CaseService:
         return self.repo.delete_case(case_id)
 
     def can_start_processing(self, case_id: str) -> str:
+        self.repo.sync_for_read(scope="all")
         status = self.repo.get_status(case_id)
         if status == CaseStatus.ERROR.value and not self.repo.case_exists(case_id):
             return "missing"
         if status == CaseStatus.PROCESSING.value:
             return "processing"
+        artifacts = self.repo.get_available_artifacts(case_id)
+        if not artifacts.get("ct_volume"):
+            return "volume_not_ready"
         return "ok"
+
+    @staticmethod
+    def _derive_readiness(artifacts: Dict[str, Any]) -> Dict[str, bool]:
+        volume_ready = bool(artifacts.get("ct_volume"))
+        viewer_ready = volume_ready or bool(artifacts.get("ct_volume_preview"))
+        return {
+            "viewer_ready": viewer_ready,
+            "volume_ready": volume_ready,
+        }
 
     @staticmethod
     def _infer_stage_state_from_artifacts(status: str, artifacts: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
