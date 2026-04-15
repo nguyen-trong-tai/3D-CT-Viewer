@@ -139,6 +139,9 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
             case 'reading_dicom_headers':
                 setProgressLabel('CT Acquisition: reading DICOM headers...');
                 return;
+            case 'expanding_archives':
+                setProgressLabel('CT Acquisition: expanding uploaded archive shards...');
+                return;
             case 'decoding_dicom_slices':
                 setProgressLabel('CT Acquisition: decoding DICOM slices...');
                 return;
@@ -158,7 +161,8 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
 
     const waitForCaseUploadReady = useCallback(
         async (caseId: string): Promise<StatusResponse> => {
-            const isReady = (status: StatusResponse['status']) => status === 'uploaded' || status === 'ready';
+            const isReady = (status: StatusResponse) =>
+                Boolean(status.viewer_ready) || status.status === 'uploaded' || status.status === 'ready';
             const applyStatus = (status: Pick<StatusResponse, 'progress_percent' | 'current_stage'>) => {
                 updateAcquisitionProgress(status.progress_percent, status.current_stage);
             };
@@ -186,7 +190,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     throw new Error(status.message || 'Error processing raw data into volume.');
                 }
 
-                if (isReady(status.status) || await hasViewerArtifact(forceArtifactProbe)) {
+                if (isReady(status) || await hasViewerArtifact(forceArtifactProbe)) {
                     return status;
                 }
 
@@ -263,6 +267,8 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             current_stage: payload.current_stage,
                         });
                         const viewerReady =
+                            payload.viewer_ready ||
+                            payload.snapshot?.viewer_ready ||
                             payload.artifact === 'ct_volume' ||
                             payload.artifact === 'ct_volume_preview' ||
                             Boolean(payload.snapshot?.artifacts?.ct_volume) ||
@@ -277,6 +283,11 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             settleSuccess({
                                 case_id: caseId,
                                 status: payload.status ?? 'uploading',
+                                viewer_ready: viewerReady,
+                                volume_ready:
+                                    payload.volume_ready ??
+                                    payload.snapshot?.volume_ready ??
+                                    Boolean(payload.snapshot?.artifacts?.ct_volume),
                                 message: payload.message,
                                 current_stage: payload.current_stage,
                                 progress_percent: payload.progress_percent,

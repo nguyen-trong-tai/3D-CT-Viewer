@@ -51,6 +51,8 @@ export interface CaseResponse {
 export interface StatusResponse {
     case_id: string;
     status: 'pending' | 'uploading' | 'uploaded' | 'processing' | 'ready' | 'error';
+    viewer_ready?: boolean;
+    volume_ready?: boolean;
     message?: string;
     expires_at?: string;
     current_stage?: string;
@@ -61,6 +63,8 @@ export interface CaseEventPayload {
     type: 'upload_status' | 'pipeline_stage' | 'artifact_ready' | 'case_ready' | 'case_error';
     case_id: string;
     status?: StatusResponse['status'];
+    viewer_ready?: boolean;
+    volume_ready?: boolean;
     stage?: string;
     artifact?: string;
     message?: string;
@@ -155,6 +159,8 @@ export interface PipelineStageSnapshot {
 
 export interface PipelineSnapshot {
     overall_status: string;
+    viewer_ready?: boolean;
+    volume_ready?: boolean;
     stages: PipelineStageSnapshot[];
     artifacts: Record<string, boolean>;
 }
@@ -173,6 +179,7 @@ interface BatchUploadProgress {
 interface BatchInitResponse extends CaseResponse {
     storage_kind: 'object_store' | 'local_dir';
     direct_upload_enabled?: boolean;
+    preferred_upload_layout?: 'archive_shards' | 'raw_files';
     upload_url_ttl_seconds?: number | null;
     recommended_upload_concurrency?: number | null;
 }
@@ -207,6 +214,11 @@ interface BatchUploadCompleteItem {
 interface UploadChunk {
     files: File[];
     totalBytes: number;
+}
+
+interface UploadChunkOptions {
+    maxFiles?: number;
+    targetBytes?: number;
 }
 
 type BinaryVolumePayload = {
@@ -299,15 +311,20 @@ const ensureSharedCaseEventSource = (caseId: string): SharedCaseEventSource | nu
     return shared;
 };
 
-const createUploadChunks = (files: File[]): UploadChunk[] => {
+const createUploadChunks = (
+    files: File[],
+    options: UploadChunkOptions = {}
+): UploadChunk[] => {
+    const maxFiles = Math.max(1, options.maxFiles ?? DICOM_BATCH_FILE_LIMIT);
+    const targetBytes = Math.max(1, options.targetBytes ?? DICOM_BATCH_TARGET_BYTES);
     const chunks: UploadChunk[] = [];
     let currentFiles: File[] = [];
     let currentBytes = 0;
 
     for (const file of files) {
-        const nextWouldOverflowCount = currentFiles.length >= DICOM_BATCH_FILE_LIMIT;
+        const nextWouldOverflowCount = currentFiles.length >= maxFiles;
         const nextWouldOverflowBytes =
-            currentFiles.length > 0 && currentBytes + file.size > DICOM_BATCH_TARGET_BYTES;
+            currentFiles.length > 0 && currentBytes + file.size > targetBytes;
 
         if (nextWouldOverflowCount || nextWouldOverflowBytes) {
             chunks.push({ files: currentFiles, totalBytes: currentBytes });
@@ -329,6 +346,45 @@ const createUploadChunks = (files: File[]): UploadChunk[] => {
 const shouldBundleDicomFolder = (fileCount: number, totalBytes: number) =>
     fileCount <= BROWSER_DICOM_BUNDLE_FILE_THRESHOLD &&
     totalBytes <= BROWSER_DICOM_BUNDLE_SIZE_THRESHOLD_BYTES;
+
+const createArchiveShard = async (
+    chunk: UploadChunk,
+    shardIndex: number,
+    shardCount: number,
+    onProgress: (percent: number, label: string) => void
+): Promise<File> => {
+    const zip = new JSZip();
+    const rawSizeMB = (chunk.totalBytes / 1024 / 1024).toFixed(1);
+
+    chunk.files.forEach((file, index) => {
+        const entryName = `dicom/${String(index + 1).padStart(4, '0')}_${file.name}`;
+        zip.file(entryName, file);
+    });
+
+    onProgress(
+        0,
+        `Packaging archive shard ${shardIndex + 1}/${shardCount} (${chunk.files.length} files, ${rawSizeMB}MB raw)...`
+    );
+
+    const blob = await zip.generateAsync(
+        {
+            type: 'blob',
+            compression: 'STORE',
+            streamFiles: true,
+            mimeType: 'application/zip',
+        },
+        (zipProgress) => {
+            onProgress(
+                Math.round(Math.max(0, Math.min(100, zipProgress.percent))),
+                `Packaging archive shard ${shardIndex + 1}/${shardCount} (${chunk.files.length} files, ${rawSizeMB}MB raw)...`
+            );
+        }
+    );
+
+    return new File([blob], `dicom-shard-${String(shardIndex + 1).padStart(3, '0')}.zip`, {
+        type: 'application/zip',
+    });
+};
 
 export const isLikelyDicomFile = (file: File): boolean => {
     const lowerName = file.name.toLowerCase();
@@ -722,6 +778,58 @@ const uploadBatchChunkViaApi = async (
     );
 };
 
+const uploadBatchFileDirect = async (
+    caseId: string,
+    file: File,
+    onProgress?: (loaded: number, total: number) => void
+): Promise<void> => {
+    const descriptor: BatchUploadFileDescriptor = {
+        client_id: `archive-${file.name}-${file.size}-${file.lastModified}`,
+        filename: file.name,
+        size_bytes: file.size,
+        content_type: file.type || undefined,
+    };
+
+    const presignResponse = await axios.post<BatchUploadPresignResponse>(
+        `${API_V1}/cases/batch/${caseId}/files/presign`,
+        { files: [descriptor] }
+    );
+    const target = presignResponse.data.targets[0];
+
+    if (!target) {
+        throw new Error(`Missing upload target for ${file.name}`);
+    }
+
+    await uploadFileToPresignedUrl(target.upload_url, file, target.method, onProgress);
+
+    await axios.post<BatchUploadProgress>(
+        `${API_V1}/cases/batch/${caseId}/files/complete`,
+        {
+            uploads: [
+                {
+                    client_id: descriptor.client_id,
+                    filename: descriptor.filename,
+                    object_key: target.object_key,
+                },
+            ],
+        }
+    );
+};
+
+const uploadBatchFileViaApi = async (
+    caseId: string,
+    file: File,
+    onProgress?: (loaded: number, total: number) => void
+): Promise<void> => {
+    const chunkFormData = new FormData();
+    chunkFormData.append('files', file, file.name);
+    await postFormDataWithProgress<BatchUploadProgress>(
+        `${API_V1}/cases/batch/${caseId}/files`,
+        chunkFormData,
+        onProgress
+    );
+};
+
 const createBundledDicomArchive = async (
     files: File[],
     onProgress: (percent: number, label: string) => void,
@@ -792,6 +900,181 @@ const uploadBundledDicomArchive = async (
     });
 };
 
+const uploadDicomFolderInRawChunks = async (
+    initResponse: BatchInitResponse,
+    dcmFiles: File[],
+    totalBytes: number,
+    onProgress: (percent: number, label: string) => void,
+    metadata?: Record<string, unknown>
+): Promise<CaseResponse> => {
+    const chunks = createUploadChunks(dcmFiles);
+    let uploadedBytes = 0;
+    let useDirectUpload =
+        initResponse.storage_kind === 'object_store' &&
+        Boolean(initResponse.direct_upload_enabled);
+    const uploadConcurrency = Math.max(
+        1,
+        initResponse.recommended_upload_concurrency ?? DEFAULT_DIRECT_UPLOAD_CONCURRENCY
+    );
+
+    for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        if (useDirectUpload) {
+            try {
+                await uploadBatchChunkDirect(
+                    initResponse.case_id,
+                    chunk,
+                    index,
+                    chunks.length,
+                    dcmFiles.length,
+                    totalBytes,
+                    uploadedBytes,
+                    onProgress,
+                    uploadConcurrency
+                );
+            } catch (error) {
+                console.warn('[casesApi] Direct upload failed, falling back to API relay upload:', error);
+                useDirectUpload = false;
+                onProgress(
+                    totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0,
+                    'Direct cloud upload unavailable. Falling back to server relay...'
+                );
+                await uploadBatchChunkViaApi(
+                    initResponse.case_id,
+                    chunk,
+                    index,
+                    chunks.length,
+                    dcmFiles.length,
+                    totalBytes,
+                    uploadedBytes,
+                    onProgress
+                );
+            }
+        } else {
+            await uploadBatchChunkViaApi(
+                initResponse.case_id,
+                chunk,
+                index,
+                chunks.length,
+                dcmFiles.length,
+                totalBytes,
+                uploadedBytes,
+                onProgress
+            );
+        }
+
+        uploadedBytes += chunk.totalBytes;
+    }
+
+    const finalizeFormData = new FormData();
+    if (metadata && Object.keys(metadata).length > 0) {
+        finalizeFormData.append('metadata', JSON.stringify(metadata));
+    }
+
+    return postFormDataWithProgress<CaseResponse>(
+        `${API_V1}/cases/batch/${initResponse.case_id}/finalize`,
+        finalizeFormData
+    );
+};
+
+const uploadDicomFolderInArchiveShards = async (
+    initResponse: BatchInitResponse,
+    dcmFiles: File[],
+    totalBytes: number,
+    onProgress: (percent: number, label: string) => void,
+    metadata?: Record<string, unknown>
+): Promise<CaseResponse> => {
+    const chunks = createUploadChunks(dcmFiles);
+    let uploadedLogicalBytes = 0;
+    let packagedLogicalBytes = 0;
+    let useDirectUpload =
+        initResponse.storage_kind === 'object_store' &&
+        Boolean(initResponse.direct_upload_enabled);
+
+    try {
+        for (let index = 0; index < chunks.length; index++) {
+            const chunk = chunks[index];
+            const packagingBasePercent =
+                totalBytes > 0
+                    ? Math.round((packagedLogicalBytes / totalBytes) * DICOM_BUNDLE_PROGRESS_MAX)
+                    : 0;
+            const packagingSpanPercent =
+                totalBytes > 0
+                    ? Math.max(
+                        1,
+                        Math.round((chunk.totalBytes / totalBytes) * DICOM_BUNDLE_PROGRESS_MAX)
+                    )
+                    : DICOM_BUNDLE_PROGRESS_MAX;
+
+            const archiveFile = await createArchiveShard(chunk, index, chunks.length, (localPercent, label) => {
+                const overallPercent = Math.min(
+                    DICOM_BUNDLE_PROGRESS_MAX,
+                    packagingBasePercent + Math.round((localPercent / 100) * packagingSpanPercent)
+                );
+                onProgress(overallPercent, label);
+            });
+
+            packagedLogicalBytes += chunk.totalBytes;
+            const rawSizeMB = (chunk.totalBytes / 1024 / 1024).toFixed(1);
+            const archiveUploadLabel = useDirectUpload
+                ? `Uploading archive shard ${index + 1}/${chunks.length} directly to cloud (${chunk.files.length} files, ${rawSizeMB}MB raw)...`
+                : `Uploading archive shard ${index + 1}/${chunks.length} via server relay (${chunk.files.length} files, ${rawSizeMB}MB raw)...`;
+            const updateUploadProgress = (loaded: number, total: number) => {
+                const shardProgress = total > 0 ? loaded / total : 0;
+                const logicalLoaded = uploadedLogicalBytes + chunk.totalBytes * shardProgress;
+                const percent =
+                    totalBytes > 0
+                        ? DICOM_BUNDLE_PROGRESS_MAX +
+                          Math.round((logicalLoaded / totalBytes) * (100 - DICOM_BUNDLE_PROGRESS_MAX))
+                        : 100;
+                onProgress(Math.min(100, percent), archiveUploadLabel);
+            };
+
+            if (useDirectUpload) {
+                try {
+                    await uploadBatchFileDirect(initResponse.case_id, archiveFile, updateUploadProgress);
+                } catch (error) {
+                    console.warn(
+                        '[casesApi] Direct archive upload failed, falling back to API relay upload:',
+                        error
+                    );
+                    useDirectUpload = false;
+                    onProgress(
+                        totalBytes > 0
+                            ? DICOM_BUNDLE_PROGRESS_MAX +
+                              Math.round((uploadedLogicalBytes / totalBytes) * (100 - DICOM_BUNDLE_PROGRESS_MAX))
+                            : DICOM_BUNDLE_PROGRESS_MAX,
+                        'Direct cloud upload unavailable. Falling back to server relay...'
+                    );
+                    await uploadBatchFileViaApi(initResponse.case_id, archiveFile, updateUploadProgress);
+                }
+            } else {
+                await uploadBatchFileViaApi(initResponse.case_id, archiveFile, updateUploadProgress);
+            }
+
+            uploadedLogicalBytes += chunk.totalBytes;
+        }
+    } catch (error) {
+        const fallbackError = error instanceof Error ? error : new Error('Archive shard upload failed.');
+        (
+            fallbackError as Error & {
+                safeFallbackToRaw?: boolean;
+            }
+        ).safeFallbackToRaw = uploadedLogicalBytes === 0;
+        throw fallbackError;
+    }
+
+    const finalizeFormData = new FormData();
+    if (metadata && Object.keys(metadata).length > 0) {
+        finalizeFormData.append('metadata', JSON.stringify(metadata));
+    }
+
+    return postFormDataWithProgress<CaseResponse>(
+        `${API_V1}/cases/batch/${initResponse.case_id}/finalize`,
+        finalizeFormData
+    );
+};
+
 const uploadDicomFolderLegacy = async (
     files: File[],
     onProgress: (percent: number, label: string) => void,
@@ -834,78 +1117,59 @@ const uploadDicomFolderLegacy = async (
     }
 
     const initResponse = await axios.post<BatchInitResponse>(`${API_V1}/cases/batch/init`);
-    const chunks = createUploadChunks(dcmFiles);
-    let uploadedBytes = 0;
-    let useDirectUpload =
-        initResponse.data.storage_kind === 'object_store' &&
-        Boolean(initResponse.data.direct_upload_enabled);
-    const uploadConcurrency = Math.max(
-        1,
-        initResponse.data.recommended_upload_concurrency ?? DEFAULT_DIRECT_UPLOAD_CONCURRENCY
-    );
+    const preferredUploadLayout = initResponse.data.preferred_upload_layout ?? 'archive_shards';
+    let response: CaseResponse;
 
-    for (let index = 0; index < chunks.length; index++) {
-        const chunk = chunks[index];
-        if (useDirectUpload) {
-            try {
-                await uploadBatchChunkDirect(
-                    initResponse.data.case_id,
-                    chunk,
-                    index,
-                    chunks.length,
-                    dcmFiles.length,
-                    totalBytes,
-                    uploadedBytes,
-                    onProgress,
-                    uploadConcurrency
-                );
-            } catch (error) {
-                console.warn('[casesApi] Direct upload failed, falling back to API relay upload:', error);
-                useDirectUpload = false;
-                onProgress(
-                    totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0,
-                    'Direct cloud upload unavailable. Falling back to server relay...'
-                );
-                await uploadBatchChunkViaApi(
-                    initResponse.data.case_id,
-                    chunk,
-                    index,
-                    chunks.length,
-                    dcmFiles.length,
-                    totalBytes,
-                    uploadedBytes,
-                    onProgress
-                );
-            }
-        } else {
-            await uploadBatchChunkViaApi(
-                initResponse.data.case_id,
-                chunk,
-                index,
-                chunks.length,
-                dcmFiles.length,
+    if (preferredUploadLayout === 'archive_shards') {
+        try {
+            onProgress(
+                0,
+                `Large DICOM folder detected (${dcmFiles.length} files, ${(
+                    totalBytes /
+                    1024 /
+                    1024
+                ).toFixed(1)}MB). Packaging archive shards for upload...`
+            );
+            response = await uploadDicomFolderInArchiveShards(
+                initResponse.data,
+                dcmFiles,
                 totalBytes,
-                uploadedBytes,
-                onProgress
+                onProgress,
+                metadata
+            );
+        } catch (error) {
+            const safeFallbackToRaw = Boolean(
+                (error as Error & { safeFallbackToRaw?: boolean })?.safeFallbackToRaw
+            );
+            if (!safeFallbackToRaw) {
+                throw error;
+            }
+            console.warn(
+                '[casesApi] Archive-shard upload failed, falling back to raw multi-file upload:',
+                error
+            );
+            onProgress(0, 'Archive shard upload unavailable. Falling back to raw multi-file upload...');
+            response = await uploadDicomFolderInRawChunks(
+                initResponse.data,
+                dcmFiles,
+                totalBytes,
+                onProgress,
+                metadata
             );
         }
-
-        uploadedBytes += chunk.totalBytes;
+    } else {
+        response = await uploadDicomFolderInRawChunks(
+            initResponse.data,
+            dcmFiles,
+            totalBytes,
+            onProgress,
+            metadata
+        );
     }
-
-    const finalizeFormData = new FormData();
-    if (metadata && Object.keys(metadata).length > 0) {
-        finalizeFormData.append('metadata', JSON.stringify(metadata));
-    }
-
-    const response = await postFormDataWithProgress<CaseResponse>(
-        `${API_V1}/cases/batch/${initResponse.data.case_id}/finalize`,
-        finalizeFormData
-    );
 
     const totalTime = performance.now() - startTime;
     console.log(
-        `Chunked DICOM upload time: ${(totalTime / 1000).toFixed(2)}s across ${chunks.length} chunks`
+        `Chunked DICOM upload time: ${(totalTime / 1000).toFixed(2)}s`
     );
     onProgress(100, 'Upload complete!');
     return response;
@@ -963,7 +1227,7 @@ export const casesApi = {
         if (!shouldBundleDicomFolder(dcmFiles.length, totalBytes)) {
             onProgress(
                 0,
-                `Large DICOM folder detected (${dcmFiles.length} files, ${totalSizeMB}MB). Using multi-file upload...`
+                `Large DICOM folder detected (${dcmFiles.length} files, ${totalSizeMB}MB). Using staged archive upload...`
             );
             return uploadDicomFolderLegacy(dcmFiles, onProgress, metadata);
         }

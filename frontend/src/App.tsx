@@ -12,7 +12,6 @@ import type {
   CaseEventPayload,
   PipelineSnapshot,
   PipelineStageSnapshot,
-  PipelineStatus,
 } from './services/api';
 import type { CaseStatus, PipelineStepStatus } from './types';
 
@@ -166,12 +165,12 @@ function App() {
   );
 
   const applyPipelineSnapshot = useCallback(
-    (caseId: string, snapshot: PipelineSnapshot | Pick<PipelineStatus, 'overall_status' | 'stages' | 'artifacts'>, autoEnableSegmentation: boolean) => {
+    (caseId: string, snapshot: PipelineSnapshot, autoEnableSegmentation: boolean) => {
       const stagesByName = new Map<string, PipelineStageSnapshot>(
         (snapshot.stages ?? []).map((stage) => [stage.name, stage])
       );
-      const nextCtVolume = Boolean(snapshot.artifacts?.ct_volume);
-      const nextCtPreview = Boolean(snapshot.artifacts?.ct_volume_preview);
+      const nextCtVolume = Boolean(snapshot.volume_ready ?? snapshot.artifacts?.ct_volume);
+      const nextCtPreview = Boolean(snapshot.viewer_ready ?? snapshot.artifacts?.ct_volume_preview);
       const previousArtifacts = artifactAvailabilityRef.current.get(caseId) ?? {
         ctVolume: false,
         ctPreview: false,
@@ -192,8 +191,12 @@ function App() {
           const backendStage = stagesByName.get(step.id);
           const artifactName = ARTIFACT_BY_STAGE[step.id];
           const hasArtifact = artifactName ? Boolean(snapshot.artifacts?.[artifactName]) : false;
-          const loadVolumeReady = Boolean(snapshot.artifacts?.ct_volume);
-          const previewReady = Boolean(snapshot.artifacts?.ct_volume_preview);
+          const loadVolumeReady = Boolean(snapshot.volume_ready ?? snapshot.artifacts?.ct_volume);
+          const previewReady = Boolean(
+            snapshot.viewer_ready ??
+              snapshot.artifacts?.ct_volume_preview ??
+              snapshot.artifacts?.ct_volume
+          );
           const effectiveBackendStatus =
             step.id === 'load_volume'
               ? loadVolumeReady
@@ -244,6 +247,7 @@ function App() {
 
   useEffect(() => {
     if (appState !== 'VISUALIZATION' || !metadata?.id) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setMeshAvailable(false);
       return;
     }
@@ -265,6 +269,7 @@ function App() {
 
       if (
         allowStartProcessing &&
+        Boolean(status.volume_ready) &&
         status.overall_status === 'uploaded' &&
         !requestedProcessingRef.current.has(caseId)
       ) {
