@@ -81,9 +81,9 @@ def spawn_single_upload(case_id: str, source_ref: str, filename: str, source_kin
     if not is_running_in_modal():
         return False
 
-    from modal_app import process_upload_modal
+    from modal_app import process_ingest_modal
 
-    process_upload_modal.spawn(case_id, source_ref, filename, source_kind)
+    process_ingest_modal.spawn("single_upload", case_id, source_ref, source_kind, filename, None)
     return True
 
 
@@ -97,13 +97,25 @@ def spawn_dicom_directory(
     if not is_running_in_modal():
         return False
 
-    if source_kind == "object_store_keys":
-        from modal_app import process_dicom_objects_modal
+    from modal_app import process_ingest_modal
 
-        process_dicom_objects_modal.spawn(case_id, source_ref, extra_metadata)
+    if source_kind == "object_store_keys":
+        process_ingest_modal.spawn(
+            "dicom_objects",
+            case_id,
+            source_ref,
+            source_kind,
+            None,
+            extra_metadata,
+        )
         return True
 
-    from modal_app import process_dicom_dir_modal
-
-    process_dicom_dir_modal.spawn(case_id, source_ref, extra_metadata)
+    process_ingest_modal.spawn(
+        "dicom_dir",
+        case_id,
+        source_ref,
+        source_kind,
+        None,
+        extra_metadata,
+    )
     return True

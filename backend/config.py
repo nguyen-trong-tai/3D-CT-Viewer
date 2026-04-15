@@ -6,6 +6,7 @@ Central configuration for the CT-based Medical Imaging & AI Research Platform.
 
 from pathlib import Path
 from typing import Optional
+import json
 import os
 
 
@@ -28,12 +29,78 @@ def _load_dotenv_file() -> None:
 _load_dotenv_file()
 
 
+DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+DEV_TRUSTED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+    "testserver",
+]
+
+
+def _normalize_app_env(value: str | None) -> str:
+    normalized = (value or "development").strip().lower()
+    aliases = {
+        "dev": "development",
+        "local": "development",
+        "prod": "production",
+        "stage": "staging",
+    }
+    return aliases.get(normalized, normalized or "development")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_list(name: str, default: list[str] | None = None) -> list[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return list(default or [])
+
+    value = raw.strip()
+    if not value:
+        return []
+
+    if value.startswith("["):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _default_cors_origins(app_env: str) -> list[str]:
+    return DEV_CORS_ORIGINS if app_env != "production" else []
+
+
+def _default_trusted_hosts(app_env: str) -> list[str]:
+    return DEV_TRUSTED_HOSTS if app_env != "production" else []
+
+
 class Settings:
     """Application settings with environment variable overrides."""
     
     # Application Info
     APP_NAME: str = "CT-based Medical Imaging & AI Research Platform"
     APP_VERSION: str = "2.0.0"
+    APP_ENV: str = _normalize_app_env(os.getenv("APP_ENV"))
+    DEBUG: bool = _env_bool("DEBUG", APP_ENV != "production")
+    API_DOCS_ENABLED: bool = _env_bool("API_DOCS_ENABLED", APP_ENV != "production")
+    HEALTH_DETAILS_ENABLED: bool = _env_bool("HEALTH_DETAILS_ENABLED", APP_ENV != "production")
+    SECURITY_HEADERS_ENABLED: bool = _env_bool("SECURITY_HEADERS_ENABLED", True)
+    TRUSTED_HOSTS: list[str] = _env_list("TRUSTED_HOSTS", _default_trusted_hosts(APP_ENV))
     APP_DESCRIPTION: str = """
     A research-oriented platform for CT image viewing and AI experimentation.
     
@@ -66,12 +133,28 @@ class Settings:
     MESH_URL_TTL_SECONDS: int = int(os.getenv("MESH_URL_TTL_SECONDS", "3600"))
     UPLOAD_URL_TTL_SECONDS: int = int(os.getenv("UPLOAD_URL_TTL_SECONDS", "900"))
     DIRECT_UPLOAD_CONCURRENCY: int = int(os.getenv("DIRECT_UPLOAD_CONCURRENCY", "4"))
+    OBJECT_STORE_DOWNLOAD_CONCURRENCY: int = int(os.getenv("OBJECT_STORE_DOWNLOAD_CONCURRENCY", "8"))
+    R2_MAX_POOL_CONNECTIONS: int = int(os.getenv("R2_MAX_POOL_CONNECTIONS", "12"))
+    R2_TRANSFER_MAX_CONCURRENCY: int = int(os.getenv("R2_TRANSFER_MAX_CONCURRENCY", "4"))
+    R2_MULTIPART_THRESHOLD_MB: int = int(os.getenv("R2_MULTIPART_THRESHOLD_MB", "16"))
+    R2_MULTIPART_CHUNK_SIZE_MB: int = int(os.getenv("R2_MULTIPART_CHUNK_SIZE_MB", "16"))
+    PREFER_LOCAL_MODAL_INGEST: bool = os.getenv("PREFER_LOCAL_MODAL_INGEST", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
     
     # CORS Settings
-    CORS_ORIGINS: list = ["*"]  # Allow all for demo
-    CORS_ALLOW_CREDENTIALS: bool = True
-    CORS_ALLOW_METHODS: list = ["*"]
-    CORS_ALLOW_HEADERS: list = ["*"]
+    CORS_ORIGINS: list[str] = _env_list("CORS_ORIGINS", _default_cors_origins(APP_ENV))
+    CORS_ALLOW_CREDENTIALS: bool = _env_bool("CORS_ALLOW_CREDENTIALS", False)
+    CORS_ALLOW_METHODS: list[str] = _env_list(
+        "CORS_ALLOW_METHODS",
+        ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    CORS_ALLOW_HEADERS: list[str] = _env_list(
+        "CORS_ALLOW_HEADERS",
+        ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    )
     
     # Processing Settings
     # Maximum workers for parallel DICOM processing
@@ -108,6 +191,12 @@ class Settings:
 
     def refresh_from_env(self) -> None:
         """Reload env-driven settings at runtime."""
+        self.APP_ENV = _normalize_app_env(os.getenv("APP_ENV"))
+        self.DEBUG = _env_bool("DEBUG", self.APP_ENV != "production")
+        self.API_DOCS_ENABLED = _env_bool("API_DOCS_ENABLED", self.APP_ENV != "production")
+        self.HEALTH_DETAILS_ENABLED = _env_bool("HEALTH_DETAILS_ENABLED", self.APP_ENV != "production")
+        self.SECURITY_HEADERS_ENABLED = _env_bool("SECURITY_HEADERS_ENABLED", True)
+        self.TRUSTED_HOSTS = _env_list("TRUSTED_HOSTS", _default_trusted_hosts(self.APP_ENV))
         self.STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "d:/Workspace/viewr_ct/data"))
         self.TEMP_STORAGE_ROOT = Path(os.getenv("TEMP_STORAGE_ROOT") or str(self.STORAGE_ROOT / "temp"))
 
@@ -129,6 +218,26 @@ class Settings:
         self.MESH_URL_TTL_SECONDS = int(os.getenv("MESH_URL_TTL_SECONDS", "3600"))
         self.UPLOAD_URL_TTL_SECONDS = int(os.getenv("UPLOAD_URL_TTL_SECONDS", "900"))
         self.DIRECT_UPLOAD_CONCURRENCY = int(os.getenv("DIRECT_UPLOAD_CONCURRENCY", "4"))
+        self.OBJECT_STORE_DOWNLOAD_CONCURRENCY = int(os.getenv("OBJECT_STORE_DOWNLOAD_CONCURRENCY", "8"))
+        self.R2_MAX_POOL_CONNECTIONS = int(os.getenv("R2_MAX_POOL_CONNECTIONS", "12"))
+        self.R2_TRANSFER_MAX_CONCURRENCY = int(os.getenv("R2_TRANSFER_MAX_CONCURRENCY", "4"))
+        self.R2_MULTIPART_THRESHOLD_MB = int(os.getenv("R2_MULTIPART_THRESHOLD_MB", "16"))
+        self.R2_MULTIPART_CHUNK_SIZE_MB = int(os.getenv("R2_MULTIPART_CHUNK_SIZE_MB", "16"))
+        self.PREFER_LOCAL_MODAL_INGEST = os.getenv("PREFER_LOCAL_MODAL_INGEST", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        self.CORS_ORIGINS = _env_list("CORS_ORIGINS", _default_cors_origins(self.APP_ENV))
+        self.CORS_ALLOW_CREDENTIALS = _env_bool("CORS_ALLOW_CREDENTIALS", False)
+        self.CORS_ALLOW_METHODS = _env_list(
+            "CORS_ALLOW_METHODS",
+            ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        self.CORS_ALLOW_HEADERS = _env_list(
+            "CORS_ALLOW_HEADERS",
+            ["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+        )
 
         self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.cpu_count() or 4))
         self.PREVIEW_MAX_DIM = int(os.getenv("PREVIEW_MAX_DIM", "256"))
@@ -178,6 +287,26 @@ class Settings:
         """Whether both remote backends are enabled for distributed execution."""
         return self.should_use_redis_state() and self.should_use_r2_object_store()
 
+    def should_prefer_local_modal_ingest(self) -> bool:
+        """Whether Modal web containers should process ingest locally to avoid object-store round-trips."""
+        return self.should_use_distributed_runtime() and self.PREFER_LOCAL_MODAL_INGEST
+
+    def is_production_environment(self) -> bool:
+        """Whether the app is running with production defaults."""
+        return self.APP_ENV == "production"
+
+    def docs_url(self) -> str | None:
+        """FastAPI docs path for the current environment."""
+        return "/docs" if self.API_DOCS_ENABLED else None
+
+    def redoc_url(self) -> str | None:
+        """ReDoc path for the current environment."""
+        return "/redoc" if self.API_DOCS_ENABLED else None
+
+    def openapi_url(self) -> str | None:
+        """OpenAPI schema path for the current environment."""
+        return "/openapi.json" if self.API_DOCS_ENABLED else None
+
     def runtime_mode_label(self) -> str:
         """Human-readable runtime mode label."""
         return "distributed" if self.should_use_distributed_runtime() else "shared_volume"
@@ -187,6 +316,16 @@ class Settings:
         if self.DISTRIBUTED_RUNTIME_MODE not in {"auto", "required", "disabled"}:
             raise ValueError(
                 "DISTRIBUTED_RUNTIME_MODE must be one of: auto, required, disabled"
+            )
+
+        if "*" in self.CORS_ORIGINS and self.CORS_ALLOW_CREDENTIALS:
+            raise RuntimeError(
+                "CORS_ORIGINS cannot contain '*' when CORS_ALLOW_CREDENTIALS=true"
+            )
+
+        if self.is_production_environment() and "*" in self.CORS_ORIGINS:
+            raise RuntimeError(
+                "CORS_ORIGINS cannot contain '*' in production. Configure explicit trusted origins."
             )
 
         if not self.distributed_runtime_required():

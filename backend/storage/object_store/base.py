@@ -19,6 +19,10 @@ class ObjectStore(ABC):
     def upload_file(self, local_path: Path, object_key: str, content_type: Optional[str] = None) -> str:
         """Upload a local file to the object store."""
 
+    def upload_bytes(self, data: bytes, object_key: str, content_type: Optional[str] = None) -> str:
+        """Upload raw bytes to the object store."""
+        raise NotImplementedError("This object store does not support direct byte uploads")
+
     @abstractmethod
     def generate_download_url(self, object_key: str, expires_in_seconds: int = 3600) -> str:
         """Generate a temporary download URL for an object."""

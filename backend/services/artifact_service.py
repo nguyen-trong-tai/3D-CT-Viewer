@@ -20,8 +20,7 @@ class ArtifactService:
     def get_mesh_delivery(self, case_id: str, expires_in_seconds: int = 3600) -> Dict[str, Any]:
         self.repo.sync_for_read(scope="artifact")
 
-        artifacts = self.repo.get_available_artifacts(case_id)
-        if not artifacts.get("mesh"):
+        if not self.repo.is_artifact_available(case_id, "mesh"):
             raise FileNotFoundError(case_id)
 
         mesh_path = self.repo.get_mesh_path(case_id, prefer_remote=True)
@@ -52,9 +51,7 @@ class ArtifactService:
     ) -> str:
         self.repo.sync_for_read(scope="artifact")
 
-        artifacts = self.repo.get_available_artifacts(case_id)
-        available = bool(artifacts.get(artifact_name))
-        if not available:
+        if not self.repo.is_artifact_available(case_id, artifact_name):
             raise FileNotFoundError(case_id)
 
         object_key = self.repo.get_artifact_object_key(case_id, artifact_name)
@@ -62,3 +59,15 @@ class ArtifactService:
             raise FileNotFoundError(case_id)
 
         return self.object_store.generate_download_url(object_key, expires_in_seconds=expires_in_seconds)
+
+    def get_npy_artifact_delivery(self, case_id: str, artifact_name: str) -> Dict[str, Any]:
+        """Resolve a local or cached NPY artifact for chunked raw-byte streaming."""
+        self.repo.sync_for_read(scope="artifact")
+
+        if not self.repo.is_artifact_available(case_id, artifact_name):
+            raise FileNotFoundError(case_id)
+
+        payload = self.repo.get_npy_artifact_stream_info(case_id, artifact_name)
+        if not payload:
+            raise FileNotFoundError(case_id)
+        return payload

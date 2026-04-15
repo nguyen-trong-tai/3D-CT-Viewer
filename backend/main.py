@@ -10,6 +10,7 @@ It is not certified for clinical diagnosis or treatment.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from api.dependencies import ensure_runtime_dependencies, reset_dependencies
 from api.router import router
@@ -41,28 +42,51 @@ async def lifespan(app: FastAPI):
     print("[Backend] Shutting down...")
 
 
-# Create FastAPI application
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
-    description=settings.APP_DESCRIPTION,
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+def create_app() -> FastAPI:
+    """Create the FastAPI application with environment-aware middleware."""
+    settings.refresh_from_env()
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
-    allow_methods=settings.CORS_ALLOW_METHODS,
-    allow_headers=settings.CORS_ALLOW_HEADERS,
-    expose_headers=["X-Volume-Shape", "X-Volume-Spacing"],  # Custom headers for binary responses
-)
+    application = FastAPI(
+        title=settings.APP_NAME,
+        version=settings.APP_VERSION,
+        description=settings.APP_DESCRIPTION,
+        lifespan=lifespan,
+        docs_url=settings.docs_url(),
+        redoc_url=settings.redoc_url(),
+        openapi_url=settings.openapi_url(),
+    )
 
-# Include API router
-app.include_router(router)
+    if settings.CORS_ORIGINS:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.CORS_ORIGINS,
+            allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
+            allow_methods=settings.CORS_ALLOW_METHODS,
+            allow_headers=settings.CORS_ALLOW_HEADERS,
+            expose_headers=["X-Volume-Shape", "X-Volume-Spacing"],
+        )
+
+    if settings.TRUSTED_HOSTS:
+        application.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=settings.TRUSTED_HOSTS,
+        )
+
+    application.include_router(router)
+    return application
+
+
+app = create_app()
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    if settings.SECURITY_HEADERS_ENABLED:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
 
 
 @app.get("/", tags=["Root"])
@@ -72,7 +96,7 @@ async def root():
         "name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "status": "running",
-        "api_docs": "/docs",
+        "api_docs": settings.docs_url(),
         "disclaimer": "This software is intended for research and educational purposes. "
                      "It is not certified for clinical diagnosis or treatment."
     }
@@ -81,20 +105,27 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health_check():
     """Simple health check endpoint."""
-    return {
+    payload = {
         "status": "healthy",
-        "runtime_mode": settings.runtime_mode_label(),
-        "distributed_runtime_mode": settings.DISTRIBUTED_RUNTIME_MODE,
-        "redis_enabled": settings.should_use_redis_state(),
-        "r2_enabled": settings.should_use_r2_object_store(),
     }
+    if settings.HEALTH_DETAILS_ENABLED:
+        payload.update(
+            {
+                "version": settings.APP_VERSION,
+                "runtime_mode": settings.runtime_mode_label(),
+                "distributed_runtime_mode": settings.DISTRIBUTED_RUNTIME_MODE,
+                "redis_enabled": settings.should_use_redis_state(),
+                "r2_enabled": settings.should_use_r2_object_store(),
+            }
+        )
+    return payload
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host="127.0.0.1" if not settings.is_production_environment() else "0.0.0.0",
         port=8000,
         reload=True,
         log_level="info"

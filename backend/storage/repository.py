@@ -8,9 +8,11 @@ Implements the repository pattern for clean separation of storage concerns.
 import os
 import json
 import math
+from io import BytesIO
 import numpy as np
 import trimesh
 from pathlib import Path
+from time import perf_counter
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
@@ -98,7 +100,90 @@ class CaseRepository:
 
         metadata_object_key = self._ct_metadata_object_key(case_id)
         if self.object_store and metadata_path.exists():
-            self.object_store.upload_file(metadata_path, metadata_object_key, content_type="application/json")
+            self.object_store.upload_bytes(
+                json.dumps(metadata).encode("utf-8"),
+                metadata_object_key,
+                content_type="application/json",
+            )
+
+    def _save_ct_metadata_artifact(self, case_id: str, metadata: Dict[str, Any]) -> str:
+        """Persist CT metadata locally and in object storage, then update the artifact manifest."""
+        case_path = self._case_dir(case_id)
+        case_path.mkdir(parents=True, exist_ok=True)
+        metadata_path = case_path / "ct_metadata.json"
+        self._save_json(metadata_path, metadata)
+
+        metadata_object_key = self._ct_metadata_object_key(case_id)
+        if self.object_store and metadata_path.exists():
+            self.object_store.upload_bytes(
+                json.dumps(metadata).encode("utf-8"),
+                metadata_object_key,
+                content_type="application/json",
+            )
+
+        if self.state_store:
+            self.state_store.set_artifact(case_id, "ct_metadata", True, object_key=metadata_object_key)
+
+        return metadata_object_key
+
+    @staticmethod
+    def _build_ct_metadata_payload(
+        volume: np.ndarray,
+        spacing: Tuple[float, float, float],
+    ) -> Dict[str, Any]:
+        """Build the canonical CT metadata payload from a full-resolution volume."""
+        volume_int16 = volume.astype(np.int16, copy=False)
+        return {
+            "shape": list(volume_int16.shape),
+            "spacing": list(spacing),
+            "dtype": "int16",
+            "hu_range": {
+                "min": float(np.min(volume_int16)),
+                "max": float(np.max(volume_int16)),
+            },
+            "preview_available": False,
+            "preview_generation_pending": True,
+            "preview_mask_available": False,
+            "preview_downsample_factor": 1,
+        }
+
+    @staticmethod
+    def _serialize_npy_bytes(array: np.ndarray) -> bytes:
+        buffer = BytesIO()
+        np.save(buffer, array, allow_pickle=False)
+        return buffer.getvalue()
+
+    def _prepare_npy_upload_path(self, case_id: str, artifact_filename: str) -> Tuple[Path, bool]:
+        """
+        Return a writable path for NPY artifacts.
+
+        In distributed mode we still materialize the NPY locally so boto3 can use multipart
+        file uploads, then delete the temporary file after the upload completes.
+        """
+        if not self._should_skip_local_volume_persist():
+            case_path = self._case_dir(case_id)
+            case_path.mkdir(parents=True, exist_ok=True)
+            return case_path / artifact_filename, False
+
+        temp_dir = settings.TEMP_STORAGE_ROOT / "artifact_uploads" / case_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir / artifact_filename, True
+
+    @staticmethod
+    def _cleanup_temp_artifact_path(path: Path) -> None:
+        try:
+            if path.exists():
+                path.unlink()
+        finally:
+            parent = path.parent
+            try:
+                if parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError:
+                pass
+
+    def _should_skip_local_volume_persist(self) -> bool:
+        return bool(self.object_store and settings.should_use_r2_object_store())
     
     def case_exists(self, case_id: str) -> bool:
         """Check if a case exists."""
@@ -158,10 +243,23 @@ class CaseRepository:
         self.sync_for_write(scope="all")
         return True
         # Status Management    
-    def update_status(self, case_id: str, status: str, message: str = None):
+    def update_status(
+        self,
+        case_id: str,
+        status: str,
+        message: str = None,
+        current_stage: str = None,
+        progress_percent: float = None,
+    ):
         """Update the status of a case."""
         if settings.has_redis_state() and self.state_store:
-            self.state_store.update_case_status(case_id, status, message=message)
+            self.state_store.update_case_status(
+                case_id,
+                status,
+                message=message,
+                current_stage=current_stage,
+                progress_percent=progress_percent,
+            )
             self.sync_for_write(scope="state")
             return
 
@@ -178,8 +276,12 @@ class CaseRepository:
         status_data = self._ensure_retention_fields(status_data)
         status_data["status"] = status
         status_data["updated_at"] = datetime.utcnow().isoformat()
-        if message:
+        if message is not None:
             status_data["message"] = message
+        if current_stage is not None:
+            status_data["current_stage"] = current_stage
+        if progress_percent is not None:
+            status_data["progress_percent"] = progress_percent
 
         self._save_json(status_file, status_data)
         self.sync_for_write(scope="state")
@@ -220,6 +322,61 @@ class CaseRepository:
             return None
         return self._ensure_retention_fields(self._load_json(status_file))
 
+    def get_artifact_path(
+        self,
+        case_id: str,
+        artifact_name: str,
+        *,
+        prefer_remote: bool = False,
+    ) -> Optional[Path]:
+        """Resolve an artifact path without materializing the full payload in memory."""
+        preferred_local_path = self._preferred_local_artifact_path(case_id, artifact_name)
+        if preferred_local_path is None:
+            return None
+
+        resolved_path = self._resolve_artifact_path(
+            case_id,
+            artifact_name,
+            preferred_local_path,
+            prefer_remote=prefer_remote,
+        )
+        if not resolved_path.exists():
+            return None
+        return resolved_path
+
+    def get_npy_artifact_stream_info(
+        self,
+        case_id: str,
+        artifact_name: str,
+        *,
+        prefer_remote: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Return streaming metadata for a persisted NPY artifact."""
+        artifact_path = self.get_artifact_path(case_id, artifact_name, prefer_remote=prefer_remote)
+        if artifact_path is None or not artifact_path.exists():
+            return None
+
+        mmap_array: Optional[np.memmap] = None
+        try:
+            mmap_array = np.load(artifact_path, mmap_mode="r")
+            data_offset = int(getattr(mmap_array, "offset", 0))
+            content_length = max(0, artifact_path.stat().st_size - data_offset)
+            return {
+                "path": artifact_path,
+                "shape": tuple(int(value) for value in mmap_array.shape),
+                "dtype": str(np.dtype(mmap_array.dtype)),
+                "data_offset": data_offset,
+                "content_length": content_length,
+            }
+        except Exception:
+            return None
+        finally:
+            if mmap_array is not None:
+                mmap_handle = getattr(mmap_array, "_mmap", None)
+                if mmap_handle is not None:
+                    mmap_handle.close()
+                del mmap_array
+
     def get_expired_case_ids(self) -> list[str]:
         """List case ids whose retention window has elapsed."""
         expired_case_ids: set[str] = set()
@@ -259,60 +416,136 @@ class CaseRepository:
         self, 
         case_id: str, 
         volume: np.ndarray, 
-        spacing: Tuple[float, float, float]
+        spacing: Tuple[float, float, float],
+        generate_preview: bool = True,
     ):
         """
         Save CT volume and metadata.
         
         Volume is saved as int16 to preserve HU values (-1024 to +3071 typical range).
         """
+        started_at = perf_counter()
         case_path = self._case_dir(case_id)
         case_path.mkdir(parents=True, exist_ok=True)
+        existing_metadata = self.load_ct_metadata(case_id) or {}
+        preview_already_available = bool(existing_metadata.get("preview_available"))
         
         # Save volume as int16 (preserves full HU range)
         volume_int16 = volume.astype(np.int16, copy=False)
-        volume_path = case_path / "ct_volume.npy"
-        np.save(volume_path, volume_int16)
+        volume_path, cleanup_after_upload = self._prepare_npy_upload_path(case_id, "ct_volume.npy")
+        local_save_started_at = perf_counter()
         volume_object_key = self._ct_volume_object_key(case_id)
-        if self.object_store and volume_path.exists():
-            self.object_store.upload_file(volume_path, volume_object_key, content_type="application/octet-stream")
+        np.save(volume_path, volume_int16, allow_pickle=False)
+        local_save_duration = perf_counter() - local_save_started_at
 
+        upload_duration = 0.0
+        if self.object_store:
+            upload_started_at = perf_counter()
+            if volume_path.exists():
+                self.object_store.upload_file(
+                    volume_path,
+                    volume_object_key,
+                    content_type="application/octet-stream",
+                )
+            upload_duration = perf_counter() - upload_started_at
+        if cleanup_after_upload:
+            self._cleanup_temp_artifact_path(volume_path)
+
+        metadata = self._build_ct_metadata_payload(volume_int16, spacing)
+        metadata["preview_available"] = preview_already_available
+        metadata["preview_generation_pending"] = not (generate_preview or preview_already_available)
+        metadata["preview_mask_available"] = bool(existing_metadata.get("preview_mask_available"))
+        metadata["preview_downsample_factor"] = int(existing_metadata.get("preview_downsample_factor") or 1)
+        if "preview_shape" in existing_metadata:
+            metadata["preview_shape"] = existing_metadata.get("preview_shape")
+        if "preview_spacing" in existing_metadata:
+            metadata["preview_spacing"] = existing_metadata.get("preview_spacing")
+        if "mask_is_labeled" in existing_metadata:
+            metadata["mask_is_labeled"] = bool(existing_metadata.get("mask_is_labeled"))
+
+        metadata_started_at = perf_counter()
+        metadata_object_key = self._save_ct_metadata_artifact(case_id, metadata)
+        metadata_duration = perf_counter() - metadata_started_at
+        
+        print(
+            f"[CaseRepository] Saved CT volume for {case_id} in {perf_counter() - started_at:.2f}s "
+            f"(shape={tuple(volume.shape)}, local_save={local_save_duration:.2f}s, "
+            f"upload={upload_duration:.2f}s, metadata={metadata_duration:.2f}s)"
+        )
+
+        if preview_already_available:
+            status_message = "CT volume ready."
+            current_stage = "uploaded"
+            progress_percent = 100.0
+        elif generate_preview:
+            status_message = "CT volume uploaded."
+            current_stage = "uploaded"
+            progress_percent = 100.0
+        else:
+            status_message = "CT volume ready. Generating preview..."
+            current_stage = "saving_volume"
+            progress_percent = 85.0
+
+        self.update_status(
+            case_id,
+            CaseStatus.UPLOADED.value,
+            message=status_message,
+            current_stage=current_stage,
+            progress_percent=progress_percent,
+        )
+        if self.state_store:
+            self.state_store.set_artifact(case_id, "ct_volume", True, object_key=volume_object_key)
+            self.state_store.set_artifact(case_id, "ct_metadata", True, object_key=metadata_object_key)
+            self.state_store.set_artifact(
+                case_id,
+                "ct_volume_preview",
+                preview_already_available,
+                object_key=self._ct_preview_volume_object_key(case_id) if preview_already_available else None,
+            )
+        self.sync_for_write(scope="artifact")
+
+        if generate_preview:
+            self.generate_ct_preview(case_id, volume=volume_int16, spacing=spacing)
+
+    def publish_ct_preview(
+        self,
+        case_id: str,
+        volume: np.ndarray,
+        spacing: Tuple[float, float, float],
+    ) -> bool:
+        """Persist metadata plus a downsampled CT preview before the full volume upload finishes."""
+        started_at = perf_counter()
+        case_path = self._case_dir(case_id)
+        case_path.mkdir(parents=True, exist_ok=True)
+
+        volume_int16 = volume.astype(np.int16, copy=False)
+        metadata = self._build_ct_metadata_payload(volume_int16, spacing)
         preview_volume, preview_spacing, preview_factor = self._build_preview_volume(volume_int16, spacing, np.int16)
         preview_available = preview_volume is not None and preview_spacing is not None
         preview_object_key = self._ct_preview_volume_object_key(case_id)
-        if preview_available:
-            preview_path = case_path / "ct_preview_volume.npy"
-            np.save(preview_path, preview_volume)
+
+        metadata["preview_available"] = preview_available
+        metadata["preview_generation_pending"] = False
+        metadata["preview_mask_available"] = False
+        metadata["preview_downsample_factor"] = preview_factor if preview_available else 1
+        metadata["preview_shape"] = list(preview_volume.shape) if preview_available and preview_volume is not None else None
+        metadata["preview_spacing"] = list(preview_spacing) if preview_available and preview_spacing is not None else None
+
+        metadata_object_key = self._save_ct_metadata_artifact(case_id, metadata)
+
+        if preview_available and preview_volume is not None:
+            preview_path, cleanup_after_upload = self._prepare_npy_upload_path(case_id, "ct_preview_volume.npy")
+            np.save(preview_path, preview_volume, allow_pickle=False)
             if self.object_store and preview_path.exists():
-                self.object_store.upload_file(preview_path, preview_object_key, content_type="application/octet-stream")
-        
-        # Compute HU range
-        hu_min = float(np.min(volume_int16))
-        hu_max = float(np.max(volume_int16))
-        
-        # Save metadata
-        metadata = {
-            "shape": list(volume.shape),
-            "spacing": list(spacing),
-            "dtype": "int16",
-            "hu_range": {"min": hu_min, "max": hu_max},
-            "preview_available": preview_available,
-            "preview_mask_available": False,
-            "preview_downsample_factor": preview_factor if preview_available else 1,
-        }
-        if preview_available and preview_volume is not None and preview_spacing is not None:
-            metadata["preview_shape"] = list(preview_volume.shape)
-            metadata["preview_spacing"] = list(preview_spacing)
-        metadata_path = case_path / "ct_metadata.json"
-        self._save_json(metadata_path, metadata)
-        metadata_object_key = self._ct_metadata_object_key(case_id)
-        if self.object_store and metadata_path.exists():
-            self.object_store.upload_file(metadata_path, metadata_object_key, content_type="application/json")
-        
-        # Update status
-        self.update_status(case_id, CaseStatus.UPLOADED.value)
+                self.object_store.upload_file(
+                    preview_path,
+                    preview_object_key,
+                    content_type="application/octet-stream",
+                )
+            if cleanup_after_upload:
+                self._cleanup_temp_artifact_path(preview_path)
+
         if self.state_store:
-            self.state_store.set_artifact(case_id, "ct_volume", True, object_key=volume_object_key)
             self.state_store.set_artifact(case_id, "ct_metadata", True, object_key=metadata_object_key)
             self.state_store.set_artifact(
                 case_id,
@@ -320,6 +553,104 @@ class CaseRepository:
                 preview_available,
                 object_key=preview_object_key if preview_available else None,
             )
+
+        self.sync_for_write(scope="artifact")
+        print(
+            f"[CaseRepository] Published CT preview for {case_id} in {perf_counter() - started_at:.2f}s "
+            f"(available={preview_available})"
+        )
+        return preview_available
+
+    def generate_ct_preview(
+        self,
+        case_id: str,
+        volume: Optional[np.ndarray] = None,
+        spacing: Optional[Tuple[float, float, float]] = None,
+    ) -> bool:
+        """Generate and persist a downsampled preview volume without blocking upload readiness."""
+        started_at = perf_counter()
+        case_path = self._case_dir(case_id)
+        case_path.mkdir(parents=True, exist_ok=True)
+
+        metadata = self.load_ct_metadata(case_id) or {}
+        if volume is None:
+            loaded = self.load_ct_volume(case_id)
+            if loaded is None:
+                return False
+            volume = loaded.astype(np.int16, copy=False)
+        else:
+            volume = volume.astype(np.int16, copy=False)
+
+        if spacing is None:
+            spacing_values = metadata.get("spacing")
+            spacing = tuple(float(value) for value in spacing_values) if spacing_values else (1.0, 1.0, 1.0)
+
+        preview_volume, preview_spacing, preview_factor = self._build_preview_volume(volume, spacing, np.int16)
+        preview_object_key = self._ct_preview_volume_object_key(case_id)
+        preview_available = preview_volume is not None and preview_spacing is not None
+
+        if preview_available and preview_volume is not None and preview_spacing is not None:
+            preview_path, cleanup_after_upload = self._prepare_npy_upload_path(case_id, "ct_preview_volume.npy")
+            np.save(preview_path, preview_volume, allow_pickle=False)
+            if self.object_store:
+                if preview_path.exists():
+                    self.object_store.upload_file(
+                        preview_path,
+                        preview_object_key,
+                        content_type="application/octet-stream",
+                    )
+            if cleanup_after_upload:
+                self._cleanup_temp_artifact_path(preview_path)
+
+        metadata_updates: Dict[str, Any] = {
+            "preview_available": preview_available,
+            "preview_generation_pending": False,
+            "preview_downsample_factor": preview_factor if preview_available else 1,
+        }
+        if preview_available and preview_volume is not None and preview_spacing is not None:
+            metadata_updates["preview_shape"] = list(preview_volume.shape)
+            metadata_updates["preview_spacing"] = list(preview_spacing)
+        else:
+            metadata_updates["preview_shape"] = None
+            metadata_updates["preview_spacing"] = None
+
+        self._update_ct_metadata(case_id, metadata_updates)
+
+        if self.state_store:
+            self.state_store.set_artifact(
+                case_id,
+                "ct_volume_preview",
+                preview_available,
+                object_key=preview_object_key if preview_available else None,
+            )
+        self.sync_for_write(scope="artifact")
+        self.update_status(
+            case_id,
+            CaseStatus.UPLOADED.value,
+            message="CT volume ready.",
+            current_stage="uploaded",
+            progress_percent=100.0,
+        )
+        print(
+            f"[CaseRepository] Generated CT preview for {case_id} in {perf_counter() - started_at:.2f}s "
+            f"(available={preview_available})"
+        )
+        return preview_available
+
+    def mark_ct_preview_unavailable(self, case_id: str) -> None:
+        """Finalize preview state when preview generation is skipped or fails."""
+        self._update_ct_metadata(
+            case_id,
+            {
+                "preview_available": False,
+                "preview_generation_pending": False,
+                "preview_downsample_factor": 1,
+                "preview_shape": None,
+                "preview_spacing": None,
+            },
+        )
+        if self.state_store:
+            self.state_store.set_artifact(case_id, "ct_volume_preview", False, object_key=None)
         self.sync_for_write(scope="artifact")
     
     def load_ct_volume(self, case_id: str) -> Optional[np.ndarray]:
@@ -386,8 +717,8 @@ class CaseRepository:
                 pass
         return None
         # Segmentation Mask Storage    
-    def save_mask(self, case_id: str, mask: np.ndarray):
-        """Save segmentation mask as uint8 (0 or 1)."""
+    def save_mask(self, case_id: str, mask: np.ndarray, manifest: Optional[Dict[str, Any]] = None):
+        """Save segmentation mask as uint8, optionally with a segmentation manifest."""
         case_path = self._case_dir(case_id)
         case_path.mkdir(parents=True, exist_ok=True)
         mask_uint8 = mask.astype(np.uint8, copy=False)
@@ -413,8 +744,15 @@ class CaseRepository:
             {
                 "preview_mask_available": preview_available,
                 "preview_downsample_factor": preview_factor if preview_available else metadata.get("preview_downsample_factor", 1),
+                "mask_is_labeled": bool(manifest),
             },
         )
+        manifest_object_key = self._segmentation_manifest_object_key(case_id)
+        if manifest:
+            manifest_path = case_path / "mask_manifest.json"
+            self._save_json(manifest_path, manifest)
+            if self.object_store and manifest_path.exists():
+                self.object_store.upload_file(manifest_path, manifest_object_key, content_type="application/json")
         if self.state_store:
             self.state_store.set_artifact(case_id, "segmentation_mask", True, object_key=mask_object_key)
             self.state_store.set_artifact(
@@ -422,6 +760,12 @@ class CaseRepository:
                 "segmentation_mask_preview",
                 preview_available,
                 object_key=preview_object_key if preview_available else None,
+            )
+            self.state_store.set_artifact(
+                case_id,
+                "segmentation_manifest",
+                bool(manifest),
+                object_key=manifest_object_key if manifest else None,
             )
         self.sync_for_write(scope="artifact")
     
@@ -445,6 +789,21 @@ class CaseRepository:
         if not path.exists():
             return None
         return np.load(path)
+
+    def load_mask_manifest(self, case_id: str) -> Optional[Dict[str, Any]]:
+        """Load segmentation manifest metadata when available."""
+        path = self._case_dir(case_id) / "mask_manifest.json"
+        if path.exists():
+            return self._load_json(path)
+
+        object_key = self.get_artifact_object_key(case_id, "segmentation_manifest")
+        if self.object_store and object_key:
+            try:
+                payload = self.object_store.download_bytes(object_key)
+                return json.loads(payload.decode("utf-8"))
+            except Exception:
+                pass
+        return None
     
     def mask_exists(self, case_id: str) -> bool:
         """Check if segmentation mask exists for a case."""
@@ -573,6 +932,7 @@ class CaseRepository:
                     "ct_metadata": bool(manifest.get("ct_metadata", False)),
                     "segmentation_mask": bool(manifest.get("segmentation_mask", False)),
                     "segmentation_mask_preview": bool(manifest.get("segmentation_mask_preview", False)),
+                    "segmentation_manifest": bool(manifest.get("segmentation_manifest", False)),
                     "sdf": bool(manifest.get("sdf", False)),
                     "mesh": bool(manifest.get("mesh", False)),
                     "extra_metadata": bool(manifest.get("extra_metadata", False)),
@@ -585,6 +945,7 @@ class CaseRepository:
                 "ct_metadata": self.object_store.object_exists(self._ct_metadata_object_key(case_id)),
                 "segmentation_mask": self.object_store.object_exists(self._mask_volume_object_key(case_id)),
                 "segmentation_mask_preview": self.object_store.object_exists(self._mask_preview_volume_object_key(case_id)),
+                "segmentation_manifest": self.object_store.object_exists(self._segmentation_manifest_object_key(case_id)),
                 "sdf": self.object_store.object_exists(self._sdf_volume_object_key(case_id)),
                 "mesh": self.object_store.object_exists(self._mesh_object_key(case_id)),
                 "extra_metadata": self.object_store.object_exists(self._extra_metadata_object_key(case_id)),
@@ -599,6 +960,7 @@ class CaseRepository:
             "ct_metadata": (case_path / "ct_metadata.json").exists(),
             "segmentation_mask": (case_path / "mask_volume.npy").exists(),
             "segmentation_mask_preview": (case_path / "mask_preview_volume.npy").exists(),
+            "segmentation_manifest": (case_path / "mask_manifest.json").exists(),
             "sdf": (case_path / "sdf_volume.npy").exists(),
             "mesh": (case_path / "mesh.glb").exists() or (case_path / "mesh.obj").exists(),
             "extra_metadata": (case_path / "extra_metadata.json").exists(),
@@ -606,6 +968,23 @@ class CaseRepository:
         if settings.has_redis_state() and self.state_store:
             self.state_store.initialize_artifacts(case_id, artifacts)
         return artifacts
+
+    def is_artifact_available(self, case_id: str, artifact_name: str) -> bool:
+        """Check one artifact without materializing the full artifact manifest."""
+        if settings.has_redis_state() and self.state_store:
+            manifest = self.state_store.get_artifacts(case_id) or {}
+            if artifact_name in manifest:
+                return bool(manifest.get(artifact_name))
+
+        preferred_local_path = self._preferred_local_artifact_path(case_id, artifact_name)
+        if preferred_local_path is not None and preferred_local_path.exists():
+            return True
+
+        object_key = self.get_artifact_object_key(case_id, artifact_name)
+        if self.object_store and object_key:
+            return self.object_store.object_exists(object_key)
+
+        return False
 
     def get_artifact_object_key(self, case_id: str, artifact_name: str) -> Optional[str]:
         """Return the object key recorded in the artifact manifest."""
@@ -661,6 +1040,7 @@ class CaseRepository:
             "ct_metadata": False,
             "segmentation_mask": False,
             "segmentation_mask_preview": False,
+            "segmentation_manifest": False,
             "sdf": False,
             "mesh": False,
             "extra_metadata": False,
@@ -692,6 +1072,9 @@ class CaseRepository:
 
     def _mask_preview_volume_object_key(self, case_id: str) -> str:
         return f"{self._case_prefix(case_id)}mask/preview_volume.npy"
+
+    def _segmentation_manifest_object_key(self, case_id: str) -> str:
+        return f"{self._case_prefix(case_id)}mask/manifest.json"
 
     def _sdf_volume_object_key(self, case_id: str) -> str:
         return f"{self._case_prefix(case_id)}sdf/volume.npy"
@@ -761,8 +1144,24 @@ class CaseRepository:
             "extra_metadata": self._extra_metadata_object_key(case_id),
             "segmentation_mask": self._mask_volume_object_key(case_id),
             "segmentation_mask_preview": self._mask_preview_volume_object_key(case_id),
+            "segmentation_manifest": self._segmentation_manifest_object_key(case_id),
             "sdf": self._sdf_volume_object_key(case_id),
             "mesh": self._mesh_object_key(case_id),
+        }
+        return mapping.get(artifact_name)
+
+    def _preferred_local_artifact_path(self, case_id: str, artifact_name: str) -> Optional[Path]:
+        case_path = self._case_dir(case_id)
+        mapping = {
+            "ct_volume": case_path / "ct_volume.npy",
+            "ct_volume_preview": case_path / "ct_preview_volume.npy",
+            "ct_metadata": case_path / "ct_metadata.json",
+            "extra_metadata": case_path / "extra_metadata.json",
+            "segmentation_mask": case_path / "mask_volume.npy",
+            "segmentation_mask_preview": case_path / "mask_preview_volume.npy",
+            "segmentation_manifest": case_path / "mask_manifest.json",
+            "sdf": case_path / "sdf_volume.npy",
+            "mesh": case_path / "mesh.glb",
         }
         return mapping.get(artifact_name)
 

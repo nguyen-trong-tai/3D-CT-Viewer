@@ -57,6 +57,8 @@ class StatusResponse(BaseModel):
     status: str
     message: Optional[str] = Field(None, description="Additional status information")
     expires_at: Optional[str] = Field(None, description="UTC timestamp when the case will be auto-deleted")
+    current_stage: Optional[str] = Field(None, description="Current backend stage name when available")
+    progress_percent: Optional[float] = Field(None, description="Best-effort overall progress percentage")
     
     class Config:
         json_schema_extra = {
@@ -64,9 +66,45 @@ class StatusResponse(BaseModel):
                 "case_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
                 "status": "ready",
                 "message": "All processing complete",
-                "expires_at": "2026-03-25T12:00:00"
+                "expires_at": "2026-03-25T12:00:00",
+                "current_stage": "mesh",
+                "progress_percent": 100.0,
             }
         }
+
+
+class CaseEventStageSnapshot(BaseModel):
+    """Pipeline stage state embedded inside case SSE events."""
+    name: str
+    status: str
+    duration_seconds: Optional[float] = None
+    message: Optional[str] = None
+    output_shape: Optional[Any] = None
+
+
+class CaseEventSnapshot(BaseModel):
+    """Compact pipeline snapshot embedded inside case SSE events."""
+    overall_status: str
+    stages: List[CaseEventStageSnapshot] = Field(default_factory=list)
+    artifacts: Dict[str, bool] = Field(default_factory=dict)
+
+
+class CaseEventPayload(BaseModel):
+    """Event payload emitted over the case SSE stream."""
+    type: str = Field(..., description="Event category")
+    case_id: str = Field(..., description="Case identifier")
+    status: Optional[str] = Field(None, description="Overall case status when applicable")
+    stage: Optional[str] = Field(None, description="Pipeline stage name for pipeline events")
+    artifact: Optional[str] = Field(None, description="Artifact name for artifact readiness events")
+    message: Optional[str] = Field(None, description="Human-readable event message")
+    progress_percent: Optional[float] = Field(None, description="Best-effort progress percentage")
+    current_stage: Optional[str] = Field(None, description="Current backend stage label")
+    duration_seconds: Optional[float] = Field(None, description="Stage duration when available")
+    snapshot: Optional[CaseEventSnapshot] = Field(
+        None,
+        description="Latest pipeline/artifact snapshot so clients can reconcile state without extra polling",
+    )
+    timestamp: str = Field(..., description="UTC ISO-8601 timestamp for the event")
 
 
 class ProcessingResponse(BaseModel):
@@ -152,15 +190,19 @@ class SliceResponse(BaseModel):
 # ============================================================================
 
 class MaskSliceResponse(BaseModel):
-    """Single segmentation mask slice response."""
+    """Single labeled segmentation mask slice response."""
     slice_index: int = Field(..., description="Z-axis slice index (0-indexed)")
     mask: List[List[int]] = Field(
-        ..., 
-        description="2D binary mask [rows][cols] = [Y][X]. Values: 0=background, 1=segmented"
+        ...,
+        description="2D labeled mask [rows][cols] = [Y][X]. Values: 0=background, 1=left_lung, 2=right_lung, 3=nodule"
     )
     sparse: bool = Field(
-        ..., 
-        description="True if slice contains no segmentation (all zeros)"
+        ...,
+        description="True if slice contains no segmentation labels (all zeros)"
+    )
+    labels_present: List[int] = Field(
+        default_factory=list,
+        description="Sorted segmentation label ids present on the slice (excluding background)",
     )
     
     class Config:
@@ -178,6 +220,33 @@ class SegmentationInfo(BaseModel):
     type: SegmentationType
     available: bool = True
     voxel_count: Optional[int] = Field(None, description="Number of segmented voxels")
+
+
+class SegmentationLabel(BaseModel):
+    """Metadata describing a labeled segmentation component."""
+    label_id: int = Field(..., description="Voxel label id stored in the mask volume")
+    key: str = Field(..., description="Stable component key")
+    display_name: str = Field(..., description="Human-readable label name")
+    color: str = Field(..., description="Default hex color used in 2D and 3D viewers")
+    available: bool = Field(default=True, description="Whether this component is available for the case")
+    visible_by_default: bool = Field(default=True, description="Whether the UI should enable this component by default")
+    render_2d: bool = Field(default=True, description="Whether to render this component in slice viewers")
+    render_3d: bool = Field(default=True, description="Whether to render this component in 3D viewers")
+    voxel_count: int = Field(default=0, description="Voxel count for this component")
+    mesh_component_name: Optional[str] = Field(
+        default=None,
+        description="Stable geometry name expected inside the GLB scene",
+    )
+
+
+class SegmentationManifestResponse(BaseModel):
+    """Manifest describing all labeled segmentation components for a case."""
+    case_id: str
+    labels: List[SegmentationLabel] = Field(default_factory=list)
+    has_labeled_mask: bool = Field(
+        default=True,
+        description="Whether the stored mask volume uses multi-label semantics",
+    )
 
 
 # ============================================================================

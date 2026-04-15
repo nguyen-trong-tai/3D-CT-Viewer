@@ -6,17 +6,18 @@ This keeps routers thin while preserving the existing local artifact workflow.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import shutil
 import tempfile
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pydicom
 from fastapi import BackgroundTasks, HTTPException, UploadFile
 
 from config import settings
@@ -215,20 +216,110 @@ class UploadBackgroundProcessor:
         self.repo = repo
         self.artifacts = artifacts or UploadArtifactManager(repo.object_store)
 
+    def _update_upload_status(
+        self,
+        case_id: str,
+        message: str,
+        *,
+        current_stage: str,
+        progress_percent: float,
+        status: str = CaseStatus.UPLOADING.value,
+    ) -> None:
+        self.repo.update_status(
+            case_id,
+            status,
+            message,
+            current_stage=current_stage,
+            progress_percent=progress_percent,
+        )
+
+    def _publish_preview_first_best_effort(
+        self,
+        case_id: str,
+        *,
+        volume: Any,
+        spacing: Any,
+    ) -> bool:
+        try:
+            self._update_upload_status(
+                case_id,
+                "Generating preview...",
+                current_stage="generating_preview",
+                progress_percent=82.0,
+            )
+            return self.repo.publish_ct_preview(case_id, volume=volume, spacing=spacing)
+        except Exception:
+            traceback.print_exc()
+            self.repo.mark_ct_preview_unavailable(case_id)
+            return False
+
+    def _generate_preview_best_effort(
+        self,
+        case_id: str,
+        *,
+        volume: Any,
+        spacing: Any,
+    ) -> None:
+        try:
+            self._update_upload_status(
+                case_id,
+                "Generating preview...",
+                current_stage="generating_preview",
+                progress_percent=92.0,
+                status=CaseStatus.UPLOADED.value,
+            )
+            self.repo.generate_ct_preview(case_id, volume=volume, spacing=spacing)
+        except Exception as exc:
+            traceback.print_exc()
+            self.repo.mark_ct_preview_unavailable(case_id)
+            self.repo.update_status(
+                case_id,
+                CaseStatus.UPLOADED.value,
+                f"CT volume ready. Preview generation failed: {exc}",
+                current_stage="uploaded",
+                progress_percent=100.0,
+            )
+
     def process_single_upload(self, case_id: str, tmp_path: str, filename: str) -> None:
         """Background task to process a single ZIP or NIfTI upload."""
         try:
-            self.repo.update_status(case_id, CaseStatus.UPLOADING.value, "Processing volume data...")
+            self._update_upload_status(
+                case_id,
+                "Reading uploaded volume...",
+                current_stage="reading_volume",
+                progress_percent=20.0,
+            )
 
             lower_name = filename.lower()
+            load_started_at = time.perf_counter()
+            metadata_payload: Dict[str, Any] | None = None
             if lower_name.endswith(".zip"):
-                volume, spacing = MedicalVolumeLoader.load_dicom_series(tmp_path)
+                volume, spacing, representative_header, archive_metadata = MedicalVolumeLoader.load_dicom_series_with_metadata(tmp_path)
+                metadata_payload = dict(archive_metadata or {})
+                dicom_meta = MedicalVolumeLoader.extract_dicom_metadata(representative_header)
+                if dicom_meta:
+                    metadata_payload["dicom"] = dicom_meta
             elif lower_name.endswith((".nii", ".nii.gz")):
                 volume, spacing = MedicalVolumeLoader.load_nifti(tmp_path)
             else:
                 raise ValueError(f"Unsupported file format: {filename}")
 
-            self.repo.save_ct_volume(case_id, volume, spacing)
+            print(
+                f"[UploadBackgroundProcessor] Loaded single upload {filename} for {case_id} "
+                f"in {time.perf_counter() - load_started_at:.2f}s"
+            )
+            preview_ready = self._publish_preview_first_best_effort(case_id, volume=volume, spacing=spacing)
+            self._update_upload_status(
+                case_id,
+                "Saving CT volume...",
+                current_stage="saving_volume",
+                progress_percent=90.0 if preview_ready else 86.0,
+            )
+            self.repo.save_ct_volume(case_id, volume, spacing, generate_preview=False)
+            if metadata_payload:
+                self.repo.save_extra_metadata(case_id, metadata_payload)
+            if not preview_ready:
+                self._generate_preview_best_effort(case_id, volume=volume, spacing=spacing)
 
         except Exception as exc:
             traceback.print_exc()
@@ -254,18 +345,40 @@ class UploadBackgroundProcessor:
     ) -> None:
         """Background task to process a directory full of DICOM files."""
         try:
-            self.repo.update_status(case_id, CaseStatus.UPLOADING.value, "Processing DICOM directory...")
+            overall_started_at = time.perf_counter()
+            self._update_upload_status(
+                case_id,
+                "Reading DICOM headers...",
+                current_stage="reading_dicom_headers",
+                progress_percent=20.0,
+            )
 
             dicom_files = self._collect_dicom_files(temp_dir)
             if not dicom_files:
-                raise ValueError("No DICOM files found in batch directory")
+                raise ValueError("No uploaded files found in batch directory")
 
-            volume, spacing = MedicalVolumeLoader.load_dicom_from_files(dicom_files)
-            self.repo.save_ct_volume(case_id, volume, spacing)
+            volume, spacing, metadata_payload = self._load_dicom_volume_from_paths(
+                case_id,
+                dicom_files,
+                extra_metadata,
+            )
+            preview_ready = self._publish_preview_first_best_effort(case_id, volume=volume, spacing=spacing)
+            self._update_upload_status(
+                case_id,
+                "Saving CT volume...",
+                current_stage="saving_volume",
+                progress_percent=90.0 if preview_ready else 86.0,
+            )
+            self.repo.save_ct_volume(case_id, volume, spacing, generate_preview=False)
 
-            metadata_payload = self._build_dicom_metadata(dicom_files, extra_metadata)
             if metadata_payload:
                 self.repo.save_extra_metadata(case_id, metadata_payload)
+            if not preview_ready:
+                self._generate_preview_best_effort(case_id, volume=volume, spacing=spacing)
+            print(
+                f"[UploadBackgroundProcessor] Processed DICOM directory for {case_id} "
+                f"in {time.perf_counter() - overall_started_at:.2f}s"
+            )
 
         except Exception as exc:
             traceback.print_exc()
@@ -280,43 +393,169 @@ class UploadBackgroundProcessor:
         extra_metadata: Optional[Dict[str, Any]],
     ) -> None:
         """Background task to process DICOM files staged in object storage."""
+        overall_started_at = time.perf_counter()
         temp_dir = self.artifacts.create_temp_dir(f"dicom_obj_{case_id}_")
         try:
-            for index, object_key in enumerate(object_keys):
-                suffix = Path(object_key).suffix or ".dcm"
-                local_path = os.path.join(temp_dir, f"{index:04d}{suffix}")
-                self.artifacts.download_object_to_path(object_key, local_path)
+            self._update_upload_status(
+                case_id,
+                "Downloading DICOM files from object storage...",
+                current_stage="receiving_upload",
+                progress_percent=10.0,
+            )
+            download_started_at = time.perf_counter()
+            dicom_files = self._download_objects_to_directory_parallel(case_id, object_keys, temp_dir)
+            print(
+                f"[UploadBackgroundProcessor] Downloaded {len(dicom_files)} DICOM objects for {case_id} "
+                f"in {time.perf_counter() - download_started_at:.2f}s"
+            )
 
-            self.process_dicom_directory(case_id, temp_dir, extra_metadata)
+            volume, spacing, metadata_payload = self._load_dicom_volume_from_paths(
+                case_id,
+                dicom_files,
+                extra_metadata,
+            )
+            preview_ready = self._publish_preview_first_best_effort(case_id, volume=volume, spacing=spacing)
+
+            self._update_upload_status(
+                case_id,
+                "Saving CT volume...",
+                current_stage="saving_volume",
+                progress_percent=90.0 if preview_ready else 86.0,
+            )
+            self.repo.save_ct_volume(case_id, volume, spacing, generate_preview=False)
+            if metadata_payload:
+                self.repo.save_extra_metadata(case_id, metadata_payload)
+            if not preview_ready:
+                self._generate_preview_best_effort(case_id, volume=volume, spacing=spacing)
+            print(
+                f"[UploadBackgroundProcessor] Processed {len(object_keys)} object-backed DICOM files for {case_id} "
+                f"in {time.perf_counter() - overall_started_at:.2f}s"
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self.repo.update_status(case_id, CaseStatus.ERROR.value, str(exc))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
             for object_key in object_keys:
                 self.artifacts.delete_object_quietly(object_key)
 
-    @staticmethod
-    def _collect_dicom_files(temp_dir: str) -> List[str]:
-        dicom_files: List[str] = []
-        for root, _, files in os.walk(temp_dir):
-            for file_name in files:
-                if file_name.lower().endswith(".dcm"):
-                    dicom_files.append(os.path.join(root, file_name))
-        return dicom_files
-
-    @staticmethod
-    def _build_dicom_metadata(
+    def _load_dicom_volume_from_paths(
+        self,
+        case_id: str,
         dicom_files: List[str],
         extra_metadata: Optional[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+    ) -> tuple[Any, Any, Dict[str, Any]]:
+        if not dicom_files:
+            raise ValueError("No DICOM files available for parsing")
+
+        header_started_at = time.perf_counter()
+        self._update_upload_status(
+            case_id,
+            "Reading DICOM headers...",
+            current_stage="reading_dicom_headers",
+            progress_percent=28.0,
+        )
+        selected_datasets, spacing, representative_header = MedicalVolumeLoader.load_selected_dicom_datasets(dicom_files)
+        print(
+            f"[UploadBackgroundProcessor] Selected {len(selected_datasets)}/{len(dicom_files)} DICOM files for primary series "
+            f"for {case_id} in {time.perf_counter() - header_started_at:.2f}s"
+        )
+
+        parse_started_at = time.perf_counter()
+        self._update_upload_status(
+            case_id,
+            "Decoding DICOM slices...",
+            current_stage="decoding_dicom_slices",
+            progress_percent=55.0,
+        )
+        volume, spacing = MedicalVolumeLoader.build_volume_from_datasets(selected_datasets, spacing)
+        print(
+            f"[UploadBackgroundProcessor] Decoded primary DICOM series for {case_id} "
+            f"in {time.perf_counter() - parse_started_at:.2f}s"
+        )
+
         metadata_payload = dict(extra_metadata or {})
         try:
-            ds = pydicom.dcmread(dicom_files[0], stop_before_pixels=True)
-            dicom_meta = MedicalVolumeLoader.extract_dicom_metadata(ds)
+            dicom_meta = MedicalVolumeLoader.extract_dicom_metadata(representative_header)
             if dicom_meta:
                 metadata_payload["dicom"] = dicom_meta
         except Exception as meta_exc:
             print(f"[Metadata Extraction Error]: {meta_exc}")
-        return metadata_payload
 
+        return volume, spacing, metadata_payload
+
+    def _download_objects_to_directory_parallel(
+        self,
+        case_id: str,
+        object_keys: List[str],
+        temp_dir: str,
+    ) -> List[str]:
+        if not object_keys:
+            return []
+        if self.artifacts.object_store is None:
+            raise ValueError("Object store is unavailable for object-backed DICOM ingest")
+
+        max_workers = max(
+            1,
+            min(
+                len(object_keys),
+                settings.OBJECT_STORE_DOWNLOAD_CONCURRENCY,
+            ),
+        )
+        results: list[str | None] = [None] * len(object_keys)
+        completed = 0
+
+        def download_one(index_and_key: tuple[int, str]) -> tuple[int, str]:
+            index, object_key = index_and_key
+            suffix = Path(object_key).suffix or ".dcm"
+            local_path = os.path.join(temp_dir, f"{index:04d}{suffix}")
+            self.artifacts.download_object_to_path(object_key, local_path)
+            return index, local_path
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(download_one, (index, object_key))
+                for index, object_key in enumerate(object_keys)
+            ]
+            for future in as_completed(futures):
+                index, payload = future.result()
+                results[index] = payload
+                completed += 1
+
+                if completed == 1 or completed == len(object_keys) or completed % 16 == 0:
+                    progress = 10.0 + (completed / max(len(object_keys), 1)) * 15.0
+                    self._update_upload_status(
+                        case_id,
+                        (
+                            f"Downloaded {completed}/{len(object_keys)} DICOM files from object storage "
+                            f"with concurrency={max_workers}..."
+                        ),
+                        current_stage="receiving_upload",
+                        progress_percent=progress,
+                    )
+
+        missing_indexes = [index for index, path in enumerate(results) if path is None]
+        if missing_indexes:
+            raise ValueError(f"Failed to download {len(missing_indexes)} DICOM objects from object storage")
+
+        return [path for path in results if path is not None]
+
+    @staticmethod
+    def _collect_dicom_files(temp_dir: str) -> List[str]:
+        dicom_files: List[str] = []
+        candidate_files: List[str] = []
+        for root, _, files in os.walk(temp_dir):
+            for file_name in files:
+                lower_name = file_name.lower()
+                if lower_name == "metadata.json":
+                    continue
+
+                file_path = os.path.join(root, file_name)
+                if lower_name.endswith(".dcm"):
+                    dicom_files.append(file_path)
+                else:
+                    candidate_files.append(file_path)
+        return dicom_files + candidate_files
 
 class UploadService:
     """Service for single-file and batch upload workflows."""
@@ -335,7 +574,26 @@ class UploadService:
 
     @property
     def _use_object_store_handoff(self) -> bool:
-        return is_running_in_modal() and has_distributed_runtime() and self.artifacts.object_store is not None
+        return (
+            is_running_in_modal()
+            and has_distributed_runtime()
+            and not settings.should_prefer_local_modal_ingest()
+            and self.artifacts.object_store is not None
+        )
+
+    @property
+    def _use_object_store_batch_handoff(self) -> bool:
+        # Batch uploads span multiple requests, so worker-local temp directories are
+        # unsafe once session state is shared across replicas or containers.
+        return has_distributed_runtime() and self.artifacts.object_store is not None
+
+    @property
+    def _should_spawn_modal_ingest(self) -> bool:
+        if not is_running_in_modal():
+            return False
+        if has_distributed_runtime() and settings.should_prefer_local_modal_ingest():
+            return False
+        return True
 
     def _create_upload_case(self, message: str) -> str:
         case_id = str(uuid.uuid4())
@@ -427,7 +685,12 @@ class UploadService:
         source: UploadSourceReference,
         filename: str,
     ) -> None:
-        if spawn_single_upload(case_id, source.source_ref, filename, source_kind=source.source_kind):
+        if self._should_spawn_modal_ingest and spawn_single_upload(
+            case_id,
+            source.source_ref,
+            filename,
+            source_kind=source.source_kind,
+        ):
             return
 
         if source.source_kind == "object_store":
@@ -453,7 +716,12 @@ class UploadService:
         temp_dir: str,
         extra_metadata: Optional[Dict[str, Any]],
     ) -> None:
-        if spawn_dicom_directory(case_id, temp_dir, extra_metadata, source_kind="local_dir"):
+        if self._should_spawn_modal_ingest and spawn_dicom_directory(
+            case_id,
+            temp_dir,
+            extra_metadata,
+            source_kind="local_dir",
+        ):
             return
 
         background_tasks.add_task(
@@ -470,7 +738,7 @@ class UploadService:
         object_keys: List[str],
         extra_metadata: Optional[Dict[str, Any]],
     ) -> None:
-        if spawn_dicom_directory(
+        if self._should_spawn_modal_ingest and spawn_dicom_directory(
             case_id,
             object_keys,
             extra_metadata,
@@ -521,9 +789,13 @@ class UploadService:
                 raise HTTPException(status_code=400, detail="No files provided")
 
             extra_metadata = self.artifacts.parse_metadata_payload(metadata)
-            dcm_files = [file for file in files if file.filename and file.filename.lower().endswith(".dcm")]
+            dcm_files = [
+                file
+                for file in files
+                if file.filename and file.filename.lower() != "metadata.json"
+            ]
             if not dcm_files:
-                raise HTTPException(status_code=400, detail="No valid DICOM files (.dcm) found")
+                raise HTTPException(status_code=400, detail="No uploadable DICOM files found")
 
             if self._use_object_store_handoff:
                 object_keys: List[str] = []
@@ -558,7 +830,7 @@ class UploadService:
 
         session = UploadBatchSession.create(
             case_id,
-            direct_upload_enabled=self._use_object_store_handoff,
+            direct_upload_enabled=self._use_object_store_batch_handoff,
             artifacts=self.artifacts,
         )
         self.state_store.create_batch_session(

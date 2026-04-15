@@ -30,8 +30,17 @@ router.include_router(mesh_router)
 @router.get("/health", summary="Health check", tags=["Health"])
 async def health_check():
     """Check if the API is running."""
-    return {
+    payload = {
         "status": "healthy",
         "version": settings.APP_VERSION,
-        "storage_root": str(settings.STORAGE_ROOT)
     }
+    if settings.HEALTH_DETAILS_ENABLED:
+        payload.update(
+            {
+                "runtime_mode": settings.runtime_mode_label(),
+                "distributed_runtime_mode": settings.DISTRIBUTED_RUNTIME_MODE,
+                "redis_enabled": settings.should_use_redis_state(),
+                "r2_enabled": settings.should_use_r2_object_store(),
+            }
+        )
+    return payload

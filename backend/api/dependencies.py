@@ -39,6 +39,7 @@ def get_state_store() -> StateStore:
         try:
             _state_store = RedisStateStore(settings.REDIS_URL, settings.REDIS_KEY_PREFIX)
             _state_store.verify_connection()
+            print("[Dependencies] Connected to Redis state store")
             return _state_store
         except Exception as exc:
             if settings.distributed_runtime_required():
@@ -65,8 +66,13 @@ def get_object_store() -> ObjectStore | None:
                 access_key_id=settings.R2_ACCESS_KEY_ID,
                 secret_access_key=settings.R2_SECRET_ACCESS_KEY,
                 public_base_url=settings.R2_PUBLIC_BASE_URL,
+                max_pool_connections=settings.R2_MAX_POOL_CONNECTIONS,
+                transfer_max_concurrency=settings.R2_TRANSFER_MAX_CONCURRENCY,
+                multipart_threshold_mb=settings.R2_MULTIPART_THRESHOLD_MB,
+                multipart_chunk_size_mb=settings.R2_MULTIPART_CHUNK_SIZE_MB,
             )
             _object_store.verify_connection()
+            print("[Dependencies] Connected to R2 object store")
             return _object_store
         except Exception as exc:
             if settings.distributed_runtime_required():

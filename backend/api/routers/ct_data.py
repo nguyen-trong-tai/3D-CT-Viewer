@@ -4,8 +4,10 @@ CT Data Router — Volume, Slice, and Metadata endpoints
 Handles serving CT volume data (binary & JSON) and metadata.
 """
 
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 import numpy as np
 import json
 
@@ -17,6 +19,17 @@ from storage.repository import CaseRepository
 
 
 router = APIRouter(tags=["CT Data"])
+STREAM_CHUNK_SIZE_BYTES = 1024 * 1024
+
+
+def _stream_file_range(path: Path, offset: int):
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        while True:
+            chunk = handle.read(STREAM_CHUNK_SIZE_BYTES)
+            if not chunk:
+                break
+            yield chunk
 
 
 @router.get("/cases/{case_id}/metadata", response_model=MetadataResponse, summary="Get CT metadata")
@@ -65,51 +78,57 @@ async def get_extra_metadata(
 @router.get("/cases/{case_id}/ct/volume", summary="Get full CT volume")
 async def get_ct_volume(
     case_id: str,
-    repo: CaseRepository = Depends(get_repository)
+    artifact_service: ArtifactService = Depends(get_artifact_service),
 ):
     """
     Get the full CT volume as raw binary data (int16).
     Response is raw binary data with shape and spacing in headers.
     """
-    repo.sync_for_read(scope="artifact")
-    volume = repo.load_ct_volume(case_id)
-    meta = repo.load_ct_metadata(case_id)
-
-    if volume is None or meta is None:
+    try:
+        delivery = artifact_service.get_npy_artifact_delivery(case_id, "ct_volume")
+        meta = artifact_service.get_ct_metadata(case_id)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Volume not found")
 
-    volume_bytes = volume.astype(np.int16).tobytes()
-
     headers = {
-        "X-Volume-Shape": json.dumps(meta["shape"]),
+        "X-Volume-Shape": json.dumps(list(delivery["shape"])),
         "X-Volume-Spacing": json.dumps(meta["spacing"]),
         "Content-Type": "application/octet-stream",
+        "Content-Length": str(delivery["content_length"]),
     }
 
-    return Response(content=volume_bytes, headers=headers)
+    return StreamingResponse(
+        _stream_file_range(delivery["path"], delivery["data_offset"]),
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @router.get("/cases/{case_id}/ct/preview-volume", summary="Get preview CT volume")
 async def get_ct_preview_volume(
     case_id: str,
-    repo: CaseRepository = Depends(get_repository)
+    artifact_service: ArtifactService = Depends(get_artifact_service),
 ):
     """Get the downsampled CT preview volume as raw binary data (int16)."""
-    repo.sync_for_read(scope="artifact")
-    volume = repo.load_ct_preview_volume(case_id)
-    meta = repo.load_ct_metadata(case_id)
-
-    if volume is None or meta is None:
+    try:
+        delivery = artifact_service.get_npy_artifact_delivery(case_id, "ct_volume_preview")
+        meta = artifact_service.get_ct_metadata(case_id)
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Preview volume not found")
 
     spacing = meta.get("preview_spacing") or meta.get("spacing")
     headers = {
-        "X-Volume-Shape": json.dumps(list(volume.shape)),
+        "X-Volume-Shape": json.dumps(list(delivery["shape"])),
         "X-Volume-Spacing": json.dumps(spacing),
         "Content-Type": "application/octet-stream",
+        "Content-Length": str(delivery["content_length"]),
     }
 
-    return Response(content=volume.astype(np.int16).tobytes(), headers=headers)
+    return StreamingResponse(
+        _stream_file_range(delivery["path"], delivery["data_offset"]),
+        media_type="application/octet-stream",
+        headers=headers,
+    )
 
 
 @router.get("/cases/{case_id}/ct/volume-url", response_model=ArtifactUrlResponse, summary="Get CT volume download URL")
