@@ -85,7 +85,7 @@ Once running, access:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/cases/{case_id}/process` | POST | Start AI processing pipeline |
+| `/api/v1/cases/{case_id}/process` | POST | Start processing pipeline |
 | `/api/v1/cases/{case_id}/pipeline` | GET | Get detailed pipeline status |
 
 ### Data Retrieval
@@ -129,8 +129,21 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `APP_ENV` | `development` | App environment. Use `production` to enable safer defaults |
+| `API_DOCS_ENABLED` | `true` in dev, `false` in prod | Enables `/docs`, `/redoc`, and `/openapi.json` |
+| `HEALTH_DETAILS_ENABLED` | `true` in dev, `false` in prod | Exposes runtime/backend details in health endpoints |
+| `CORS_ORIGINS` | local frontend origins in dev, empty in prod | Comma-separated or JSON list of allowed browser origins |
+| `CORS_ALLOW_CREDENTIALS` | `false` | Whether browsers may send credentials on cross-origin requests |
+| `TRUSTED_HOSTS` | localhost/test hosts in dev, empty in prod | Comma-separated host allowlist for `Host` header validation |
+| `SECURITY_HEADERS_ENABLED` | `true` | Adds basic hardening headers like `X-Frame-Options` and `nosniff` |
 | `STORAGE_ROOT` | `d:/Workspace/viewr_ct/data` | Data storage directory |
 | `MAX_WORKERS` | CPU count | Parallel DICOM processing workers |
+| `DISTRIBUTED_RUNTIME_MODE` | `auto` | `required` makes startup fail if Redis + R2 are unavailable |
+| `REDIS_URL` | unset | Redis state store for pipeline status, locks, and batch sessions |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET` | unset | Cloudflare R2 artifact/object storage |
+
+For production, start from [`.env.example`](./.env.example) and set explicit values for
+`CORS_ORIGINS` and `TRUSTED_HOSTS` instead of using wildcards.
 
 ## Modal Deployment
 
@@ -139,6 +152,10 @@ Deploy to Modal cloud with GPU support:
 ```bash
 modal deploy modal_app.py
 ```
+
+For distributed execution without shared-volume fallback, set `DISTRIBUTED_RUNTIME_MODE=required`
+and provide both Redis + R2 credentials. In that mode the app will fail at startup if either
+backend cannot be reached, which avoids silently dropping to in-memory/local storage.
 
 ## Data Storage
 
