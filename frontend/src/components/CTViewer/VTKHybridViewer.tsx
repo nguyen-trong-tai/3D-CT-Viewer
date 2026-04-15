@@ -49,7 +49,7 @@ const VTKHybridViewer: React.FC<VTKHybridViewerProps> = ({ caseId }) => {
             // 2. Volume Pipeline Init
             const volumeMapper = vtkVolumeMapper.newInstance();
             // Tối ưu hóa sample distance để chất lượng nét hơn (0.5 là đẹp nhưng nặng, 1.0 là cân bằng, ở đây để 0.5)
-            volumeMapper.setSampleDistance(0.5); 
+            volumeMapper.setSampleDistance(1.0);
             // Bật tính năng nội suy trên các cạnh của voxel để volume liền mạch thành khối mượt mà thay vì các lát xếp nếp
             const volumeActor = vtkVolume.newInstance();
             volumeActor.setMapper(volumeMapper);
@@ -98,10 +98,14 @@ const VTKHybridViewer: React.FC<VTKHybridViewerProps> = ({ caseId }) => {
             const loadData = async () => {
                 try {
                     // --- LOAD VOLUME ---
-                    setLoadingMsg("Downloading CT Volume...");
-                    const { data, shape, spacing } = await ctApi.getVolumeBinary(caseId);
+                    setLoadingMsg("Checking CT Volume...");
+                    const metadata = await ctApi.getMetadata(caseId);
+                    const previewVolume = metadata.preview_available
+                        ? await ctApi.getPreviewVolumeBinary(caseId)
+                        : null;
+                    const { data, shape, spacing } = previewVolume ?? await ctApi.getVolumeBinary(caseId);
                     
-                    setLoadingMsg("Processing Volume...");
+                    setLoadingMsg(previewVolume ? "Processing Preview Volume..." : "Processing Volume...");
                     const volumeData = vtkImageData.newInstance({
                         // Backend data is passed as Int16Array unrolled. Tăng spacing Z nếu các lát cắt xa nhau
                         spacing: [spacing[0], spacing[1], spacing[2]],
@@ -188,12 +192,15 @@ const VTKHybridViewer: React.FC<VTKHybridViewerProps> = ({ caseId }) => {
                             
                             renderer.resetCamera();
                             renderWindow.render();
+                            dracoLoader.dispose();
                             setLoadingMsg(""); // Done
                         } else {
+                            dracoLoader.dispose();
                             setLoadingMsg("No valid Mesh geometry found");
                         }
                     }, undefined, (e: any) => {
                         console.error('Failed to load mesh', e);
+                        dracoLoader.dispose();
                         setLoadingMsg("Error loading Mesh.");
                     });
 

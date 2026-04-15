@@ -141,6 +141,28 @@ export interface SegmentationConfig {
     tumorColor: string;
 }
 
+export interface SegmentationLabel {
+    label_id: number;
+    key: 'left_lung' | 'right_lung' | 'nodule' | string;
+    display_name: string;
+    color: string;
+    available: boolean;
+    visible_by_default: boolean;
+    render_2d: boolean;
+    render_3d: boolean;
+    voxel_count: number;
+    mesh_component_name?: string | null;
+}
+
+export interface SegmentationManifest {
+    case_id: string;
+    labels: SegmentationLabel[];
+    has_labeled_mask: boolean;
+}
+
+export type SegmentationVisibility = Record<string, boolean>;
+export type MeshVisibilityPreset = 'default' | 'nodule_focus';
+
 export const DEFAULT_SEGMENTATION_CONFIG: SegmentationConfig = {
     visible: false,
     opacity: 0.5,
@@ -182,6 +204,7 @@ export interface MaskSliceData {
     slice_index: number;
     mask: number[][];
     sparse: boolean;
+    labels_present: number[];
 }
 
 /**
@@ -193,6 +216,8 @@ export interface ViewerState {
     windowPreset: WindowPresetKey;
     customWindow?: { level: number; width: number };
     segmentation: SegmentationConfig;
+    segmentationVisibility: SegmentationVisibility;
+    meshVisibilityPreset: MeshVisibilityPreset;
     showWireframe: boolean;
     zoomLevel: number;
     panOffset: { x: number; y: number };
@@ -201,8 +226,10 @@ export interface ViewerState {
 export const DEFAULT_VIEWER_STATE: ViewerState = {
     viewMode: '2D',
     crosshair: { x: 0, y: 0, z: 0 },
-    windowPreset: 'SOFT_TISSUE',
+    windowPreset: 'LUNG',
     segmentation: DEFAULT_SEGMENTATION_CONFIG,
+    segmentationVisibility: {},
+    meshVisibilityPreset: 'default',
     showWireframe: false,
     zoomLevel: 1,
     panOffset: { x: 0, y: 0 },

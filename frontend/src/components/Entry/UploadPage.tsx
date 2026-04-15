@@ -1,55 +1,49 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
-    Upload,
+    Activity,
+    AlertCircle,
     FileUp,
     FolderUp,
-    CheckCircle,
-    AlertCircle,
-    ArrowRight,
-    Activity,
     Loader2,
+    Upload,
 } from 'lucide-react';
-import type { CaseMetadata, PipelineStep, PipelineStepStatus } from '../../types';
-import { PIPELINE_STEPS } from '../../types';
-import { casesApi, ctApi } from '../../services/api';
-import { Button, ProgressBar, InfoRow } from '../UI';
+import type { CaseMetadata } from '../../types';
+import { casesApi, ctApi, isLikelyDicomFile } from '../../services/api';
+import type { StatusResponse } from '../../services/api';
+import { Button, ProgressBar } from '../UI';
 
 interface UploadPageProps {
     onUploadComplete: (metadata: CaseMetadata) => void;
 }
 
-type UploadState = 'idle' | 'uploading' | 'processing' | 'ready' | 'error';
+type UploadState = 'idle' | 'uploading' | 'error';
 
-/**
- * Upload Page Component
- * Entry point for loading CT data (DICOM folders or NIfTI files)
- */
+const TRANSFER_PROGRESS_MAX = 88;
+const ACQUISITION_PROGRESS_MAX = 99;
+
+const normalizeCaseStatus = (status?: StatusResponse['status']): CaseMetadata['status'] => {
+    switch (status) {
+        case 'uploading':
+        case 'uploaded':
+        case 'processing':
+        case 'ready':
+        case 'error':
+            return status;
+        default:
+            return 'uploaded';
+    }
+};
+
 export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
     const [dragActive, setDragActive] = useState(false);
     const [uploadState, setUploadState] = useState<UploadState>('idle');
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
-    const [metadata, setMetadata] = useState<CaseMetadata | null>(null);
     const [progress, setProgress] = useState(0);
     const [progressLabel, setProgressLabel] = useState('');
-    const [pipelineSteps, setPipelineSteps] = useState<PipelineStep[]>(PIPELINE_STEPS);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
     const folderInputRef = useRef<HTMLInputElement>(null);
 
-    /**
-     * Update pipeline step status
-     */
-    const updateStepStatus = useCallback((stepId: string, status: PipelineStepStatus) => {
-        setPipelineSteps(prev =>
-            prev.map(step =>
-                step.id === stepId ? { ...step, status } : step
-            )
-        );
-    }, []);
-
-    /**
-     * Read directory entries recursively (for drag-drop folders)
-     */
     const readDirectoryEntries = async (dirEntry: FileSystemDirectoryEntry): Promise<File[]> => {
         return new Promise((resolve) => {
             const reader = dirEntry.createReader();
@@ -66,7 +60,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         if (entry.isFile) {
                             const fileEntry = entry as FileSystemFileEntry;
                             const file = await new Promise<File>((res) => {
-                                fileEntry.file((f) => res(f));
+                                fileEntry.file((value) => res(value));
                             });
                             files.push(file);
                         } else if (entry.isDirectory) {
@@ -74,34 +68,231 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             files.push(...subFiles);
                         }
                     }
+
                     readBatch();
                 });
             };
+
             readBatch();
         });
     };
 
-    /**
-     * Process uploaded files
-     */
+    const buildCaseMetadata = useCallback(async (caseId: string): Promise<CaseMetadata> => {
+        ctApi.invalidateMetadata(caseId);
+        const [metaRes, statusRes] = await Promise.all([
+            ctApi.getMetadata(caseId),
+            casesApi.getStatus(caseId),
+        ]);
+
+        return {
+            id: caseId,
+            totalSlices: metaRes.num_slices,
+            dimensions: [
+                metaRes.volume_shape.x,
+                metaRes.volume_shape.y,
+                metaRes.volume_shape.z,
+            ],
+            voxelSpacing: [
+                metaRes.voxel_spacing_mm.x,
+                metaRes.voxel_spacing_mm.y,
+                metaRes.voxel_spacing_mm.z,
+            ],
+            status: normalizeCaseStatus(statusRes.status),
+            huRange: metaRes.hu_range,
+        };
+    }, []);
+
+    const setTransferProgress = useCallback((percent: number) => {
+        const clampedPercent = Math.max(0, Math.min(100, percent));
+        setProgress(Math.round((clampedPercent / 100) * TRANSFER_PROGRESS_MAX));
+    }, []);
+
+    const updateAcquisitionProgress = useCallback((progressPercent?: number, currentStage?: string) => {
+        if (typeof progressPercent === 'number') {
+            const clampedBackendProgress = Math.max(0, Math.min(100, progressPercent));
+            const mappedProgress =
+                TRANSFER_PROGRESS_MAX +
+                (clampedBackendProgress / 100) * (ACQUISITION_PROGRESS_MAX - TRANSFER_PROGRESS_MAX);
+            setProgress((current) => Math.max(current, Math.round(mappedProgress)));
+        } else {
+            setProgress((current) => Math.max(current, TRANSFER_PROGRESS_MAX));
+        }
+
+        switch (currentStage) {
+            case 'receiving_upload':
+                setProgressLabel('CT Acquisition: receiving DICOM files...');
+                return;
+            case 'reading_volume':
+                setProgressLabel('CT Acquisition: reading uploaded volume...');
+                return;
+            case 'reading_dicom_headers':
+                setProgressLabel('CT Acquisition: reading DICOM headers...');
+                return;
+            case 'decoding_dicom_slices':
+                setProgressLabel('CT Acquisition: decoding DICOM slices...');
+                return;
+            case 'saving_volume':
+                setProgressLabel('CT Acquisition: converting upload into volume...');
+                return;
+            case 'generating_preview':
+                setProgressLabel('CT Acquisition: generating preview for faster 2D viewing...');
+                return;
+            case 'uploaded':
+                setProgressLabel('CT Acquisition: volume ready for 2D viewer...');
+                return;
+            default:
+                setProgressLabel('CT Acquisition: preparing volume for 2D view...');
+        }
+    }, []);
+
+    const waitForCaseUploadReady = useCallback(
+        async (caseId: string): Promise<StatusResponse> => {
+            const isReady = (status: StatusResponse['status']) => status === 'uploaded' || status === 'ready';
+            const applyStatus = (status: Pick<StatusResponse, 'progress_percent' | 'current_stage'>) => {
+                updateAcquisitionProgress(status.progress_percent, status.current_stage);
+            };
+            const hasViewerArtifact = async () => {
+                try {
+                    const artifacts = await casesApi.getArtifacts(caseId);
+                    return Boolean(
+                        artifacts.artifacts.ct_volume || artifacts.artifacts.ct_volume_preview
+                    );
+                } catch {
+                    return false;
+                }
+            };
+            const evaluateStatus = async (status: StatusResponse) => {
+                applyStatus(status);
+
+                if (status.status === 'error') {
+                    throw new Error(status.message || 'Error processing raw data into volume.');
+                }
+
+                if (isReady(status.status) || await hasViewerArtifact()) {
+                    return status;
+                }
+
+                return null;
+            };
+
+            const initialStatus = await casesApi.getStatus(caseId);
+            const initialReadyStatus = await evaluateStatus(initialStatus);
+            if (initialReadyStatus) {
+                return initialReadyStatus;
+            }
+
+            return new Promise<StatusResponse>((resolve, reject) => {
+                let settled = false;
+                let unsubscribe = () => {};
+
+                const cleanup = () => {
+                    window.clearInterval(pollInterval);
+                    unsubscribe();
+                };
+
+                const settleSuccess = (status: StatusResponse) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    cleanup();
+                    resolve(status);
+                };
+
+                const settleError = (message: string) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    cleanup();
+                    reject(new Error(message));
+                };
+
+                const handleStatus = async (status: StatusResponse) => {
+                    try {
+                        const readyStatus = await evaluateStatus(status);
+                        if (readyStatus) {
+                            settleSuccess(readyStatus);
+                        }
+                    } catch (error) {
+                        settleError(
+                            error instanceof Error
+                                ? error.message
+                                : 'Error processing raw data into volume.'
+                        );
+                    }
+                };
+
+                const pollInterval = window.setInterval(() => {
+                    void casesApi
+                        .getStatus(caseId)
+                        .then((status) => handleStatus(status))
+                        .catch((error) => {
+                            if (!settled) {
+                                console.warn('[UploadPage] Failed to poll upload status:', error);
+                            }
+                        });
+                }, 1000);
+
+                unsubscribe = casesApi.subscribeToCaseEvents(caseId, {
+                    onEvent: (payload) => {
+                        if (payload.case_id !== caseId) {
+                            return;
+                        }
+
+                        applyStatus({
+                            progress_percent: payload.progress_percent,
+                            current_stage: payload.current_stage,
+                        });
+                        const viewerReady =
+                            payload.artifact === 'ct_volume' ||
+                            payload.artifact === 'ct_volume_preview' ||
+                            Boolean(payload.snapshot?.artifacts?.ct_volume) ||
+                            Boolean(payload.snapshot?.artifacts?.ct_volume_preview);
+
+                        if (payload.status === 'error') {
+                            settleError(payload.message || 'Error processing raw data into volume.');
+                            return;
+                        }
+
+                        if (payload.status === 'uploaded' || payload.status === 'ready' || viewerReady) {
+                            settleSuccess({
+                                case_id: caseId,
+                                status: payload.status ?? 'uploading',
+                                message: payload.message,
+                                current_stage: payload.current_stage,
+                                progress_percent: payload.progress_percent,
+                            });
+                        }
+                    },
+                    onError: () => {
+                        // Keep the polling fallback alive if SSE disconnects.
+                    },
+                });
+            });
+        },
+        [updateAcquisitionProgress]
+    );
+
     const processFiles = useCallback(
         async (items: DataTransferItemList | FileList | null) => {
-            if (!items || items.length === 0) return;
+            if (!items || items.length === 0) {
+                return;
+            }
 
             setErrorMsg(null);
             setProgress(0);
+            setProgressLabel('');
             setUploadState('uploading');
-            setPipelineSteps(PIPELINE_STEPS); // Reset pipeline
 
             try {
                 let fileArray: File[] = [];
                 let metadataFile: File | null = null;
 
-                // Handle drag-drop with folder support
                 if ('length' in items && items[0] && 'webkitGetAsEntry' in items[0]) {
                     setProgressLabel('Reading folder structure...');
 
-                    for (let i = 0; i < items.length; i++) {
+                    for (let i = 0; i < items.length; i += 1) {
                         const item = items[i] as DataTransferItem;
                         const entry = item.webkitGetAsEntry?.();
 
@@ -110,258 +301,108 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             fileArray.push(...dirFiles);
                         } else if (entry?.isFile) {
                             const file = item.getAsFile();
-                            if (file) fileArray.push(file);
+                            if (file) {
+                                fileArray.push(file);
+                            }
                         }
                     }
                 } else {
                     fileArray = Array.from(items as FileList);
                 }
 
-                // Separate metadata and DICOM files
                 const dcmFiles: File[] = [];
                 for (const file of fileArray) {
                     const lowerName = file.name.toLowerCase();
                     if (lowerName === 'metadata.json') {
                         metadataFile = file;
-                    } else if (lowerName.endsWith('.dcm')) {
+                    } else if (isLikelyDicomFile(file)) {
                         dcmFiles.push(file);
                     }
                 }
 
-                // Parse metadata if found
                 let extraMetadata: Record<string, unknown> | undefined;
                 if (metadataFile) {
                     try {
-                        const text = await metadataFile.text();
-                        extraMetadata = JSON.parse(text);
+                        extraMetadata = JSON.parse(await metadataFile.text()) as Record<string, unknown>;
                     } catch {
                         console.warn('Failed to parse metadata.json');
                     }
                 }
 
                 let caseId: string;
-
-                // Upload DICOM folder
                 if (dcmFiles.length > 0) {
                     const uploadRes = await casesApi.uploadDicomFolder(
                         dcmFiles,
                         (percent, label) => {
-                            setProgress(percent);
+                            setTransferProgress(percent);
                             setProgressLabel(label);
                         },
                         extraMetadata
                     );
                     caseId = uploadRes.case_id;
                 } else {
-                    // Single file (NIfTI)
                     const file = fileArray[0];
-                    if (!file) throw new Error('No valid files found');
+                    if (!file) {
+                        throw new Error('No valid files found');
+                    }
 
                     setProgressLabel(`Uploading ${(file.size / 1024 / 1024).toFixed(1)} MB...`);
                     const uploadRes = await casesApi.uploadCaseWithProgress(file, (percent) => {
-                        setProgress(percent);
+                        setTransferProgress(percent);
                     });
                     caseId = uploadRes.case_id;
                 }
 
-                updateStepStatus('load_volume', 'running');
-                setUploadState('processing');
+                setProgressLabel('CT Acquisition: preparing volume for 2D view...');
+                await waitForCaseUploadReady(caseId);
+
                 setProgress(100);
-                setProgressLabel('Upload complete. Preparing 3D volume on the server...');
+                setProgressLabel('Opening 2D viewer...');
 
-                // Wait for background worker to parse DICOM/NIfTI and save the numpy volume
-                let isUploaded = false;
-                while (!isUploaded) {
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    const currentStatus = await casesApi.getStatus(caseId);
-                    if (currentStatus.status === 'uploaded' || currentStatus.status === 'ready') {
-                        isUploaded = true;
-                    } else if (currentStatus.status === 'error') {
-                        throw new Error(currentStatus.message || 'Error processing raw data into volume.');
-                    }
-                }
-
-                // Mark upload complete
-                updateStepStatus('load_volume', 'completed');
-
-                // Processing phase
-                setProgress(0);
-                setProgressLabel('Starting AI pipeline...');
-                await casesApi.processCase(caseId);
-
-                // Poll for completion with pipeline status updates
-                let pollCount = 0;
-                const maxPolls = 120; // 2 minutes max
-
-                const pollInterval = setInterval(async () => {
-                    try {
-                        pollCount++;
-
-                        // Get detailed pipeline status
-                        const pipelineStatus = await casesApi.getPipelineStatus(caseId);
-
-                        // Update pipeline steps based on response
-                        if (pipelineStatus.stages) {
-                            for (const stage of pipelineStatus.stages) {
-                                let status: PipelineStepStatus = 'pending';
-                                if (stage.status === 'completed') status = 'completed';
-                                else if (stage.status === 'running') status = 'running';
-                                else if (stage.status === 'failed') status = 'failed';
-                                else if (stage.status === 'skipped') status = 'completed';
-
-                                updateStepStatus(stage.name, status);
-                            }
-                        }
-
-                        // Update progress label based on current stage
-                        const runningStage = pipelineStatus.stages?.find(s => s.status === 'running');
-                        if (runningStage) {
-                            const stageLabels: Record<string, string> = {
-                                'segmentation': 'Running segmentation...',
-                                'sdf': 'Computing implicit field...',
-                                'mesh': 'Generating 3D mesh...',
-                            };
-                            setProgressLabel(stageLabels[runningStage.name] || 'Processing...');
-                        }
-
-                        if (pipelineStatus.overall_status === 'ready') {
-                            clearInterval(pollInterval);
-
-                            // Mark all steps completed
-                            setPipelineSteps(prev =>
-                                prev.map(step => ({ ...step, status: 'completed' as const }))
-                            );
-
-                            const metaRes = await ctApi.getMetadata(caseId);
-                            const newMeta: CaseMetadata = {
-                                id: caseId,
-                                totalSlices: metaRes.num_slices,
-                                dimensions: [
-                                    metaRes.volume_shape.x,
-                                    metaRes.volume_shape.y,
-                                    metaRes.volume_shape.z,
-                                ],
-                                voxelSpacing: [
-                                    metaRes.voxel_spacing_mm.x,
-                                    metaRes.voxel_spacing_mm.y,
-                                    metaRes.voxel_spacing_mm.z,
-                                ],
-                                status: 'ready',
-                                huRange: metaRes.hu_range,
-                            };
-
-                            setMetadata(newMeta);
-                            setUploadState('ready');
-                            setProgressLabel('Complete!');
-
-                            // // Auto-navigate after delay
-                            // setTimeout(() => {
-                            //     onUploadComplete(newMeta);
-                            // }, 2000);
-
-                        } else if (pipelineStatus.overall_status === 'error') {
-                            clearInterval(pollInterval);
-                            setUploadState('error');
-                            setErrorMsg('Processing failed on the server.');
-                        } else if (pollCount >= maxPolls) {
-                            clearInterval(pollInterval);
-                            setUploadState('error');
-                            setErrorMsg('Processing timeout. Please try again.');
-                        }
-                    } catch (e) {
-                        // Fallback to simple status check
-                        try {
-                            const statusRes = await casesApi.getStatus(caseId);
-
-                            if (statusRes.status === 'ready') {
-                                clearInterval(pollInterval);
-
-                                const metaRes = await ctApi.getMetadata(caseId);
-                                const newMeta: CaseMetadata = {
-                                    id: caseId,
-                                    totalSlices: metaRes.num_slices,
-                                    dimensions: [
-                                        metaRes.volume_shape.x,
-                                        metaRes.volume_shape.y,
-                                        metaRes.volume_shape.z,
-                                    ],
-                                    voxelSpacing: [
-                                        metaRes.voxel_spacing_mm.x,
-                                        metaRes.voxel_spacing_mm.y,
-                                        metaRes.voxel_spacing_mm.z,
-                                    ],
-                                    status: 'ready',
-                                };
-
-                                setMetadata(newMeta);
-                                setUploadState('ready');
-
-                                setTimeout(() => {
-                                    onUploadComplete(newMeta);
-                                }, 1500);
-
-                            } else if (statusRes.status === 'error') {
-                                clearInterval(pollInterval);
-                                setUploadState('error');
-                                setErrorMsg(statusRes.message || 'Processing failed.');
-                            }
-                        } catch {
-                            clearInterval(pollInterval);
-                            setUploadState('error');
-                            setErrorMsg('Lost connection to the server.');
-                        }
-                    }
-                }, 3000);
+                onUploadComplete(await buildCaseMetadata(caseId));
             } catch (err) {
                 console.error(err);
                 setUploadState('error');
                 setErrorMsg(err instanceof Error ? err.message : 'Upload failed');
             }
         },
-        [onUploadComplete, updateStepStatus]
+        [buildCaseMetadata, onUploadComplete, readDirectoryEntries, setTransferProgress, updateAcquisitionProgress, waitForCaseUploadReady]
     );
 
-    // Drag handlers
-    const handleDrag = (e: React.DragEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (e.type === 'dragenter' || e.type === 'dragover') {
+    const handleDrag = (event: React.DragEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (event.type === 'dragenter' || event.type === 'dragover') {
             setDragActive(true);
-        } else if (e.type === 'dragleave') {
+        } else if (event.type === 'dragleave') {
             setDragActive(false);
         }
     };
 
-    const handleDrop = (e: React.DragEvent) => {
-        e.preventDefault();
-        e.stopPropagation();
+    const handleDrop = (event: React.DragEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
         setDragActive(false);
 
-        if (e.dataTransfer.items?.length > 0) {
-            processFiles(e.dataTransfer.items);
-        } else if (e.dataTransfer.files?.length > 0) {
-            processFiles(e.dataTransfer.files);
+        if (event.dataTransfer.items?.length > 0) {
+            processFiles(event.dataTransfer.items);
+        } else if (event.dataTransfer.files?.length > 0) {
+            processFiles(event.dataTransfer.files);
         }
     };
 
-    const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-        if (e.target.files && e.target.files.length > 0) {
-            processFiles(e.target.files);
-        }
-    };
-
-    const handleConfirm = () => {
-        if (metadata) {
-            onUploadComplete(metadata);
+    const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+        if (event.target.files && event.target.files.length > 0) {
+            processFiles(event.target.files);
         }
     };
 
     const handleRetry = () => {
         setUploadState('idle');
         setErrorMsg(null);
-        setMetadata(null);
         setProgress(0);
-        setPipelineSteps(PIPELINE_STEPS);
+        setProgressLabel('');
     };
 
     return (
@@ -378,7 +419,6 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                 overflow: 'hidden',
             }}
         >
-            {/* Background Glow */}
             <div
                 style={{
                     position: 'absolute',
@@ -400,7 +440,6 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     zIndex: 1,
                 }}
             >
-                {/* Header */}
                 <div style={{ textAlign: 'center', marginBottom: 'var(--space-2xl)' }}>
                     <div
                         style={{
@@ -423,7 +462,6 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     </p>
                 </div>
 
-                {/* Idle State - Upload Zone */}
                 {uploadState === 'idle' && (
                     <div
                         className="animate-fade-in"
@@ -435,9 +473,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             border: `2px dashed ${dragActive ? 'var(--accent-primary)' : 'var(--border-default)'}`,
                             borderRadius: 'var(--radius-xl)',
                             padding: 'var(--space-2xl)',
-                            background: dragActive
-                                ? 'rgba(59, 130, 246, 0.05)'
-                                : 'var(--bg-panel)',
+                            background: dragActive ? 'rgba(59, 130, 246, 0.05)' : 'var(--bg-panel)',
                             textAlign: 'center',
                             transition: 'all var(--transition-base)',
                             cursor: 'default',
@@ -462,8 +498,14 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         <h3 style={{ marginBottom: 'var(--space-sm)' }}>
                             Drag & drop DICOM folder or NIfTI file
                         </h3>
-                        <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginBottom: 'var(--space-lg)' }}>
-                            Supported formats: .dcm, .nii, .nii.gz
+                        <p
+                            style={{
+                                fontSize: '0.9rem',
+                                color: 'var(--text-muted)',
+                                marginBottom: 'var(--space-lg)',
+                            }}
+                        >
+                            Supported formats: DICOM (.dcm, .ima, extensionless), .nii, .nii.gz
                         </p>
 
                         <div style={{ display: 'flex', gap: 'var(--space-md)', justifyContent: 'center' }}>
@@ -483,11 +525,10 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             </Button>
                         </div>
 
-                        {/* Hidden inputs */}
                         <input
                             ref={fileInputRef}
                             type="file"
-                            accept=".nii,.nii.gz,.dcm,.zip"
+                            accept=".nii,.nii.gz,.dcm,.dicom,.ima,.zip"
                             style={{ display: 'none' }}
                             onChange={handleFileSelect}
                         />
@@ -503,8 +544,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                     </div>
                 )}
 
-                {/* Uploading / Processing State */}
-                {(uploadState === 'uploading' || uploadState === 'processing') && (
+                {uploadState === 'uploading' && (
                     <div
                         className="card animate-scale-in"
                         style={{
@@ -528,7 +568,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         </div>
 
                         <h3 style={{ marginBottom: 'var(--space-sm)' }}>
-                            {uploadState === 'uploading' ? 'Uploading Data...' : 'Processing Volume...'}
+                            Preparing Case...
                         </h3>
                         <p
                             style={{
@@ -540,63 +580,10 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                             {progressLabel || 'Please wait...'}
                         </p>
 
-                        {uploadState === 'uploading' && (
-                            <ProgressBar value={progress} showLabel size="md" />
-                        )}
-
-                        {/* Pipeline Steps */}
-                        {uploadState === 'processing' && (
-                            <div style={{ marginTop: 'var(--space-lg)', textAlign: 'left' }}>
-                                {pipelineSteps.map((step) => (
-                                    <div
-                                        key={step.id}
-                                        style={{
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            gap: 'var(--space-sm)',
-                                            padding: 'var(--space-sm) 0',
-                                            opacity: step.status === 'pending' ? 0.5 : 1,
-                                        }}
-                                    >
-                                        {step.status === 'completed' && (
-                                            <CheckCircle size={16} color="var(--accent-success)" />
-                                        )}
-                                        {step.status === 'running' && (
-                                            <Loader2
-                                                size={16}
-                                                color="var(--accent-primary)"
-                                                style={{ animation: 'spin 1s linear infinite' }}
-                                            />
-                                        )}
-                                        {step.status === 'pending' && (
-                                            <div
-                                                style={{
-                                                    width: 16,
-                                                    height: 16,
-                                                    borderRadius: '50%',
-                                                    border: '2px solid var(--border-subtle)',
-                                                }}
-                                            />
-                                        )}
-                                        {step.status === 'failed' && (
-                                            <AlertCircle size={16} color="var(--accent-error)" />
-                                        )}
-                                        <span style={{
-                                            color: step.status === 'completed'
-                                                ? 'var(--text-primary)'
-                                                : 'var(--text-muted)',
-                                            fontSize: '0.85rem',
-                                        }}>
-                                            {step.label}
-                                        </span>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
+                        <ProgressBar value={progress} showLabel size="md" />
                     </div>
                 )}
 
-                {/* Error State */}
                 {uploadState === 'error' && (
                     <div
                         className="card animate-scale-in"
@@ -639,116 +626,8 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         </Button>
                     </div>
                 )}
-
-                {/* Ready State */}
-                {uploadState === 'ready' && metadata && (
-                    <div className="card animate-scale-in" style={{ padding: 'var(--space-xl)' }}>
-                        <div
-                            style={{
-                                display: 'flex',
-                                alignItems: 'center',
-                                gap: 'var(--space-md)',
-                                marginBottom: 'var(--space-lg)',
-                                paddingBottom: 'var(--space-md)',
-                                borderBottom: '1px solid var(--border-subtle)',
-                            }}
-                        >
-                            <div
-                                style={{
-                                    width: 40,
-                                    height: 40,
-                                    borderRadius: '50%',
-                                    background: 'var(--accent-success-glow)',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                }}
-                            >
-                                <CheckCircle size={24} color="var(--accent-success)" />
-                            </div>
-                            <div>
-                                <h3 style={{ marginBottom: 2 }}>Ready for Visualization</h3>
-                                <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                                    Case ID: {metadata.id.slice(0, 8)}...
-                                </span>
-                            </div>
-                        </div>
-
-                        <div style={{ marginBottom: 'var(--space-lg)' }}>
-                            <InfoRow label="Total Slices" value={metadata.totalSlices} mono />
-                            <InfoRow
-                                label="Volume Dimensions"
-                                value={metadata.dimensions.join(' × ')}
-                                mono
-                            />
-                            <InfoRow
-                                label="Voxel Spacing (mm)"
-                                value={metadata.voxelSpacing.map((v) => v.toFixed(2)).join(' × ')}
-                                mono
-                            />
-                            {metadata.huRange && (
-                                <InfoRow
-                                    label="HU Range"
-                                    value={`${metadata.huRange.min.toFixed(0)} to ${metadata.huRange.max.toFixed(0)}`}
-                                    mono
-                                />
-                            )}
-                        </div>
-
-                        <Button
-                            variant="primary"
-                            fullWidth
-                            icon={<ArrowRight size={16} />}
-                            iconPosition="right"
-                            onClick={handleConfirm}
-                        >
-                            Launch Viewer
-                        </Button>
-
-                        <button
-                            onClick={handleRetry}
-                            style={{
-                                width: '100%',
-                                marginTop: 'var(--space-md)',
-                                background: 'transparent',
-                                border: 'none',
-                                color: 'var(--text-muted)',
-                                cursor: 'pointer',
-                                fontSize: '0.85rem',
-                            }}
-                        >
-                            Upload Different File
-                        </button>
-                    </div>
-                )}
-
-                {/* Research Disclaimer */}
-                {/* <div
-                    style={{
-                        marginTop: 'var(--space-xl)',
-                        padding: 'var(--space-md)',
-                        background: 'rgba(239, 68, 68, 0.05)',
-                        border: '1px solid rgba(239, 68, 68, 0.2)',
-                        borderRadius: 'var(--radius-md)',
-                        textAlign: 'center',
-                    }}
-                >
-                    <p
-                        style={{
-                            fontSize: '0.75rem',
-                            color: 'var(--accent-error)',
-                            lineHeight: 1.5,
-                            margin: 0,
-                        }}
-                    >
-                        This software is intended for research and educational purposes only.
-                        <br />
-                        It is not certified for clinical diagnosis or treatment.
-                    </p>
-                </div> */}
             </div>
 
-            {/* Animation keyframes */}
             <style>{`
         @keyframes spin {
           from { transform: rotate(0deg); }

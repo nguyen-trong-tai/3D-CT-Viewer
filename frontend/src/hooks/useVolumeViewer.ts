@@ -1,7 +1,7 @@
 
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { ctApi, maskApi } from '../services/api';
-import { WINDOW_PRESETS, type WindowPresetKey, type MPRView } from '../types';
+import { WINDOW_PRESETS, type WindowPresetKey, type MPRView, type SegmentationManifest } from '../types';
 import { useViewerStore } from '../stores/viewerStore';
 
 interface VolumeData {
@@ -16,6 +16,24 @@ interface MaskData {
     shape: [number, number, number];
     resolution: 'preview' | 'full';
 }
+
+const hexToRgb = (hex: string): { r: number; g: number; b: number } | null => {
+    const normalized = hex.trim().replace('#', '');
+    const expanded = normalized.length === 3
+        ? normalized.split('').map((char) => `${char}${char}`).join('')
+        : normalized;
+
+    if (!/^[0-9a-fA-F]{6}$/.test(expanded)) {
+        return null;
+    }
+
+    const value = Number.parseInt(expanded, 16);
+    return {
+        r: (value >> 16) & 255,
+        g: (value >> 8) & 255,
+        b: value & 255,
+    };
+};
 
 // Global cache for volume data (shared across all hook instances)
 // LRU eviction: keep at most MAX_CACHED_VOLUMES to prevent memory leaks
@@ -55,6 +73,7 @@ export function useVolumeViewer(caseId: string | null) {
     // Crosshair position for MPR synchronization (voxel indices)
     const crosshair = useViewerStore(state => state.mprCrosshair);
     const setCrosshair = useViewerStore(state => state.setMprCrosshair);
+    const artifactRefreshVersion = useViewerStore(state => state.artifactRefreshVersion);
 
     // ImageData cache for ultra-fast rendering
     const imageDataCache = useRef(new Map<string, ImageData>());
@@ -80,6 +99,91 @@ export function useVolumeViewer(caseId: string | null) {
         y: Math.max(0, Math.min(nextShape[1] - 1, nextCrosshair.y)),
         z: Math.max(0, Math.min(nextShape[2] - 1, nextCrosshair.z)),
     }), []);
+
+    const projectCrosshairToShape = useCallback((
+        fromShape: [number, number, number],
+        toShape: [number, number, number],
+        currentCrosshair: { x: number; y: number; z: number }
+    ) => {
+        const projectAxis = (value: number, fromSize: number, toSize: number) => {
+            if (toSize <= 1) {
+                return 0;
+            }
+            if (fromSize <= 1) {
+                return Math.floor((toSize - 1) / 2);
+            }
+            return Math.round((value / (fromSize - 1)) * (toSize - 1));
+        };
+
+        return clampCrosshairToShape(toShape, {
+            x: projectAxis(currentCrosshair.x, fromShape[0], toShape[0]),
+            y: projectAxis(currentCrosshair.y, fromShape[1], toShape[1]),
+            z: projectAxis(currentCrosshair.z, fromShape[2], toShape[2]),
+        });
+    }, [clampCrosshairToShape]);
+
+    const loadMaskArtifacts = useCallback(async (targetCaseId: string, preferPreview: boolean) => {
+        try {
+            const previewMaskResult = preferPreview
+                ? await maskApi.getPreviewMaskVolumeBinary(targetCaseId)
+                : null;
+            const maskResult = previewMaskResult ?? await maskApi.getMaskVolumeBinary(targetCaseId);
+
+            if (!maskResult) {
+                return false;
+            }
+
+            const maskData: MaskData = {
+                data: maskResult.data,
+                shape: maskResult.shape,
+                resolution: previewMaskResult ? 'preview' : 'full',
+            };
+            globalMaskCache.set(targetCaseId, maskData);
+            setMask(maskData);
+            return true;
+        } catch {
+            return false;
+        }
+    }, []);
+
+    const upgradePreviewVolume = useCallback(async (
+        targetCaseId: string,
+        currentVolume: VolumeData
+    ) => {
+        if (currentVolume.resolution !== 'preview') {
+            return false;
+        }
+
+        try {
+            ctApi.invalidateMetadata(targetCaseId);
+            const fullVolumeResult = await ctApi.getVolumeBinary(targetCaseId);
+            const fullVolume: VolumeData = {
+                data: fullVolumeResult.data,
+                shape: fullVolumeResult.shape,
+                spacing: fullVolumeResult.spacing,
+                resolution: 'full',
+            };
+
+            globalVolumeCache.set(targetCaseId, fullVolume);
+            setVolume(fullVolume);
+
+            const currentCrosshair = useViewerStore.getState().mprCrosshair;
+            setCrosshair(projectCrosshairToShape(currentVolume.shape, fullVolume.shape, currentCrosshair));
+            imageDataCache.current.clear();
+
+            const refreshedMask = await loadMaskArtifacts(targetCaseId, false);
+            if (!refreshedMask) {
+                globalMaskCache.delete(targetCaseId);
+                setMask(null);
+            }
+
+            console.log('[VolumeViewer] Upgraded preview volume to full resolution for:', targetCaseId);
+            return true;
+        } catch (error) {
+            console.warn('[VolumeViewer] Full-resolution volume not ready yet:', error);
+            return false;
+        }
+    }, [loadMaskArtifacts, projectCrosshairToShape, setCrosshair]);
 
     /**
      * Load volume data from backend (with global deduplication)
@@ -235,6 +339,38 @@ export function useVolumeViewer(caseId: string | null) {
             loadVolume();
         }
     }, [caseId, loadVolume]);
+
+    useEffect(() => {
+        if (!caseId || !volume) {
+            return;
+        }
+
+        let cancelled = false;
+
+        const refreshArtifacts = async () => {
+            if (artifactRefreshVersion > 0 && volume.resolution === 'preview') {
+                const upgraded = await upgradePreviewVolume(caseId, volume);
+                if (cancelled) {
+                    return;
+                }
+                if (upgraded) {
+                    return;
+                }
+            }
+
+            const refreshed = await loadMaskArtifacts(caseId, volume.resolution === 'preview');
+            if (cancelled || !refreshed) {
+                return;
+            }
+            imageDataCache.current.clear();
+        };
+
+        void refreshArtifacts();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [artifactRefreshVersion, caseId, loadMaskArtifacts, upgradePreviewVolume, volume]);
 
     /**
      * Get dimensions for a specific view
@@ -483,6 +619,34 @@ export function useVolumeViewer(caseId: string | null) {
 
         const strideX = dimY * dimZ;
         const strideY = dimZ;
+        const viewerState = useViewerStore.getState();
+        const hasRenderableManifestLabels = viewerState.segmentationLabels.some(
+            (label) => label.available && label.render_2d
+        );
+        const activeLabels = viewerState.segmentationLabels
+            .filter((label) => Boolean(label.available && label.render_2d))
+            .filter((label) => viewerState.segmentationVisibility[label.key] ?? label.available);
+        const labelColors = new Map<number, { r: number; g: number; b: number }>();
+
+        activeLabels.forEach((label) => {
+            const color = hexToRgb(label.color);
+            if (color) {
+                labelColors.set(label.label_id, color);
+            }
+        });
+
+        const fallbackColor = { r: 239, g: 68, b: 68 };
+        const resolveVoxelColor = (value: number) => {
+            if (value <= 0) {
+                return null;
+            }
+
+            if (!hasRenderableManifestLabels) {
+                return fallbackColor;
+            }
+
+            return labelColors.get(value) ?? null;
+        };
 
         switch (view) {
             case 'AXIAL': {
@@ -491,10 +655,11 @@ export function useVolumeViewer(caseId: string | null) {
                     for (let x = 0; x < dimX; x++) {
                         const srcIdx = x * strideX + y * strideY + index;
                         const dstIdx = (x + y * width) << 2;
-                        if (data[srcIdx] > 0) {
-                            pixels[dstIdx] = 239;     // R
-                            pixels[dstIdx + 1] = 68;  // G
-                            pixels[dstIdx + 2] = 68;  // B
+                        const color = resolveVoxelColor(data[srcIdx]);
+                        if (color) {
+                            pixels[dstIdx] = color.r;
+                            pixels[dstIdx + 1] = color.g;
+                            pixels[dstIdx + 2] = color.b;
                             pixels[dstIdx + 3] = 200;
                         }
                     }
@@ -508,10 +673,11 @@ export function useVolumeViewer(caseId: string | null) {
                     for (let x = 0; x < dimX; x++) {
                         const srcIdx = x * strideX + index * strideY + z;
                         const dstIdx = (x + (dimZ - 1 - z) * width) << 2;
-                        if (data[srcIdx] > 0) {
-                            pixels[dstIdx] = 239;
-                            pixels[dstIdx + 1] = 68;
-                            pixels[dstIdx + 2] = 68;
+                        const color = resolveVoxelColor(data[srcIdx]);
+                        if (color) {
+                            pixels[dstIdx] = color.r;
+                            pixels[dstIdx + 1] = color.g;
+                            pixels[dstIdx + 2] = color.b;
                             pixels[dstIdx + 3] = 200;
                         }
                     }
@@ -525,10 +691,11 @@ export function useVolumeViewer(caseId: string | null) {
                     for (let y = 0; y < dimY; y++) {
                         const srcIdx = index * strideX + y * strideY + z;
                         const dstIdx = (y + (dimZ - 1 - z) * width) << 2;
-                        if (data[srcIdx] > 0) {
-                            pixels[dstIdx] = 239;
-                            pixels[dstIdx + 1] = 68;
-                            pixels[dstIdx + 2] = 68;
+                        const color = resolveVoxelColor(data[srcIdx]);
+                        if (color) {
+                            pixels[dstIdx] = color.r;
+                            pixels[dstIdx + 1] = color.g;
+                            pixels[dstIdx + 2] = color.b;
                             pixels[dstIdx + 3] = 200;
                         }
                     }
@@ -648,6 +815,9 @@ export function useVolumeViewer(caseId: string | null) {
         prerenderAdjacent('SAGITTAL', crosshair.x, windowPreset);
     }, [crosshair, windowPreset, volume, prerenderAdjacent]);
 
+    // Compatibility placeholder for viewers expecting manifest metadata.
+    const segmentationManifest: SegmentationManifest | null = null;
+
     // Computed values
     const isLoaded = volume !== null;
     const hasMask = mask !== null;
@@ -661,6 +831,7 @@ export function useVolumeViewer(caseId: string | null) {
         error,
         isLoaded,
         hasMask,
+        segmentationManifest,
 
         // View settings
         windowPreset,

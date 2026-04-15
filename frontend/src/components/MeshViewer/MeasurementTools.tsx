@@ -1,9 +1,8 @@
-import React, { useState, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useThree, type ThreeEvent } from '@react-three/fiber';
 import { Html, Line } from '@react-three/drei';
 import * as THREE from 'three';
 
-// Types
 export interface MeasurementPoint {
     id: string;
     position: THREE.Vector3;
@@ -16,57 +15,61 @@ export interface Measurement {
     distanceMm: number;
 }
 
-interface MeasurementToolsProps {
-    enabled: boolean;
-    voxelSpacing: [number, number, number];
-    onMeasurementComplete?: (measurement: Measurement) => void;
-}
-
 interface MeasurementDisplayProps {
     measurements: Measurement[];
     pendingPoint: THREE.Vector3 | null;
     cursorPosition: THREE.Vector3 | null;
 }
 
-// Generate unique ID
-const generateId = () => Math.random().toString(36).substr(2, 9);
+const generateId = () => Math.random().toString(36).slice(2, 11);
 
-/**
- * Calculate real-world distance considering voxel spacing
- */
 const calculateDistance = (
     p1: THREE.Vector3,
     p2: THREE.Vector3,
     voxelSpacing: [number, number, number]
 ): number => {
-    // Apply voxel spacing to convert from model units to mm
     const dx = (p2.x - p1.x) * voxelSpacing[0];
     const dy = (p2.y - p1.y) * voxelSpacing[1];
     const dz = (p2.z - p1.z) * voxelSpacing[2];
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
 };
 
-/**
- * Point Marker Component
- * Renders a small sphere at measurement point
- */
+const isMeasurementDecoration = (object: THREE.Object3D | null | undefined): boolean => {
+    if (!object) {
+        return false;
+    }
+
+    return object.name.includes('measurement') || object.parent?.name.includes('measurement') === true;
+};
+
+const resolveMeasurementIntersection = (
+    eventIntersections: THREE.Intersection<THREE.Object3D>[],
+    raycaster: THREE.Raycaster,
+    raycastTargets: THREE.Object3D[]
+): THREE.Intersection<THREE.Object3D> | undefined => {
+    const fromEvent = eventIntersections.find(
+        (intersection) => intersection.object instanceof THREE.Mesh && !isMeasurementDecoration(intersection.object)
+    );
+    if (fromEvent) {
+        return fromEvent;
+    }
+
+    return raycaster
+        .intersectObjects(raycastTargets, true)
+        .find((intersection) => intersection.object instanceof THREE.Mesh && !isMeasurementDecoration(intersection.object));
+};
+
 const PointMarker: React.FC<{
     position: THREE.Vector3;
     color?: string;
     size?: number;
-}> = ({ position, color = '#22c55e', size = 3 }) => {
-    return (
-        <mesh position={position}>
-            <sphereGeometry args={[size, 16, 16]} />
-            <meshBasicMaterial color={color} />
-        </mesh>
-    );
-};
+}> = ({ position, color = '#22c55e', size = 3 }) => (
+    <mesh position={position}>
+        <sphereGeometry args={[size, 16, 16]} />
+        <meshBasicMaterial color={color} />
+    </mesh>
+);
 
-/**
- * Distance Label Component
- * Shows distance value at midpoint of measurement line
- */
 const DistanceLabel: React.FC<{
     startPoint: THREE.Vector3;
     endPoint: THREE.Vector3;
@@ -80,8 +83,7 @@ const DistanceLabel: React.FC<{
         );
     }, [startPoint, endPoint]);
 
-    // Format distance
-    const displayValue = distanceMm >= 10 
+    const displayValue = distanceMm >= 10
         ? `${distanceMm.toFixed(1)} mm`
         : `${distanceMm.toFixed(2)} mm`;
 
@@ -108,10 +110,6 @@ const DistanceLabel: React.FC<{
     );
 };
 
-/**
- * Measurement Display Component
- * Renders all measurements (lines, points, labels)
- */
 export const MeasurementDisplay: React.FC<MeasurementDisplayProps> = ({
     measurements,
     pendingPoint,
@@ -119,34 +117,27 @@ export const MeasurementDisplay: React.FC<MeasurementDisplayProps> = ({
 }) => {
     return (
         <group name="measurements">
-            {/* Completed measurements */}
-            {measurements.map((m) => (
-                <group key={m.id}>
-                    {/* Line between points */}
+            {measurements.map((measurement) => (
+                <group key={measurement.id}>
                     <Line
-                        points={[m.startPoint.position, m.endPoint.position]}
+                        points={[measurement.startPoint.position, measurement.endPoint.position]}
                         color="#22c55e"
                         lineWidth={2}
                         dashed={false}
                     />
-                    {/* Start point marker */}
-                    <PointMarker position={m.startPoint.position} />
-                    {/* End point marker */}
-                    <PointMarker position={m.endPoint.position} />
-                    {/* Distance label */}
+                    <PointMarker position={measurement.startPoint.position} />
+                    <PointMarker position={measurement.endPoint.position} />
                     <DistanceLabel
-                        startPoint={m.startPoint.position}
-                        endPoint={m.endPoint.position}
-                        distanceMm={m.distanceMm}
+                        startPoint={measurement.startPoint.position}
+                        endPoint={measurement.endPoint.position}
+                        distanceMm={measurement.distanceMm}
                     />
                 </group>
             ))}
 
-            {/* Pending measurement (first point selected, waiting for second) */}
             {pendingPoint && (
                 <>
                     <PointMarker position={pendingPoint} color="#f59e0b" />
-                    {/* Preview line to cursor */}
                     {cursorPosition && (
                         <Line
                             points={[pendingPoint, cursorPosition]}
@@ -161,90 +152,117 @@ export const MeasurementDisplay: React.FC<MeasurementDisplayProps> = ({
     );
 };
 
-/**
- * Measurement Click Handler Component
- * Handles raycasting and point selection
- */
 export const MeasurementClickHandler: React.FC<{
     enabled: boolean;
     voxelSpacing: [number, number, number];
-    measurements: Measurement[];
     setMeasurements: React.Dispatch<React.SetStateAction<Measurement[]>>;
     pendingPoint: THREE.Vector3 | null;
     setPendingPoint: React.Dispatch<React.SetStateAction<THREE.Vector3 | null>>;
     setCursorPosition: React.Dispatch<React.SetStateAction<THREE.Vector3 | null>>;
+    targetObjects?: THREE.Object3D[];
 }> = ({
     enabled,
     voxelSpacing,
-    measurements,
     setMeasurements,
     pendingPoint,
     setPendingPoint,
     setCursorPosition,
+    targetObjects,
 }) => {
-    const { camera, raycaster, scene } = useThree();
+    const { raycaster, scene, invalidate } = useThree();
+    const moveFrameRef = useRef<number | null>(null);
+    const latestMoveEventRef = useRef<ThreeEvent<PointerEvent> | null>(null);
 
-    // Handle pointer move for preview line
-    const handlePointerMove = useCallback((event: ThreeEvent<PointerEvent>) => {
-        if (!enabled || !pendingPoint) return;
-        
-        // Get intersection point with mesh
-        const intersects = raycaster.intersectObjects(scene.children, true);
-        const meshIntersect = intersects.find(
-            (i) => i.object.type === 'Mesh' && i.object.name !== 'measurements'
-        );
-        
-        if (meshIntersect) {
-            setCursorPosition(meshIntersect.point.clone());
+    const raycastTargets = useMemo(() => {
+        const scopedTargets = targetObjects?.filter((object) => !isMeasurementDecoration(object));
+        if (scopedTargets && scopedTargets.length > 0) {
+            return scopedTargets;
         }
-    }, [enabled, pendingPoint, raycaster, scene, setCursorPosition]);
 
-    // Handle click to add measurement point
-    const handleClick = useCallback((event: ThreeEvent<MouseEvent>) => {
-        if (!enabled) return;
+        return scene.children.filter((object) => !isMeasurementDecoration(object));
+    }, [scene, targetObjects]);
 
-        // Prevent event propagation
+    const handlePointerMove = useCallback((event: ThreeEvent<PointerEvent>) => {
+        if (!enabled || !pendingPoint) {
+            return;
+        }
+
+        latestMoveEventRef.current = event;
+        if (moveFrameRef.current !== null) {
+            return;
+        }
+
+        moveFrameRef.current = window.requestAnimationFrame(() => {
+            moveFrameRef.current = null;
+            const latestEvent = latestMoveEventRef.current;
+            if (!latestEvent) {
+                return;
+            }
+
+            const intersection = resolveMeasurementIntersection(
+                latestEvent.intersections,
+                raycaster,
+                raycastTargets
+            );
+
+            setCursorPosition(intersection?.point.clone() ?? null);
+            invalidate();
+        });
+    }, [enabled, invalidate, pendingPoint, raycastTargets, raycaster, setCursorPosition]);
+
+    const handleClick = useCallback((event: ThreeEvent<PointerEvent>) => {
+        if (!enabled) {
+            return;
+        }
+
         event.stopPropagation();
 
-        // Get intersection point with mesh
-        const intersects = raycaster.intersectObjects(scene.children, true);
-        const meshIntersect = intersects.find(
-            (i) => i.object.type === 'Mesh' && 
-                   !i.object.name.includes('measurement') &&
-                   !i.object.parent?.name.includes('measurement')
+        const intersection = resolveMeasurementIntersection(
+            event.intersections,
+            raycaster,
+            raycastTargets
         );
+        if (!intersection) {
+            return;
+        }
 
-        if (!meshIntersect) return;
-
-        const clickedPoint = meshIntersect.point.clone();
+        const clickedPoint = intersection.point.clone();
 
         if (!pendingPoint) {
-            // First point - start new measurement
             setPendingPoint(clickedPoint);
-        } else {
-            // Second point - complete measurement
-            const distance = calculateDistance(pendingPoint, clickedPoint, voxelSpacing);
-            
-            const newMeasurement: Measurement = {
-                id: generateId(),
-                startPoint: {
-                    id: generateId(),
-                    position: pendingPoint,
-                },
-                endPoint: {
-                    id: generateId(),
-                    position: clickedPoint,
-                },
-                distanceMm: distance,
-            };
-
-            setMeasurements((prev) => [...prev, newMeasurement]);
-            setPendingPoint(null);
-            setCursorPosition(null);
+            setCursorPosition(clickedPoint);
+            invalidate();
+            return;
         }
-    }, [enabled, pendingPoint, raycaster, scene, voxelSpacing, setMeasurements, setPendingPoint, setCursorPosition]);
 
-    // Invisible plane to catch all clicks when measurement mode is active
+        const distance = calculateDistance(pendingPoint, clickedPoint, voxelSpacing);
+        const newMeasurement: Measurement = {
+            id: generateId(),
+            startPoint: {
+                id: generateId(),
+                position: pendingPoint,
+            },
+            endPoint: {
+                id: generateId(),
+                position: clickedPoint,
+            },
+            distanceMm: distance,
+        };
+
+        setMeasurements((prev) => [...prev, newMeasurement]);
+        setPendingPoint(null);
+        setCursorPosition(null);
+        invalidate();
+    }, [enabled, invalidate, pendingPoint, raycastTargets, raycaster, setCursorPosition, setMeasurements, setPendingPoint, voxelSpacing]);
+
+    useEffect(() => {
+        return () => {
+            if (moveFrameRef.current !== null) {
+                window.cancelAnimationFrame(moveFrameRef.current);
+            }
+        };
+    }, []);
+
     if (!enabled) return null;
 
     return (
@@ -260,10 +278,6 @@ export const MeasurementClickHandler: React.FC<{
     );
 };
 
-/**
- * Main Measurement Tools Hook
- * Manages measurement state and provides components
- */
 export const useMeasurementTools = (voxelSpacing: [number, number, number]) => {
     const [measurements, setMeasurements] = useState<Measurement[]>([]);
     const [pendingPoint, setPendingPoint] = useState<THREE.Vector3 | null>(null);
@@ -282,13 +296,12 @@ export const useMeasurementTools = (voxelSpacing: [number, number, number]) => {
     }, []);
 
     const deleteMeasurement = useCallback((id: string) => {
-        setMeasurements((prev) => prev.filter((m) => m.id !== id));
+        setMeasurements((prev) => prev.filter((measurement) => measurement.id !== id));
     }, []);
 
     const toggleMeasurementMode = useCallback(() => {
         setMeasurementMode((prev) => {
             if (prev) {
-                // Turning off - cancel pending
                 setPendingPoint(null);
                 setCursorPosition(null);
             }

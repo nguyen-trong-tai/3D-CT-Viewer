@@ -45,7 +45,10 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     const containerRef = useRef<HTMLDivElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+    const firstFrameMeasuredRef = useRef(false);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+    const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
+    const segmentationVisibility = useViewerStore((state) => state.segmentationVisibility);
 
     const {
         isLoaded,
@@ -100,6 +103,11 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         }
     }, [windowPreset, setHookWindowPreset]);
 
+    useEffect(() => {
+        firstFrameMeasuredRef.current = false;
+        performance.mark(`case-first-2d-frame-start:${caseId}:${viewType}`);
+    }, [caseId, viewType]);
+
     // Render slice to canvas - use custom window if enabled
     const imageData = isLoaded
         ? (useCustomWindow
@@ -131,8 +139,17 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         const ctx = canvas.getContext('2d', { alpha: false });
         if (ctx) {
             ctx.putImageData(imageData, 0, 0);
+            if (!firstFrameMeasuredRef.current) {
+                firstFrameMeasuredRef.current = true;
+                performance.mark(`case-first-2d-frame-complete:${caseId}:${viewType}`);
+                performance.measure(
+                    `case-first-2d-frame:${caseId}:${viewType}`,
+                    `case-first-2d-frame-start:${caseId}:${viewType}`,
+                    `case-first-2d-frame-complete:${caseId}:${viewType}`
+                );
+            }
         }
-    }, [imageData, loading]);
+    }, [caseId, imageData, loading, viewType]);
 
     // Render mask overlay
     useEffect(() => {
@@ -157,7 +174,7 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
             // Clear mask when not showing
             ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
         }
-    }, [maskImageData, showSegmentation, segmentationOpacity, loading]);
+    }, [maskImageData, showSegmentation, segmentationOpacity, loading, segmentationLabels, segmentationVisibility]);
 
     const sliceCount = dims?.maxSlice || totalSlices;
     const spacingAspect = dims ? (dims.spacing.y / dims.spacing.x) : 1;
@@ -298,39 +315,6 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
             >
                 {viewLabel}
             </div>
-
-            {/* Segmentation Indicator */}
-            {showSegmentation && hasMask && (
-                <div
-                    style={{
-                        position: 'absolute',
-                        top: 36,
-                        left: 8,
-                        zIndex: 10,
-                        background: 'rgba(239, 68, 68, 0.2)',
-                        backdropFilter: 'blur(4px)',
-                        padding: '3px 8px',
-                        borderRadius: 4,
-                        fontSize: '0.65rem',
-                        fontWeight: 500,
-                        color: '#ef4444',
-                        border: '1px solid rgba(239, 68, 68, 0.4)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 4,
-                    }}
-                >
-                    <span
-                        style={{
-                            width: 6,
-                            height: 6,
-                            borderRadius: '50%',
-                            background: '#ef4444',
-                        }}
-                    />
-                    Segmentation {Math.round(segmentationOpacity * 100)}%
-                </div>
-            )}
 
             {/* Slice Counter */}
             <div

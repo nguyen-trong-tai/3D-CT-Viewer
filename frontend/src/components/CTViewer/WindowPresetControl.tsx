@@ -22,16 +22,14 @@ export function useOnClickOutside(ref: React.RefObject<HTMLElement | null>, hand
 }
 
 export const WindowPresetControl = () => {
-    const {
-        windowPreset,
-        applyPreset,
-        useCustomWindow,
-        setUseCustomWindow,
-        customWindowLevel,
-        setCustomWindowLevel,
-        customWindowWidth,
-        setCustomWindowWidth,
-    } = useViewerStore();
+    const windowPreset = useViewerStore(state => state.windowPreset);
+    const applyPreset = useViewerStore(state => state.applyPreset);
+    const useCustomWindow = useViewerStore(state => state.useCustomWindow);
+    const setUseCustomWindow = useViewerStore(state => state.setUseCustomWindow);
+    const customWindowLevel = useViewerStore(state => state.customWindowLevel);
+    const setCustomWindowLevel = useViewerStore(state => state.setCustomWindowLevel);
+    const customWindowWidth = useViewerStore(state => state.customWindowWidth);
+    const setCustomWindowWidth = useViewerStore(state => state.setCustomWindowWidth);
 
     const [isOpen, setIsOpen] = useState(false);
     const ref = useRef<HTMLDivElement>(null);

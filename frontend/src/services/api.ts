@@ -6,6 +6,7 @@
  */
 
 import axios from 'axios';
+import JSZip from 'jszip';
 
 // API base — empty string uses Vite proxy in dev, override with VITE_API_URL for production
 const API_BASE = import.meta.env.VITE_API_URL || '';
@@ -15,6 +16,30 @@ const DIRECT_DICOM_SIZE_THRESHOLD_BYTES = 32 * 1024 * 1024;
 const DICOM_BATCH_FILE_LIMIT = 128;
 const DICOM_BATCH_TARGET_BYTES = 48 * 1024 * 1024;
 const DEFAULT_DIRECT_UPLOAD_CONCURRENCY = 4;
+const METADATA_CACHE_TTL_MS = 5_000;
+const DICOM_BUNDLE_PROGRESS_MAX = 32;
+const DICOM_BUNDLE_SOFT_LIMIT_BYTES = 768 * 1024 * 1024;
+const BROWSER_DICOM_BUNDLE_FILE_THRESHOLD = 128;
+const BROWSER_DICOM_BUNDLE_SIZE_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const KNOWN_NON_DICOM_SUFFIXES = [
+    '.json',
+    '.txt',
+    '.csv',
+    '.md',
+    '.xml',
+    '.html',
+    '.htm',
+    '.pdf',
+    '.jpg',
+    '.jpeg',
+    '.png',
+    '.gif',
+    '.bmp',
+    '.webp',
+    '.nii',
+    '.nii.gz',
+    '.zip',
+];
 
 // Type Definitions (matching backend schemas)
 
@@ -27,6 +52,23 @@ export interface StatusResponse {
     case_id: string;
     status: 'pending' | 'uploading' | 'uploaded' | 'processing' | 'ready' | 'error';
     message?: string;
+    expires_at?: string;
+    current_stage?: string;
+    progress_percent?: number;
+}
+
+export interface CaseEventPayload {
+    type: 'upload_status' | 'pipeline_stage' | 'artifact_ready' | 'case_ready' | 'case_error';
+    case_id: string;
+    status?: StatusResponse['status'];
+    stage?: string;
+    artifact?: string;
+    message?: string;
+    progress_percent?: number;
+    current_stage?: string;
+    duration_seconds?: number;
+    snapshot?: PipelineSnapshot;
+    timestamp: string;
 }
 
 export interface ProcessingResponse {
@@ -76,6 +118,26 @@ export interface MaskSliceData {
     slice_index: number;
     mask: number[][];
     sparse: boolean;
+    labels_present: number[];
+}
+
+export interface SegmentationLabel {
+    label_id: number;
+    key: string;
+    display_name: string;
+    color: string;
+    available: boolean;
+    visible_by_default: boolean;
+    render_2d: boolean;
+    render_3d: boolean;
+    voxel_count: number;
+    mesh_component_name?: string | null;
+}
+
+export interface SegmentationManifest {
+    case_id: string;
+    labels: SegmentationLabel[];
+    has_labeled_mask: boolean;
 }
 
 export interface ArtifactList {
@@ -83,15 +145,23 @@ export interface ArtifactList {
     artifacts: Record<string, boolean>;
 }
 
-export interface PipelineStatus {
-    case_id: string;
+export interface PipelineStageSnapshot {
+    name: string;
+    status: string;
+    duration_seconds?: number;
+    message?: string;
+    output_shape?: number[] | null;
+}
+
+export interface PipelineSnapshot {
     overall_status: string;
-    is_running: boolean;
-    stages: Array<{
-        name: string;
-        status: string;
-    }>;
+    stages: PipelineStageSnapshot[];
     artifacts: Record<string, boolean>;
+}
+
+export interface PipelineStatus extends PipelineSnapshot {
+    case_id: string;
+    is_running: boolean;
 }
 
 interface BatchUploadProgress {
@@ -151,6 +221,83 @@ type BinaryMaskPayload = {
 };
 
 const metadataCache = new Map<string, CTMetadata>();
+const metadataCacheExpiry = new Map<string, number>();
+const segmentationManifestCache = new Map<string, SegmentationManifest>();
+const metadataLoadingPromises = new Map<string, Promise<CTMetadata>>();
+const artifactUrlCache = new Map<string, { url: string; expiresAt: number }>();
+const artifactUrlLoadingPromises = new Map<string, Promise<string | null>>();
+type CaseEventHandler = (payload: CaseEventPayload) => void;
+type CaseEventErrorHandler = (event: Event) => void;
+
+type SharedCaseEventSource = {
+    source: EventSource;
+    listeners: Set<CaseEventHandler>;
+    errorListeners: Set<CaseEventErrorHandler>;
+};
+
+const caseEventSources = new Map<string, SharedCaseEventSource>();
+
+const createCaseEventUrl = (caseId: string) => `${API_V1}/cases/${caseId}/events`;
+
+const isTerminalCaseEvent = (payload: CaseEventPayload) =>
+    payload.type === 'case_ready' ||
+    payload.type === 'case_error' ||
+    payload.status === 'ready' ||
+    payload.status === 'error' ||
+    payload.snapshot?.overall_status === 'ready' ||
+    payload.snapshot?.overall_status === 'error';
+
+const closeSharedCaseEventSource = (caseId: string) => {
+    const shared = caseEventSources.get(caseId);
+    if (!shared) {
+        return;
+    }
+
+    shared.source.close();
+    caseEventSources.delete(caseId);
+};
+
+const invalidateCaseMetadataCache = (caseId: string) => {
+    metadataCache.delete(caseId);
+    metadataCacheExpiry.delete(caseId);
+    metadataLoadingPromises.delete(caseId);
+};
+
+const ensureSharedCaseEventSource = (caseId: string): SharedCaseEventSource | null => {
+    if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') {
+        return null;
+    }
+
+    const existing = caseEventSources.get(caseId);
+    if (existing) {
+        return existing;
+    }
+
+    const shared: SharedCaseEventSource = {
+        source: new window.EventSource(createCaseEventUrl(caseId)),
+        listeners: new Set<CaseEventHandler>(),
+        errorListeners: new Set<CaseEventErrorHandler>(),
+    };
+
+    shared.source.onmessage = (event) => {
+        try {
+            const payload = JSON.parse(event.data) as CaseEventPayload;
+            shared.listeners.forEach((listener) => listener(payload));
+            if (isTerminalCaseEvent(payload)) {
+                closeSharedCaseEventSource(caseId);
+            }
+        } catch (error) {
+            console.warn('[casesApi] Failed to parse case event payload:', error);
+        }
+    };
+
+    shared.source.onerror = (event) => {
+        shared.errorListeners.forEach((listener) => listener(event));
+    };
+
+    caseEventSources.set(caseId, shared);
+    return shared;
+};
 
 const createUploadChunks = (files: File[]): UploadChunk[] => {
     const chunks: UploadChunk[] = [];
@@ -177,6 +324,27 @@ const createUploadChunks = (files: File[]): UploadChunk[] => {
     }
 
     return chunks;
+};
+
+const shouldBundleDicomFolder = (fileCount: number, totalBytes: number) =>
+    fileCount <= BROWSER_DICOM_BUNDLE_FILE_THRESHOLD &&
+    totalBytes <= BROWSER_DICOM_BUNDLE_SIZE_THRESHOLD_BYTES;
+
+export const isLikelyDicomFile = (file: File): boolean => {
+    const lowerName = file.name.toLowerCase();
+    if (lowerName === 'metadata.json') {
+        return false;
+    }
+
+    if (
+        lowerName.endsWith('.dcm') ||
+        lowerName.endsWith('.dicom') ||
+        lowerName.endsWith('.ima')
+    ) {
+        return true;
+    }
+
+    return !KNOWN_NON_DICOM_SUFFIXES.some((suffix) => lowerName.endsWith(suffix)) && !lowerName.includes('.');
 };
 
 const postFormDataWithProgress = <T>(
@@ -274,8 +442,21 @@ const spacingToTuple = (spacing: VoxelSpacing): [number, number, number] => [
 ];
 
 const fetchArtifactUrl = async (url: string): Promise<string | null> => {
+    const cached = artifactUrlCache.get(url);
+    if (cached && cached.expiresAt > Date.now()) {
+        return cached.url;
+    }
+
+    const existingPromise = artifactUrlLoadingPromises.get(url);
+    if (existingPromise) {
+        return existingPromise;
+    }
+
+    const loadPromise = (async () => {
     try {
         const response = await axios.get<ArtifactUrlResponse>(url);
+        const expiresAt = Date.now() + Math.max((response.data.expires_in_seconds - 30) * 1000, 30_000);
+        artifactUrlCache.set(url, { url: response.data.url, expiresAt });
         return response.data.url;
     } catch (error) {
         if (axios.isAxiosError(error) && error.response?.status === 404) {
@@ -283,6 +464,12 @@ const fetchArtifactUrl = async (url: string): Promise<string | null> => {
         }
         throw error;
     }
+    })().finally(() => {
+        artifactUrlLoadingPromises.delete(url);
+    });
+
+    artifactUrlLoadingPromises.set(url, loadPromise);
+    return loadPromise;
 };
 
 const fetchArrayBuffer = async (
@@ -535,6 +722,195 @@ const uploadBatchChunkViaApi = async (
     );
 };
 
+const createBundledDicomArchive = async (
+    files: File[],
+    onProgress: (percent: number, label: string) => void,
+    metadata?: Record<string, unknown>
+): Promise<File> => {
+    if (files.length === 0) {
+        throw new Error('No DICOM files found to package.');
+    }
+
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const totalSizeMB = (totalBytes / 1024 / 1024).toFixed(1);
+    if (totalBytes > DICOM_BUNDLE_SOFT_LIMIT_BYTES) {
+        throw new Error(
+            `DICOM folder is ${totalSizeMB}MB, exceeding the browser bundle limit. Falling back to multi-file upload.`
+        );
+    }
+
+    const zip = new JSZip();
+    files.forEach((file, index) => {
+        const entryName = `dicom/${String(index + 1).padStart(4, '0')}_${file.name}`;
+        zip.file(entryName, file);
+    });
+
+    if (metadata && Object.keys(metadata).length > 0) {
+        zip.file('metadata.json', JSON.stringify(metadata, null, 2));
+    }
+
+    onProgress(0, `Packaging DICOM archive (${files.length} files, ${totalSizeMB}MB)...`);
+    const blob = await zip.generateAsync(
+        {
+            type: 'blob',
+            compression: 'STORE',
+            streamFiles: true,
+            mimeType: 'application/zip',
+        },
+        (zipProgress) => {
+            const percent = Math.round(
+                (Math.max(0, Math.min(100, zipProgress.percent)) / 100) * DICOM_BUNDLE_PROGRESS_MAX
+            );
+            onProgress(percent, `Packaging DICOM archive (${files.length} files, ${totalSizeMB}MB)...`);
+        }
+    );
+
+    return new File([blob], `dicom-series-${Date.now()}.zip`, { type: 'application/zip' });
+};
+
+const uploadBundledDicomArchive = async (
+    archiveFile: File,
+    fileCount: number,
+    totalBytes: number,
+    onProgress: (percent: number, label: string) => void
+): Promise<CaseResponse> => {
+    const formData = new FormData();
+    formData.append('file', archiveFile, archiveFile.name);
+
+    return postFormDataWithProgress<CaseResponse>(`${API_V1}/cases`, formData, (loaded, total) => {
+        if (total <= 0) {
+            return;
+        }
+
+        const uploadProgress = loaded / total;
+        const percent = DICOM_BUNDLE_PROGRESS_MAX + Math.round(uploadProgress * (100 - DICOM_BUNDLE_PROGRESS_MAX));
+        const totalSizeMB = (totalBytes / 1024 / 1024).toFixed(1);
+        onProgress(
+            Math.min(100, percent),
+            `Uploading DICOM archive (${fileCount} files, ${totalSizeMB}MB)...`
+        );
+    });
+};
+
+const uploadDicomFolderLegacy = async (
+    files: File[],
+    onProgress: (percent: number, label: string) => void,
+    metadata?: Record<string, unknown>
+): Promise<CaseResponse> => {
+    const startTime = performance.now();
+    const dcmFiles = files.filter(isLikelyDicomFile);
+    const totalBytes = dcmFiles.reduce((sum, file) => sum + file.size, 0);
+
+    onProgress(0, `Preparing ${dcmFiles.length} files...`);
+
+    if (
+        dcmFiles.length <= DIRECT_DICOM_FILE_THRESHOLD &&
+        totalBytes <= DIRECT_DICOM_SIZE_THRESHOLD_BYTES
+    ) {
+        const formData = new FormData();
+        for (const file of dcmFiles) {
+            formData.append('files', file, file.name);
+        }
+        if (metadata && Object.keys(metadata).length > 0) {
+            formData.append('metadata', JSON.stringify(metadata));
+        }
+
+        const response = await postFormDataWithProgress<CaseResponse>(
+            `${API_V1}/cases/dicom`,
+            formData,
+            (loaded, total) => {
+                if (total > 0) {
+                    const percent = Math.round((loaded / total) * 100);
+                    const sizeMB = (total / 1024 / 1024).toFixed(1);
+                    onProgress(percent, `Uploading ${dcmFiles.length} files (${sizeMB}MB)...`);
+                }
+            }
+        );
+
+        const totalTime = performance.now() - startTime;
+        console.log(`Direct DICOM upload time: ${(totalTime / 1000).toFixed(2)}s`);
+        onProgress(100, 'Upload complete!');
+        return response;
+    }
+
+    const initResponse = await axios.post<BatchInitResponse>(`${API_V1}/cases/batch/init`);
+    const chunks = createUploadChunks(dcmFiles);
+    let uploadedBytes = 0;
+    let useDirectUpload =
+        initResponse.data.storage_kind === 'object_store' &&
+        Boolean(initResponse.data.direct_upload_enabled);
+    const uploadConcurrency = Math.max(
+        1,
+        initResponse.data.recommended_upload_concurrency ?? DEFAULT_DIRECT_UPLOAD_CONCURRENCY
+    );
+
+    for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        if (useDirectUpload) {
+            try {
+                await uploadBatchChunkDirect(
+                    initResponse.data.case_id,
+                    chunk,
+                    index,
+                    chunks.length,
+                    dcmFiles.length,
+                    totalBytes,
+                    uploadedBytes,
+                    onProgress,
+                    uploadConcurrency
+                );
+            } catch (error) {
+                console.warn('[casesApi] Direct upload failed, falling back to API relay upload:', error);
+                useDirectUpload = false;
+                onProgress(
+                    totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0,
+                    'Direct cloud upload unavailable. Falling back to server relay...'
+                );
+                await uploadBatchChunkViaApi(
+                    initResponse.data.case_id,
+                    chunk,
+                    index,
+                    chunks.length,
+                    dcmFiles.length,
+                    totalBytes,
+                    uploadedBytes,
+                    onProgress
+                );
+            }
+        } else {
+            await uploadBatchChunkViaApi(
+                initResponse.data.case_id,
+                chunk,
+                index,
+                chunks.length,
+                dcmFiles.length,
+                totalBytes,
+                uploadedBytes,
+                onProgress
+            );
+        }
+
+        uploadedBytes += chunk.totalBytes;
+    }
+
+    const finalizeFormData = new FormData();
+    if (metadata && Object.keys(metadata).length > 0) {
+        finalizeFormData.append('metadata', JSON.stringify(metadata));
+    }
+
+    const response = await postFormDataWithProgress<CaseResponse>(
+        `${API_V1}/cases/batch/${initResponse.data.case_id}/finalize`,
+        finalizeFormData
+    );
+
+    const totalTime = performance.now() - startTime;
+    console.log(
+        `Chunked DICOM upload time: ${(totalTime / 1000).toFixed(2)}s across ${chunks.length} chunks`
+    );
+    onProgress(100, 'Upload complete!');
+    return response;
+};
+
 // Cases API - Upload and Processing
 
 export const casesApi = {
@@ -576,118 +952,44 @@ export const casesApi = {
         metadata?: Record<string, unknown>
     ): Promise<CaseResponse> => {
         const startTime = performance.now();
-        const dcmFiles = files.filter((f) => f.name.toLowerCase().endsWith('.dcm'));
+        const dcmFiles = files.filter(isLikelyDicomFile);
         const totalBytes = dcmFiles.reduce((sum, file) => sum + file.size, 0);
+        const totalSizeMB = (totalBytes / 1024 / 1024).toFixed(1);
 
-        onProgress(0, `Preparing ${dcmFiles.length} files...`);
+        if (dcmFiles.length === 0) {
+            throw new Error('No DICOM files found in the selected folder.');
+        }
 
-        if (
-            dcmFiles.length <= DIRECT_DICOM_FILE_THRESHOLD &&
-            totalBytes <= DIRECT_DICOM_SIZE_THRESHOLD_BYTES
-        ) {
-            const formData = new FormData();
-            for (const file of dcmFiles) {
-                formData.append('files', file, file.name);
-            }
-            if (metadata && Object.keys(metadata).length > 0) {
-                formData.append('metadata', JSON.stringify(metadata));
-            }
+        if (!shouldBundleDicomFolder(dcmFiles.length, totalBytes)) {
+            onProgress(
+                0,
+                `Large DICOM folder detected (${dcmFiles.length} files, ${totalSizeMB}MB). Using multi-file upload...`
+            );
+            return uploadDicomFolderLegacy(dcmFiles, onProgress, metadata);
+        }
 
-            const response = await postFormDataWithProgress<CaseResponse>(
-                `${API_V1}/cases/dicom`,
-                formData,
-                (loaded, total) => {
-                    if (total > 0) {
-                        const percent = Math.round((loaded / total) * 100);
-                        const sizeMB = (total / 1024 / 1024).toFixed(1);
-                        onProgress(percent, `Uploading ${dcmFiles.length} files (${sizeMB}MB)...`);
-                    }
-                }
+        try {
+            const archiveFile = await createBundledDicomArchive(dcmFiles, onProgress, metadata);
+            const response = await uploadBundledDicomArchive(
+                archiveFile,
+                dcmFiles.length,
+                totalBytes,
+                onProgress
             );
 
             const totalTime = performance.now() - startTime;
-            console.log(`Direct DICOM upload time: ${(totalTime / 1000).toFixed(2)}s`);
+            console.log(
+                `Bundled DICOM upload time: ${(totalTime / 1000).toFixed(2)}s for ${dcmFiles.length} files (${totalSizeMB}MB)`
+            );
             onProgress(100, 'Upload complete!');
             return response;
+        } catch (error) {
+            console.warn('[casesApi] Bundled DICOM upload failed, falling back to legacy multi-file upload:', error);
+            onProgress(0, 'Bundling unavailable. Falling back to multi-file upload...');
+            return uploadDicomFolderLegacy(dcmFiles, onProgress, metadata);
         }
-
-        const initResponse = await axios.post<BatchInitResponse>(`${API_V1}/cases/batch/init`);
-        const chunks = createUploadChunks(dcmFiles);
-        let uploadedBytes = 0;
-        let useDirectUpload =
-            initResponse.data.storage_kind === 'object_store' &&
-            Boolean(initResponse.data.direct_upload_enabled);
-        const uploadConcurrency = Math.max(
-            1,
-            initResponse.data.recommended_upload_concurrency ?? DEFAULT_DIRECT_UPLOAD_CONCURRENCY
-        );
-
-        for (let index = 0; index < chunks.length; index++) {
-            const chunk = chunks[index];
-            if (useDirectUpload) {
-                try {
-                    await uploadBatchChunkDirect(
-                        initResponse.data.case_id,
-                        chunk,
-                        index,
-                        chunks.length,
-                        dcmFiles.length,
-                        totalBytes,
-                        uploadedBytes,
-                        onProgress,
-                        uploadConcurrency
-                    );
-                } catch (error) {
-                    console.warn('[casesApi] Direct upload failed, falling back to API relay upload:', error);
-                    useDirectUpload = false;
-                    onProgress(
-                        totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0,
-                        'Direct cloud upload unavailable. Falling back to server relay...'
-                    );
-                    await uploadBatchChunkViaApi(
-                        initResponse.data.case_id,
-                        chunk,
-                        index,
-                        chunks.length,
-                        dcmFiles.length,
-                        totalBytes,
-                        uploadedBytes,
-                        onProgress
-                    );
-                }
-            } else {
-                await uploadBatchChunkViaApi(
-                    initResponse.data.case_id,
-                    chunk,
-                    index,
-                    chunks.length,
-                    dcmFiles.length,
-                    totalBytes,
-                    uploadedBytes,
-                    onProgress
-                );
-            }
-
-            uploadedBytes += chunk.totalBytes;
-        }
-
-        const finalizeFormData = new FormData();
-        if (metadata && Object.keys(metadata).length > 0) {
-            finalizeFormData.append('metadata', JSON.stringify(metadata));
-        }
-
-        const response = await postFormDataWithProgress<CaseResponse>(
-            `${API_V1}/cases/batch/${initResponse.data.case_id}/finalize`,
-            finalizeFormData
-        );
-
-        const totalTime = performance.now() - startTime;
-        console.log(
-            `Chunked DICOM upload time: ${(totalTime / 1000).toFixed(2)}s across ${chunks.length} chunks`
-        );
-        onProgress(100, 'Upload complete!');
-        return response;
     },
+
 
     /**
      * Trigger processing pipeline
@@ -713,12 +1015,55 @@ export const casesApi = {
         return response.data;
     },
 
+    subscribeToCaseEvents: (
+        caseId: string,
+        handlers: {
+            onEvent: CaseEventHandler;
+            onError?: CaseEventErrorHandler;
+        }
+    ): (() => void) => {
+        const shared = ensureSharedCaseEventSource(caseId);
+        if (!shared) {
+            return () => {};
+        }
+
+        shared.listeners.add(handlers.onEvent);
+        if (handlers.onError) {
+            shared.errorListeners.add(handlers.onError);
+        }
+
+        return () => {
+            shared.listeners.delete(handlers.onEvent);
+            if (handlers.onError) {
+                shared.errorListeners.delete(handlers.onError);
+            }
+            if (shared.listeners.size === 0 && shared.errorListeners.size === 0) {
+                closeSharedCaseEventSource(caseId);
+            }
+        };
+    },
+
     /**
      * Delete a case
      */
     deleteCase: async (caseId: string): Promise<void> => {
         await axios.delete(`${API_V1}/cases/${caseId}`);
-        metadataCache.delete(caseId);
+        invalidateCaseMetadataCache(caseId);
+        segmentationManifestCache.delete(caseId);
+        for (const key of Array.from(artifactUrlCache.keys())) {
+            if (key.includes(`/cases/${caseId}/`)) {
+                artifactUrlCache.delete(key);
+            }
+        }
+        for (const key of Array.from(artifactUrlLoadingPromises.keys())) {
+            if (key.includes(`/cases/${caseId}/`)) {
+                artifactUrlLoadingPromises.delete(key);
+            }
+        }
+        const shared = caseEventSources.get(caseId);
+        if (shared) {
+            closeSharedCaseEventSource(caseId);
+        }
     },
 
     /**
@@ -733,13 +1078,38 @@ export const casesApi = {
 // CT API - Volume and Slice Data
 
 export const ctApi = {
+    invalidateMetadata: (caseId: string): void => {
+        invalidateCaseMetadataCache(caseId);
+    },
+
     /**
      * Get CT metadata
      */
     getMetadata: async (caseId: string): Promise<CTMetadata> => {
-        const response = await axios.get(`${API_V1}/cases/${caseId}/metadata`);
-        metadataCache.set(caseId, response.data);
-        return response.data;
+        const cached = metadataCache.get(caseId);
+        const cachedExpiry = metadataCacheExpiry.get(caseId) ?? 0;
+        if (cached && cachedExpiry > Date.now()) {
+            return cached;
+        }
+
+        const existingPromise = metadataLoadingPromises.get(caseId);
+        if (existingPromise) {
+            return existingPromise;
+        }
+
+        const loadPromise = axios
+            .get<CTMetadata>(`${API_V1}/cases/${caseId}/metadata`)
+            .then((response) => {
+                metadataCache.set(caseId, response.data);
+                metadataCacheExpiry.set(caseId, Date.now() + METADATA_CACHE_TTL_MS);
+                return response.data;
+            })
+            .finally(() => {
+                metadataLoadingPromises.delete(caseId);
+            });
+
+        metadataLoadingPromises.set(caseId, loadPromise);
+        return loadPromise;
     },
 
     /**
@@ -826,6 +1196,24 @@ export const ctApi = {
 // Mask API - Segmentation Data
 
 export const maskApi = {
+    getSegmentationManifest: async (caseId: string): Promise<SegmentationManifest | null> => {
+        const cached = segmentationManifestCache.get(caseId);
+        if (cached) {
+            return cached;
+        }
+
+        try {
+            const response = await axios.get<SegmentationManifest>(`${API_V1}/cases/${caseId}/segmentation/manifest`);
+            segmentationManifestCache.set(caseId, response.data);
+            return response.data;
+        } catch (error) {
+            if (axios.isAxiosError(error) && error.response?.status === 404) {
+                return null;
+            }
+            throw error;
+        }
+    },
+
     /**
      * Fetch single segmentation mask slice
      */

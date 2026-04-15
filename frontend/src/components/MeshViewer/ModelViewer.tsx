@@ -1,12 +1,13 @@
-import React, { Suspense, useMemo, useCallback, useRef, useEffect } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { PerspectiveCamera, OrbitControls, Grid, Environment, useGLTF } from '@react-three/drei';
+import { PerspectiveCamera, OrbitControls, Grid, useGLTF } from '@react-three/drei';
 import * as THREE from 'three';
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import { meshApi } from '../../services/api';
 import { Box, RotateCcw, Move3d } from 'lucide-react';
 import { useViewerStore } from '../../stores/viewerStore';
 import { DRACO_DECODER_PATH } from '../../utils/draco';
+import type { MeshVisibilityPreset, SegmentationVisibility } from '../../types';
 
 interface ModelViewerProps {
     caseId: string;
@@ -18,16 +19,46 @@ interface ModelViewerProps {
     showGrid?: boolean;
 }
 
+type MeshEntry = {
+    mesh: THREE.Mesh;
+    material: THREE.MeshStandardMaterial;
+    componentKey: string;
+    visibilityKey: string;
+};
+
 const COMPONENT_COLOR_MAP: Record<string, string> = {
     lung: '#ef4444',
     left_lung: '#60a5fa',
     right_lung: '#34d399',
+    nodule: '#f97316',
 };
 
 const FALLBACK_COMPONENT_COLORS = ['#f59e0b', '#a855f7', '#14b8a6', '#fb7185'];
 
 const normalizeComponentKey = (value: string | undefined): string =>
     (value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+
+const findMatchingLabel = (
+    candidateKeys: string[],
+    labels: Array<{
+        key: string;
+        color: string;
+        mesh_component_name?: string | null;
+    }>
+) => {
+    for (const candidateKey of candidateKeys) {
+        const match = labels.find((label) => {
+            const meshKey = normalizeComponentKey(label.mesh_component_name ?? undefined);
+            const labelKey = normalizeComponentKey(label.key);
+            return candidateKey === meshKey || candidateKey === labelKey;
+        });
+        if (match) {
+            return match;
+        }
+    }
+
+    return null;
+};
 
 const getMaterialColor = (material: THREE.Material | THREE.Material[]): THREE.Color | null => {
     const firstMaterial = Array.isArray(material) ? material[0] : material;
@@ -59,12 +90,19 @@ const resolveMeshColor = (mesh: THREE.Mesh, fallbackColor: string, index: number
     );
 };
 
+const getOpacityForComponent = (key: string, preset: MeshVisibilityPreset): number => {
+    const isLung = key === 'left_lung' || key === 'right_lung' || key === 'lung';
+    const isNodule = key === 'nodule';
 
-/**
- * Slice Indicator Plane
- * Shows the current 2D slice position in 3D space
- * Optimized: simplified geometry, no transparency calculations when possible
- */
+    if (preset === 'nodule_focus') {
+        if (isLung) return 0.08;
+        if (isNodule) return 1.0;
+        return 0.45;
+    }
+
+    return 1.0;
+};
+
 const SliceIndicator: React.FC<{
     zPos: number;
     wireframe: boolean;
@@ -74,7 +112,6 @@ const SliceIndicator: React.FC<{
 
     return (
         <group position={[0, zPos, 0]}>
-            {/* Semi-transparent plane - simplified */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
                 <planeGeometry args={[400, 400]} />
                 <meshBasicMaterial
@@ -85,7 +122,6 @@ const SliceIndicator: React.FC<{
                     depthWrite={false}
                 />
             </mesh>
-            {/* Edge ring - reduced segments from 64 to 32 */}
             <mesh rotation={[Math.PI / 2, 0, 0]}>
                 <ringGeometry args={[195, 200, 32]} />
                 <meshBasicMaterial color="#3b82f6" opacity={0.6} transparent side={THREE.DoubleSide} />
@@ -94,26 +130,27 @@ const SliceIndicator: React.FC<{
     );
 };
 
-/**
- * 3D Mesh Component using GLTF + Draco
- * Loads and renders the reconstructed mesh with proper material
- * Optimized: GLTF format, Draco compression, strict memory management
- */
 const ProcessedMesh: React.FC<{
     url: string;
     wireframe: boolean;
+    componentVisibility: SegmentationVisibility;
+    visibilityPreset: MeshVisibilityPreset;
+    labels: Array<{
+        key: string;
+        color: string;
+        mesh_component_name?: string | null;
+    }>;
     color?: string;
     onLoad?: () => void;
-}> = ({ url, wireframe, color = '#ef4444', onLoad }) => {
-    const { invalidate: triggerInvalidate } = useThree();
-
+}> = ({ url, wireframe, componentVisibility, visibilityPreset, labels, color = '#ef4444', onLoad }) => {
+    const invalidate = useThree((state) => state.invalidate);
     const { scene } = useGLTF(url, DRACO_DECODER_PATH, false);
 
-    // Clone the scene and center it as a whole to preserve multi-mesh alignment.
-    const { clonedScene, materials } = useMemo(() => {
+    const { clonedScene, meshEntries, materials } = useMemo(() => {
         const clone = scene.clone(true);
         const bounds = new THREE.Box3().setFromObject(clone);
         const createdMaterials: THREE.MeshStandardMaterial[] = [];
+        const createdEntries: MeshEntry[] = [];
         let meshIndex = 0;
 
         if (!bounds.isEmpty()) {
@@ -122,47 +159,81 @@ const ProcessedMesh: React.FC<{
             clone.position.sub(center);
         }
 
-        clone.traverse((child: THREE.Object3D) => {
-            if ((child as THREE.Mesh).isMesh) {
-                const mesh = child as THREE.Mesh;
-                const material = new THREE.MeshStandardMaterial({
-                    color: resolveMeshColor(mesh, color, meshIndex),
-                    roughness: 0.35,
-                    metalness: 0.05,
-                    wireframe,
-                    side: THREE.DoubleSide,
-                    flatShading: false,
-                });
-
-                mesh.material = material;
-                mesh.frustumCulled = true;
-                createdMaterials.push(material);
-                meshIndex += 1;
+        clone.traverse((child) => {
+            if (!(child as THREE.Mesh).isMesh) {
+                return;
             }
+
+            const mesh = child as THREE.Mesh;
+            const componentKey = [
+                mesh.name,
+                mesh.parent?.name,
+                typeof mesh.userData?.component_key === 'string' ? mesh.userData.component_key : undefined,
+            ]
+                .map(normalizeComponentKey)
+                .find(Boolean) ?? '';
+            const candidateKeys = [
+                mesh.name,
+                mesh.parent?.name,
+                typeof mesh.userData?.component_key === 'string' ? mesh.userData.component_key : undefined,
+            ]
+                .map(normalizeComponentKey)
+                .filter(Boolean);
+            const matchedLabel = findMatchingLabel(candidateKeys, labels);
+            const visibilityKey = matchedLabel?.key ?? componentKey;
+
+            const material = new THREE.MeshStandardMaterial({
+                color: matchedLabel?.color
+                    ? new THREE.Color(matchedLabel.color)
+                    : resolveMeshColor(mesh, color, meshIndex),
+                roughness: 0.35,
+                metalness: 0.05,
+                transparent: true,
+                opacity: 1.0,
+                side: THREE.DoubleSide,
+            });
+
+            mesh.material = material;
+            mesh.userData.component_key = componentKey;
+            mesh.frustumCulled = true;
+
+            createdMaterials.push(material);
+            createdEntries.push({ mesh, material, componentKey, visibilityKey });
+            meshIndex += 1;
         });
 
-        return { clonedScene: clone, materials: createdMaterials };
-    }, [scene, color, wireframe]);
+        return {
+            clonedScene: clone,
+            meshEntries: createdEntries,
+            materials: createdMaterials,
+        };
+    }, [color, labels, scene]);
 
-    // Handle onLoad notification
     useEffect(() => {
-        if (onLoad) {
-            onLoad();
-        }
-        triggerInvalidate();
-    }, [clonedScene, onLoad, triggerInvalidate]);
+        onLoad?.();
+        invalidate();
+    }, [clonedScene, invalidate, onLoad]);
 
-    // Update material properties efficiently
     useEffect(() => {
-        materials.forEach((material) => {
+        meshEntries.forEach(({ mesh, componentKey, visibilityKey }) => {
+            const resolvedVisibilityKey = visibilityKey || componentKey;
+            mesh.visible = resolvedVisibilityKey ? (componentVisibility[resolvedVisibilityKey] ?? true) : true;
+        });
+        invalidate();
+    }, [componentVisibility, invalidate, meshEntries]);
+
+    useEffect(() => {
+        meshEntries.forEach(({ componentKey, material }) => {
+            const opacity = getOpacityForComponent(componentKey, visibilityPreset);
+            material.opacity = opacity;
+            material.transparent = opacity < 0.999 || wireframe;
+            material.depthWrite = opacity >= 0.999 && !wireframe;
             material.wireframe = wireframe;
             material.needsUpdate = true;
         });
-        triggerInvalidate();
-    }, [wireframe, materials, triggerInvalidate]);
+        invalidate();
+    }, [invalidate, meshEntries, visibilityPreset, wireframe]);
 
-    // Dispose only the material owned by this component. Geometry and source scene
-    // are cached by useGLTF and can be reused across StrictMode remounts.
     useEffect(() => {
         return () => {
             materials.forEach((material) => material.dispose());
@@ -172,26 +243,16 @@ const ProcessedMesh: React.FC<{
     return <primitive object={clonedScene} />;
 };
 
-/**
- * Loading Fallback for 3D Scene
- * Simplified placeholder
- */
-const LoadingFallback: React.FC = () => {
-    return (
-        <mesh>
-            <boxGeometry args={[50, 50, 50]} />
-            <meshBasicMaterial color="#1a1e26" wireframe />
-        </mesh>
-    );
-};
+const LoadingFallback: React.FC = () => (
+    <mesh>
+        <boxGeometry args={[50, 50, 50]} />
+        <meshBasicMaterial color="#1a1e26" wireframe />
+    </mesh>
+);
 
-
-
-/**
- * Scene Content — React.memo prevents re-renders from parent state changes.
- */
 const SceneContent = React.memo<ModelViewerProps & {
     onModelLoad?: () => void;
+    visibilityPreset: MeshVisibilityPreset;
 }>(function SceneContent({
     caseId,
     currentSliceIndex,
@@ -201,43 +262,44 @@ const SceneContent = React.memo<ModelViewerProps & {
     showSliceIndicator = false,
     showGrid = false,
     onModelLoad,
+    visibilityPreset,
 }) {
     const meshUrl = meshApi.getMeshUrl(caseId);
+    const componentVisibility = useViewerStore((state) => state.segmentationVisibility);
+    const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
 
     const centerSlice = totalSlices / 2;
     const zPos = (currentSliceIndex - centerSlice) * voxelSpacing[2];
 
     return (
         <>
-            {/* Lighting */}
-            <ambientLight intensity={0.5} />
-            <directionalLight position={[100, 100, 50]} intensity={0.7} />
-            <directionalLight position={[-50, 50, -50]} intensity={0.35} />
-            <Environment preset="studio" background={false} />
+            <ambientLight intensity={0.58} />
+            <directionalLight position={[100, 120, 60]} intensity={0.72} />
+            <directionalLight position={[-70, 40, -80]} intensity={0.28} />
 
-            {/* Extras */}
-            <group>
-                {showGrid && (
-                    <Grid
-                        infiniteGrid
-                        cellSize={50}
-                        sectionSize={200}
-                        fadeDistance={800}
-                        sectionColor="#2a2e38"
-                        cellColor="#1a1e26"
-                        fadeStrength={1.5}
-                    />
-                )}
-                {showSliceIndicator && (
-                    <SliceIndicator zPos={zPos} wireframe={showWireframe} visible />
-                )}
-            </group>
+            {showGrid && (
+                <Grid
+                    infiniteGrid
+                    cellSize={50}
+                    sectionSize={200}
+                    fadeDistance={800}
+                    sectionColor="#2a2e38"
+                    cellColor="#1a1e26"
+                    fadeStrength={1.5}
+                />
+            )}
 
-            {/* 3D Mesh */}
+            {showSliceIndicator && (
+                <SliceIndicator zPos={zPos} wireframe={showWireframe} visible />
+            )}
+
             <Suspense fallback={<LoadingFallback />}>
                 <ProcessedMesh
                     url={meshUrl}
                     wireframe={showWireframe}
+                    componentVisibility={componentVisibility}
+                    visibilityPreset={visibilityPreset}
+                    labels={segmentationLabels}
                     onLoad={onModelLoad}
                 />
             </Suspense>
@@ -245,26 +307,24 @@ const SceneContent = React.memo<ModelViewerProps & {
     );
 });
 
-
-
-/**
- * Active Tool Context wrapper for Orbit Controls
- * Isolated to prevent Canvas re-renders when activeTool changes
- */
-const ViewerControls = () => {
-    const activeTool = useViewerStore(state => state.activeTool);
+const ViewerControls: React.FC = () => {
+    const activeTool = useViewerStore((state) => state.activeTool);
     const controlsRef = useRef<OrbitControlsImpl | null>(null);
+    const invalidate = useThree((state) => state.invalidate);
 
-    // Listen to global reset view event from header toolbar
     useEffect(() => {
         const handleReset = () => {
-            if (controlsRef.current) {
-                controlsRef.current.reset();
-            }
+            controlsRef.current?.reset();
+            invalidate();
         };
+
         window.addEventListener('reset-view', handleReset);
         return () => window.removeEventListener('reset-view', handleReset);
-    }, []);
+    }, [invalidate]);
+
+    useEffect(() => {
+        invalidate();
+    }, [activeTool, invalidate]);
 
     return (
         <OrbitControls
@@ -279,10 +339,14 @@ const ViewerControls = () => {
             minPolarAngle={0.1}
             maxPolarAngle={Math.PI - 0.1}
             enablePan
+            onChange={() => invalidate()}
             mouseButtons={{
-                LEFT: activeTool === 'pan' ? THREE.MOUSE.PAN : 
-                      activeTool === 'zoom' ? THREE.MOUSE.DOLLY : 
-                      THREE.MOUSE.ROTATE,
+                LEFT:
+                    activeTool === 'pan'
+                        ? THREE.MOUSE.PAN
+                        : activeTool === 'zoom'
+                            ? THREE.MOUSE.DOLLY
+                            : THREE.MOUSE.ROTATE,
                 MIDDLE: THREE.MOUSE.DOLLY,
                 RIGHT: THREE.MOUSE.PAN,
             }}
@@ -290,15 +354,43 @@ const ViewerControls = () => {
     );
 };
 
-/**
- * 3D Model Viewer Component
- *
- * Uses drei OrbitControls for native, smooth 3D interactions.
- * enableDamping provides inertia, frameloop="always" keeps the
- * damping animation running continuously.
- */
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
-    const handleModelLoad = useCallback(() => { }, []);
+    const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
+    const visibilityPreset = useViewerStore((state) => state.meshVisibilityPreset);
+    const setMeshVisibilityPreset = useViewerStore((state) => state.setMeshVisibilityPreset);
+    const meshLoadMeasuredRef = useRef(false);
+    const has3DLung = segmentationLabels.some(
+        (label) => label.available && label.render_3d && (label.key === 'left_lung' || label.key === 'right_lung' || label.key === 'lung')
+    );
+    const has3DNodule = segmentationLabels.some(
+        (label) => label.available && label.render_3d && label.key === 'nodule'
+    );
+    const supportsNoduleFocus = has3DLung && has3DNodule;
+
+    useEffect(() => {
+        meshLoadMeasuredRef.current = false;
+        performance.mark(`case-mesh-load-start:${props.caseId}`);
+    }, [props.caseId]);
+
+    useEffect(() => {
+        if (!supportsNoduleFocus && visibilityPreset !== 'default') {
+            setMeshVisibilityPreset('default');
+        }
+    }, [setMeshVisibilityPreset, supportsNoduleFocus, visibilityPreset]);
+
+    const handleModelLoad = useCallback(() => {
+        if (meshLoadMeasuredRef.current) {
+            return;
+        }
+
+        meshLoadMeasuredRef.current = true;
+        performance.mark(`case-mesh-load-complete:${props.caseId}`);
+        performance.measure(
+            `case-mesh-load:${props.caseId}`,
+            `case-mesh-load-start:${props.caseId}`,
+            `case-mesh-load-complete:${props.caseId}`
+        );
+    }, [props.caseId]);
 
     const glProps = useMemo(() => ({
         antialias: true,
@@ -317,7 +409,6 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 background: 'linear-gradient(180deg, #0f1115 0%, #0a0c10 100%)',
             }}
         >
-            {/* View Label */}
             <div
                 style={{
                     position: 'absolute',
@@ -349,7 +440,6 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 </div>
             </div>
 
-            {/* Controls Hint */}
             <div
                 style={{
                     position: 'absolute',
@@ -396,10 +486,53 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 </div>
             </div>
 
-            {/* 3D Canvas */}
+            {segmentationLabels.some((label) => label.available && label.render_3d) && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: 'var(--space-md)',
+                        right: 'var(--space-md)',
+                        zIndex: 10,
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 'var(--space-xs)',
+                        padding: '8px 10px',
+                        borderRadius: 'var(--radius-md)',
+                        background: 'var(--bg-glass)',
+                        backdropFilter: 'blur(8px)',
+                        border: '1px solid var(--border-subtle)',
+                    }}
+                >
+                    {segmentationLabels
+                        .filter((label) => label.available && label.render_3d)
+                        .map((label) => (
+                            <div
+                                key={label.key}
+                                style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: 8,
+                                    fontSize: '0.72rem',
+                                    color: 'var(--text-secondary)',
+                                }}
+                            >
+                                <span
+                                    style={{
+                                        width: 10,
+                                        height: 10,
+                                        borderRadius: '50%',
+                                        background: label.color,
+                                    }}
+                                />
+                                {label.display_name}
+                            </div>
+                        ))}
+                </div>
+            )}
+
             <Canvas
-                frameloop="always"
-                dpr={[1, 2]}
+                frameloop="demand"
+                dpr={[1, 1.5]}
                 gl={glProps}
                 style={{ background: 'transparent' }}
             >
@@ -414,9 +547,9 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 <SceneContent
                     {...props}
                     onModelLoad={handleModelLoad}
+                    visibilityPreset={visibilityPreset}
                 />
             </Canvas>
-
         </div>
     );
 };

@@ -185,6 +185,11 @@ export const HeaderToolbar: React.FC = () => {
         setViewMode,
         showSegmentation,
         setShowSegmentation,
+        segmentationLabels,
+        segmentationVisibility,
+        setSegmentationVisibility,
+        meshVisibilityPreset,
+        setMeshVisibilityPreset,
         resetCase,
         metadata,
         activeTool,
@@ -199,6 +204,17 @@ export const HeaderToolbar: React.FC = () => {
         { value: 'MPR' as const, label: 'MPR', icon: <LayoutGrid size={14} /> },
         { value: 'MPR_3D' as const, label: 'MPR+3D', icon: <Columns size={14} /> },
     ];
+    const availableLabels = segmentationLabels.filter((label) => label.available);
+    const has2DSegments = availableLabels.some((label) => label.render_2d);
+    const has3DSegments = availableLabels.some((label) => label.render_3d);
+    const has3DLung = availableLabels.some(
+        (label) => label.render_3d && (label.key === 'left_lung' || label.key === 'right_lung' || label.key === 'lung')
+    );
+    const has3DNodule = availableLabels.some(
+        (label) => label.render_3d && label.key === 'nodule'
+    );
+    const supportsNoduleFocus = has3DLung && has3DNodule;
+    const is3DViewActive = viewMode === '3D' || viewMode === 'MPR_3D';
 
     return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', background: 'transparent', padding: '6px' }}>
@@ -216,21 +232,96 @@ export const HeaderToolbar: React.FC = () => {
 
             <ToolbarPopover
                 icon={<Eye size={20} />}
-                title="CT Visualization Options"
-                disabled={viewMode === '3D'}
-                active={showSegmentation}
+                title="Segmentation Visibility"
+                disabled={!has2DSegments && !has3DSegments}
+                active={showSegmentation || availableLabels.some((label) => segmentationVisibility[label.key])}
                 colorTheme="cyan"
             >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '-4px' }}>
                     <SquareDashed size={14} />
-                    <label>Overlays</label>
+                    <label>Segments</label>
                 </div>
-                <ToggleSwitch
-                    label="Segmentation"
-                    checked={showSegmentation}
-                    onChange={setShowSegmentation}
-                    description="Show segmented lung/tumor regions"
+                {has2DSegments && (
+                    <ToggleSwitch
+                        label="2D Overlay"
+                        checked={showSegmentation}
+                        onChange={setShowSegmentation}
+                        description="Show segmentation labels on CT slices"
+                    />
+                )}
+                {availableLabels.map((label) => {
+                    const isVisible = segmentationVisibility[label.key] ?? label.visible_by_default;
+                    const supportedViews = [
+                        label.render_2d ? '2D' : null,
+                        label.render_3d ? '3D' : null,
+                    ].filter(Boolean).join(' + ');
+
+                    return (
+                        <ToggleSwitch
+                            key={label.key}
+                            label={
+                                <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <span
+                                        style={{
+                                            width: 10,
+                                            height: 10,
+                                            borderRadius: '50%',
+                                            background: label.color,
+                                            boxShadow: `0 0 0 1px ${label.color}40`,
+                                        }}
+                                    />
+                                    <span>{label.display_name}</span>
+                                </span>
+                            }
+                            checked={isVisible}
+                            onChange={(checked) =>
+                                setSegmentationVisibility((current) => ({
+                                    ...current,
+                                    [label.key]: checked,
+                                }))
+                            }
+                            description={supportedViews || 'Available'}
+                        />
+                    );
+                })}
+                {!availableLabels.length && (
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                        Waiting for backend segmentation masks...
+                    </div>
+                )}
+            </ToolbarPopover>
+
+            <div style={{ width: 1, height: 24, background: 'var(--border-subtle)', margin: '0 4px' }} />
+
+            <ToolbarPopover
+                icon={<Box size={20} />}
+                title="3D Focus"
+                disabled={!supportsNoduleFocus || !is3DViewActive}
+                active={meshVisibilityPreset === 'nodule_focus' && is3DViewActive}
+                colorTheme="emerald"
+            >
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    Fade the lungs to make the nodule easier to inspect inside the 3D reconstruction.
+                </div>
+                <SegmentedControl
+                    options={[
+                        { value: 'default' as const, label: 'Default' },
+                        { value: 'nodule_focus' as const, label: 'Nodule Focus' },
+                    ]}
+                    value={meshVisibilityPreset}
+                    onChange={setMeshVisibilityPreset}
+                    disabled={!supportsNoduleFocus || !is3DViewActive}
                 />
+                {!supportsNoduleFocus && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        Available when the case has both 3D lung and nodule meshes.
+                    </div>
+                )}
+                {supportsNoduleFocus && !is3DViewActive && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                        Switch to `3D` or `MPR+3D` to use this focus mode.
+                    </div>
+                )}
             </ToolbarPopover>
 
             <div style={{ width: 1, height: 24, background: 'var(--border-subtle)', margin: '0 4px' }} />

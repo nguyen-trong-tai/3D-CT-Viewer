@@ -1,4 +1,4 @@
-import React, { type InputHTMLAttributes } from 'react';
+import React, { type InputHTMLAttributes, type ReactNode } from 'react';
 
 /**
  * Range Slider with label and value display
@@ -58,11 +58,11 @@ export const RangeSlider: React.FC<RangeSliderProps> = ({
  * Toggle Switch
  */
 interface ToggleSwitchProps {
-    label: string;
+    label: ReactNode;
     checked: boolean;
     onChange: (checked: boolean) => void;
     disabled?: boolean;
-    description?: string;
+    description?: ReactNode;
 }
 
 export const ToggleSwitch: React.FC<ToggleSwitchProps> = ({

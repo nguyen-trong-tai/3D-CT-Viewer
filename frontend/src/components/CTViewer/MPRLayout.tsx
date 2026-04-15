@@ -2,6 +2,7 @@ import React, { useCallback, useMemo, useRef, useEffect } from 'react';
 import { useVolumeViewer } from '../../hooks/useVolumeViewer';
 import type { WindowPresetKey, MPRView } from '../../types';
 import { Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
+import { useViewerStore } from '../../stores/viewerStore';
 
 interface MPRLayoutProps {
     caseId: string;
@@ -346,6 +347,8 @@ export const MPRLayout: React.FC<MPRLayoutProps> = ({
     customWindowLevel = 40,
     customWindowWidth = 400,
 }) => {
+    const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
+    const segmentationVisibility = useViewerStore((state) => state.segmentationVisibility);
     const {
         volume,
         loading,
@@ -400,17 +403,17 @@ export const MPRLayout: React.FC<MPRLayoutProps> = ({
     // Mask slices
     const axialMask = useMemo(() =>
         isLoaded && showMask ? renderMaskSliceToImageData('AXIAL', crosshair.z) : null,
-        [isLoaded, showMask, crosshair.z, renderMaskSliceToImageData]
+        [isLoaded, showMask, crosshair.z, renderMaskSliceToImageData, segmentationLabels, segmentationVisibility]
     );
 
     const sagittalMask = useMemo(() =>
         isLoaded && showMask ? renderMaskSliceToImageData('SAGITTAL', crosshair.x) : null,
-        [isLoaded, showMask, crosshair.x, renderMaskSliceToImageData]
+        [isLoaded, showMask, crosshair.x, renderMaskSliceToImageData, segmentationLabels, segmentationVisibility]
     );
 
     const coronalMask = useMemo(() =>
         isLoaded && showMask ? renderMaskSliceToImageData('CORONAL', crosshair.y) : null,
-        [isLoaded, showMask, crosshair.y, renderMaskSliceToImageData]
+        [isLoaded, showMask, crosshair.y, renderMaskSliceToImageData, segmentationLabels, segmentationVisibility]
     );
 
     // Dimensions
