@@ -21,6 +21,7 @@ from models import (
     ImplicitMetadataResponse,
     SegmentationManifestResponse,
     SegmentationLabel,
+    NoduleEntity,
 )
 from models.enums import CaseStatus
 from services.artifact_service import ArtifactService
@@ -243,9 +244,14 @@ async def get_segmentation_manifest(
         SegmentationLabel(**label_payload)
         for label_payload in manifest.get("labels", [])
     ]
+    nodule_entities = [
+        NoduleEntity(**entity_payload)
+        for entity_payload in manifest.get("nodule_entities", [])
+    ]
     return SegmentationManifestResponse(
         case_id=case_id,
         labels=labels,
+        nodule_entities=nodule_entities,
         has_labeled_mask=bool(manifest.get("has_labeled_mask", True)),
     )
 

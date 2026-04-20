@@ -66,6 +66,8 @@ class SegmentationComponent:
     visible_by_default: bool = True
     render_2d: bool = False
     render_3d: bool = True
+    mask_origin_xyz: tuple[int, int, int] = (0, 0, 0)
+    mask_is_cropped: bool = False
 
 
 class PipelineService:
@@ -465,16 +467,25 @@ class PipelineService:
                 if not np.any(component.mask):
                     continue
 
-                component_sdf, downsample_factor = self._compute_mask_sdf(component.mask)
+                cropped_mask, component_origin_xyz = self._resolve_component_mask_for_mesh(component)
+                if cropped_mask is None:
+                    continue
+
+                component_sdf, downsample_factor = self._compute_mask_sdf(cropped_mask)
                 mesh_step_size = MeshProcessor.get_optimal_step_size(component_sdf.shape)
                 component_mesh = MeshProcessor.extract_mesh(
                     component_sdf,
                     spacing,
                     step_size=mesh_step_size,
+                    allow_placeholder=False,
                 )
 
                 if len(component_mesh.vertices) == 0 or len(component_mesh.faces) == 0:
                     continue
+
+                component_mesh.apply_translation(
+                    np.asarray(component_origin_xyz, dtype=np.float32) * np.asarray(spacing, dtype=np.float32)
+                )
 
                 colored_mesh = MeshProcessor.apply_color(
                     component_mesh,
@@ -553,6 +564,8 @@ class PipelineService:
                     visible_by_default = bool(payload.get("visible_by_default", True))
                     render_2d = bool(payload.get("render_2d", False))
                     render_3d = bool(payload.get("render_3d", True))
+                    mask_origin_xyz = tuple(int(value) for value in payload.get("mask_origin_xyz", (0, 0, 0)))
+                    mask_is_cropped = bool(payload.get("mask_is_cropped", False))
                 else:
                     mask = payload
                     display_name = key.replace("_", " ").title()
@@ -561,6 +574,8 @@ class PipelineService:
                     visible_by_default = True
                     render_2d = False
                     render_3d = True
+                    mask_origin_xyz = (0, 0, 0)
+                    mask_is_cropped = False
 
                 if mask is None:
                     continue
@@ -575,6 +590,8 @@ class PipelineService:
                         visible_by_default=visible_by_default,
                         render_2d=render_2d,
                         render_3d=render_3d,
+                        mask_origin_xyz=mask_origin_xyz,
+                        mask_is_cropped=mask_is_cropped,
                     )
                 )
         else:
@@ -597,6 +614,8 @@ class PipelineService:
                         visible_by_default=True,
                         render_2d=render_2d,
                         render_3d=render_3d,
+                        mask_origin_xyz=(0, 0, 0),
+                        mask_is_cropped=False,
                     )
                 )
 
@@ -628,6 +647,8 @@ class PipelineService:
                     visible_by_default=True,
                     render_2d=True,
                     render_3d=True,
+                    mask_origin_xyz=(0, 0, 0),
+                    mask_is_cropped=False,
                 )
             ]
 
@@ -669,7 +690,70 @@ class PipelineService:
         return sdf, downsample_factor
 
     @staticmethod
+    def _crop_component_mask(
+        mask: np.ndarray,
+        pad_voxels: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """
+        Crop a sparse component to its local bounds before SDF extraction.
+
+        A small zero-padding border keeps the extracted iso-surface from collapsing
+        when the component touches its tight bounding box on every side.
+        """
+        mask_bool = np.asarray(mask, dtype=bool)
+        occupied = np.argwhere(mask_bool)
+        if occupied.size == 0:
+            return None, None
+
+        min_xyz = occupied.min(axis=0).astype(np.int32)
+        max_xyz = (occupied.max(axis=0) + 1).astype(np.int32)
+        cropped = mask_bool[
+            min_xyz[0]:max_xyz[0],
+            min_xyz[1]:max_xyz[1],
+            min_xyz[2]:max_xyz[2],
+        ]
+        padded = np.pad(
+            cropped,
+            ((pad_voxels, pad_voxels), (pad_voxels, pad_voxels), (pad_voxels, pad_voxels)),
+            mode="constant",
+            constant_values=False,
+        )
+        origin_xyz = min_xyz - int(pad_voxels)
+        return padded.astype(np.uint8, copy=False), origin_xyz
+
+    @classmethod
+    def _resolve_component_mask_for_mesh(
+        cls,
+        component: SegmentationComponent,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        mask = np.asarray(component.mask, dtype=np.uint8)
+        if component.mask_is_cropped:
+            return cls._pad_component_mask(mask, np.asarray(component.mask_origin_xyz, dtype=np.int32))
+        return cls._crop_component_mask(mask)
+
+    @staticmethod
+    def _pad_component_mask(
+        mask: np.ndarray,
+        origin_xyz: np.ndarray,
+        pad_voxels: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        mask_bool = np.asarray(mask, dtype=bool)
+        if not mask_bool.any():
+            return None, None
+
+        padded = np.pad(
+            mask_bool,
+            ((pad_voxels, pad_voxels), (pad_voxels, pad_voxels), (pad_voxels, pad_voxels)),
+            mode="constant",
+            constant_values=False,
+        )
+        padded_origin_xyz = np.asarray(origin_xyz, dtype=np.int32) - int(pad_voxels)
+        return padded.astype(np.uint8, copy=False), padded_origin_xyz
+
+    @staticmethod
     def _default_component_color(component_key: str) -> str:
+        if component_key.startswith("nodule_"):
+            component_key = "nodule"
         palette = {
             "lung": "#ef4444",
             "left_lung": "#60a5fa",
@@ -680,6 +764,8 @@ class PipelineService:
 
     @staticmethod
     def _default_component_label(component_key: str) -> int:
+        if component_key.startswith("nodule_"):
+            component_key = "nodule"
         label_map = {
             "left_lung": 1,
             "right_lung": 2,

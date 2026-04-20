@@ -259,10 +259,35 @@ class SegmentationLabel(BaseModel):
     )
 
 
+class NoduleEntity(BaseModel):
+    """Metadata describing one connected-component nodule entity."""
+    id: str = Field(..., description="Stable nodule entity id")
+    display_name: str = Field(..., description="Human-readable nodule label")
+    mesh_component_name: str = Field(..., description="Stable mesh node name inside the GLB scene")
+    voxel_count: int = Field(default=0, description="Voxel count for this connected component")
+    volume_mm3: float = Field(default=0.0, description="Physical volume in cubic millimeters")
+    volume_ml: float = Field(default=0.0, description="Physical volume in milliliters")
+    centroid_xyz: List[float] = Field(default_factory=list, description="Component centroid in voxel coordinates [x, y, z]")
+    centroid_mm: List[float] = Field(default_factory=list, description="Component centroid in physical millimeter coordinates [x, y, z]")
+    bbox_xyz: List[List[int]] = Field(default_factory=list, description="Axis-aligned bounding box in voxel coordinates [[x0, x1], [y0, y1], [z0, z1]]")
+    bbox_mm: List[List[float]] = Field(default_factory=list, description="Axis-aligned bounding box in millimeter coordinates [[x0, x1], [y0, y1], [z0, z1]]")
+    extents_mm: List[float] = Field(default_factory=list, description="Bounding-box extent in millimeters [dx, dy, dz]")
+    estimated_diameter_mm: float = Field(default=0.0, description="Simple max-extent diameter estimate in millimeters")
+    slice_range: List[int] = Field(default_factory=list, description="Inclusive axial slice range [z_start, z_end]")
+    match_source: Optional[str] = Field(default=None, description="How this component was selected into the nodule list")
+    candidate_index: Optional[int] = Field(default=None, description="Accepted detector candidate index when matched")
+    detection_score_probability: Optional[float] = Field(default=None, description="Detector confidence probability when matched")
+    detection_score_logit: Optional[float] = Field(default=None, description="Detector confidence logit when matched")
+
+
 class SegmentationManifestResponse(BaseModel):
     """Manifest describing all labeled segmentation components for a case."""
     case_id: str
     labels: List[SegmentationLabel] = Field(default_factory=list)
+    nodule_entities: List[NoduleEntity] = Field(
+        default_factory=list,
+        description="Connected-component nodules available for 3D interaction",
+    )
     has_labeled_mask: bool = Field(
         default=True,
         description="Whether the stored mask volume uses multi-label semantics",

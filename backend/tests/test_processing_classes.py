@@ -190,6 +190,18 @@ class ProcessingClassTests(unittest.TestCase):
 
         self.assertEqual(set(scene.geometry.keys()), {"left_lung", "right_lung"})
 
+    def test_mesh_extraction_can_skip_placeholder_fallback(self):
+        sdf = np.ones((8, 8, 8), dtype=np.float32)
+
+        mesh = MeshProcessor.extract_mesh(
+            sdf,
+            (1.0, 1.0, 1.0),
+            allow_placeholder=False,
+        )
+
+        self.assertEqual(len(mesh.vertices), 0)
+        self.assertEqual(len(mesh.faces), 0)
+
     def test_pipeline_normalizes_component_aware_segmentation_output(self):
         combined = np.zeros((8, 8, 8), dtype=np.uint8)
         combined[1:7, 1:7, 1:7] = 1
@@ -266,6 +278,17 @@ class ProcessingClassTests(unittest.TestCase):
         prepared = PipelineService._prepare_volume_for_segmentation(volume, metadata)
 
         np.testing.assert_array_equal(prepared, np.array([[[-1024, 3071]]], dtype=np.int16))
+
+    def test_crop_component_mask_uses_local_bounds_with_padding(self):
+        mask = np.zeros((32, 32, 32), dtype=np.uint8)
+        mask[10:13, 12:15, 14:17] = 1
+
+        cropped_mask, origin_xyz = PipelineService._crop_component_mask(mask)
+
+        self.assertIsNotNone(cropped_mask)
+        self.assertEqual(tuple(cropped_mask.shape), (5, 5, 5))
+        np.testing.assert_array_equal(origin_xyz, np.array([9, 11, 13], dtype=np.int32))
+        self.assertEqual(int(np.count_nonzero(cropped_mask)), 27)
 
 
 if __name__ == "__main__":

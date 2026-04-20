@@ -37,6 +37,7 @@ class MeshProcessor:
         spacing: Tuple[float, float, float],
         level: float | None = None,
         step_size: int | None = None,
+        allow_placeholder: bool = True,
     ) -> trimesh.Trimesh:
         """Extract an iso-surface mesh from an SDF volume."""
         if level is None:
@@ -47,13 +48,21 @@ class MeshProcessor:
 
         if any(dim < 2 for dim in sdf.shape):
             print(f"Warning: Volume too small for mesh extraction: {sdf.shape}")
-            return cls._create_placeholder_mesh(sdf.shape, spacing)
+            return (
+                cls._create_placeholder_mesh(sdf.shape, spacing)
+                if allow_placeholder
+                else trimesh.Trimesh()
+            )
 
         has_inside = np.any(sdf < level)
         has_outside = np.any(sdf > level)
         if not (has_inside and has_outside):
             print(f"Warning: No surface crossing found at level {level}")
-            return cls._create_placeholder_mesh(sdf.shape, spacing)
+            return (
+                cls._create_placeholder_mesh(sdf.shape, spacing)
+                if allow_placeholder
+                else trimesh.Trimesh()
+            )
 
         try:
             vertices, faces, normals, _ = marching_cubes(
@@ -64,11 +73,19 @@ class MeshProcessor:
             )
         except (RuntimeError, ValueError) as exc:
             print(f"Warning: Marching cubes failed: {exc}")
-            return cls._create_placeholder_mesh(sdf.shape, spacing)
+            return (
+                cls._create_placeholder_mesh(sdf.shape, spacing)
+                if allow_placeholder
+                else trimesh.Trimesh()
+            )
 
         if len(vertices) == 0 or len(faces) == 0:
             print("Warning: Empty mesh generated")
-            return cls._create_placeholder_mesh(sdf.shape, spacing)
+            return (
+                cls._create_placeholder_mesh(sdf.shape, spacing)
+                if allow_placeholder
+                else trimesh.Trimesh()
+            )
 
         vertices_mm = vertices * np.array(spacing)
         return trimesh.Trimesh(
@@ -244,8 +261,15 @@ def extract_mesh(
     spacing: Tuple[float, float, float],
     level: float | None = None,
     step_size: int | None = None,
+    allow_placeholder: bool = True,
 ) -> trimesh.Trimesh:
-    return MeshProcessor.extract_mesh(sdf, spacing, level=level, step_size=step_size)
+    return MeshProcessor.extract_mesh(
+        sdf,
+        spacing,
+        level=level,
+        step_size=step_size,
+        allow_placeholder=allow_placeholder,
+    )
 
 
 def extract_mesh_from_mask(
