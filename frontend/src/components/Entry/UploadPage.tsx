@@ -377,7 +377,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                         throw new Error('No valid files found');
                     }
 
-                    setProgressLabel(`Uploading ${(file.size / 1024 / 1024).toFixed(1)} MB...`);
+                    setProgressLabel(`Uploading...`);
                     const uploadRes = await casesApi.uploadCaseWithProgress(file, (percent) => {
                         setTransferProgress(percent);
                     });
