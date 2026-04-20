@@ -121,6 +121,28 @@ export function useVolumeViewer(caseId: string | null) {
         });
     }, [clampCrosshairToShape]);
 
+    const syncCrosshairState = useCallback((
+        targetCaseId: string,
+        nextCrosshair: { x: number; y: number; z: number }
+    ) => {
+        useViewerStore.setState({
+            mprCrosshairCaseId: targetCaseId,
+            mprCrosshair: nextCrosshair,
+        });
+    }, []);
+
+    const ensureCrosshairForCase = useCallback((
+        targetCaseId: string,
+        shape: [number, number, number]
+    ) => {
+        const { mprCrosshairCaseId, mprCrosshair } = useViewerStore.getState();
+        const nextCrosshair = mprCrosshairCaseId === targetCaseId
+            ? clampCrosshairToShape(shape, mprCrosshair)
+            : getCenteredCrosshair(shape);
+
+        syncCrosshairState(targetCaseId, nextCrosshair);
+    }, [clampCrosshairToShape, getCenteredCrosshair, syncCrosshairState]);
+
     const loadMaskArtifacts = useCallback(async (targetCaseId: string, preferPreview: boolean) => {
         const cachedMask = globalMaskCache.get(targetCaseId);
         if (cachedMask && (preferPreview || cachedMask.resolution === 'full')) {
@@ -189,8 +211,11 @@ export function useVolumeViewer(caseId: string | null) {
             globalVolumeCache.set(targetCaseId, fullVolume);
             setVolume(fullVolume);
 
-            const currentCrosshair = useViewerStore.getState().mprCrosshair;
-            setCrosshair(projectCrosshairToShape(currentVolume.shape, fullVolume.shape, currentCrosshair));
+            const { mprCrosshair, mprCrosshairCaseId } = useViewerStore.getState();
+            const nextCrosshair = mprCrosshairCaseId === targetCaseId
+                ? projectCrosshairToShape(currentVolume.shape, fullVolume.shape, mprCrosshair)
+                : getCenteredCrosshair(fullVolume.shape);
+            syncCrosshairState(targetCaseId, nextCrosshair);
             imageDataCache.current.clear();
 
             const refreshedMask = await loadMaskArtifacts(targetCaseId, false);
@@ -205,7 +230,7 @@ export function useVolumeViewer(caseId: string | null) {
             console.warn('[VolumeViewer] Full-resolution volume not ready yet:', error);
             return false;
         }
-    }, [loadMaskArtifacts, projectCrosshairToShape, setCrosshair]);
+    }, [getCenteredCrosshair, loadMaskArtifacts, projectCrosshairToShape, syncCrosshairState]);
 
     /**
      * Load volume data from backend (with global deduplication)
@@ -229,7 +254,7 @@ export function useVolumeViewer(caseId: string | null) {
         if (cachedVolume) {
             console.log('[VolumeViewer] Using cached volume for:', caseId);
             setVolume(cachedVolume);
-            setCrosshair(getCenteredCrosshair(cachedVolume.shape));
+            ensureCrosshairForCase(caseId, cachedVolume.shape);
 
             const cachedMask = globalMaskCache.get(caseId);
             if (cachedMask) {
@@ -254,7 +279,7 @@ export function useVolumeViewer(caseId: string | null) {
             const vol = globalVolumeCache.get(caseId);
             if (vol) {
                 setVolume(vol);
-                setCrosshair(getCenteredCrosshair(vol.shape));
+                ensureCrosshairForCase(caseId, vol.shape);
             }
             const msk = globalMaskCache.get(caseId);
             if (msk) {
@@ -311,7 +336,7 @@ export function useVolumeViewer(caseId: string | null) {
                 evictOldestCache();
                 globalVolumeCache.set(caseId, volumeData);
                 setVolume(volumeData);
-                setCrosshair(getCenteredCrosshair(volumeResult.shape));
+                ensureCrosshairForCase(caseId, volumeResult.shape);
 
                 setLoadProgress(100);
                 loadedCaseRef.current = caseId;
@@ -326,7 +351,7 @@ export function useVolumeViewer(caseId: string | null) {
 
         globalLoadingPromises.set(caseId, loadPromise);
         await loadPromise;
-    }, [caseId, getCenteredCrosshair, setCrosshair]);
+    }, [caseId, ensureCrosshairForCase]);
 
     // Auto-load on caseId change
     useEffect(() => {

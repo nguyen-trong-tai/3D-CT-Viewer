@@ -1,10 +1,10 @@
-import React, { useRef, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Loader2, RotateCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { useVolumeViewer } from '../../hooks/useVolumeViewer';
-import { RotateCcw, ZoomIn, ZoomOut, Loader2 } from 'lucide-react';
-import { type WindowPresetKey, type MPRView } from '../../types';
-import { useViewerStore } from '../../stores/viewerStore';
-import { WindowPresetControl } from './WindowPresetControl';
 import { useViewerInteractions } from '../../hooks/useViewerInteractions';
+import { useViewerStore } from '../../stores/viewerStore';
+import { type MPRView, type WindowPresetKey } from '../../types';
+import { WindowPresetControl } from './WindowPresetControl';
 
 interface SliceViewerProps {
     caseId: string;
@@ -17,7 +17,8 @@ interface SliceViewerProps {
     windowPreset?: WindowPresetKey;
     showSegmentation?: boolean;
     segmentationOpacity?: number;
-    // Custom window for manual HU adjustment
+    showNoduleNavigator?: boolean;
+    showUiOverlays?: boolean;
     useCustomWindow?: boolean;
     customWindowLevel?: number;
     customWindowWidth?: number;
@@ -25,7 +26,7 @@ interface SliceViewerProps {
 
 /**
  * CT Slice Viewer Component (Single Axial View)
- * Supports window presets, custom window values, and segmentation overlay
+ * Supports window presets, custom window values, and segmentation overlay.
  */
 export const SliceViewer: React.FC<SliceViewerProps> = ({
     caseId,
@@ -38,6 +39,8 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     windowPreset = 'LUNG',
     showSegmentation = false,
     segmentationOpacity = 0.5,
+    showNoduleNavigator = false,
+    showUiOverlays = true,
     useCustomWindow = false,
     customWindowLevel = 40,
     customWindowWidth = 400,
@@ -46,9 +49,14 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const maskCanvasRef = useRef<HTMLCanvasElement>(null);
     const firstFrameMeasuredRef = useRef(false);
+
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
+
     const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
     const segmentationVisibility = useViewerStore((state) => state.segmentationVisibility);
+    const noduleEntities = useViewerStore((state) => state.noduleEntities);
+    const selectedNoduleId = useViewerStore((state) => state.selectedNoduleId);
+    const setSelectedNoduleId = useViewerStore((state) => state.setSelectedNoduleId);
 
     const {
         isLoaded,
@@ -68,10 +76,12 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         hasMask,
     } = useVolumeViewer(caseId);
 
-    const activeTool = useViewerStore(state => state.activeTool);
-    const viewMode = useViewerStore(state => state.viewMode);
+    const activeTool = useViewerStore((state) => state.activeTool);
+    const viewMode = useViewerStore((state) => state.viewMode);
     const currentSlice = getSliceIndex(viewType);
     const dims = getViewDimensions(viewType);
+    const isMprCrosshairView = viewMode === 'MPR' || viewMode === 'MPR_3D';
+    const isCrosshairToolActive = isMprCrosshairView && activeTool === 'crosshair';
 
     const {
         zoom,
@@ -83,7 +93,7 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         handleMouseDown,
         handleMouseMove,
         handleMouseUp,
-        resetView
+        resetView,
     } = useViewerInteractions({
         canvasRef,
         dims,
@@ -91,44 +101,56 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         viewType,
         crosshair,
         setCrosshair,
-        activeTool
+        activeTool,
     });
 
-    // Sync window preset - use ref to avoid re-render loop
+    const viewerCursor = isDragging
+        ? 'grabbing'
+        : isZooming
+            ? 'ns-resize'
+            : activeTool === 'pan'
+                ? 'grab'
+                : isCrosshairToolActive
+                    ? 'crosshair'
+                    : activeTool === 'zoom'
+                        ? 'zoom-in'
+                        : 'default';
+
     const windowPresetRef = useRef(windowPreset);
     useEffect(() => {
         if (windowPresetRef.current !== windowPreset) {
             windowPresetRef.current = windowPreset;
             setHookWindowPreset(windowPreset);
         }
-    }, [windowPreset, setHookWindowPreset]);
+    }, [setHookWindowPreset, windowPreset]);
 
     useEffect(() => {
         firstFrameMeasuredRef.current = false;
         performance.mark(`case-first-2d-frame-start:${caseId}:${viewType}`);
     }, [caseId, viewType]);
 
-    // Render slice to canvas - use custom window if enabled
     const imageData = isLoaded
-        ? (useCustomWindow
-            ? renderSliceWithCustomWindow(viewType, currentSlice, customWindowLevel, customWindowWidth)
-            : renderSliceToImageData(viewType, currentSlice, windowPreset))
+        ? (
+            useCustomWindow
+                ? renderSliceWithCustomWindow(viewType, currentSlice, customWindowLevel, customWindowWidth)
+                : renderSliceToImageData(viewType, currentSlice, windowPreset)
+        )
         : null;
+
     const maskImageData = isLoaded && showSegmentation && hasMask
         ? renderMaskSliceToImageData(viewType, currentSlice)
         : null;
 
-    // Sync external currentIndex to internal crosshair
     useEffect(() => {
         if (currentIndex !== undefined && currentIndex !== currentSlice) {
             updateCrosshair(viewType, currentIndex);
         }
     }, [currentIndex, currentSlice, updateCrosshair, viewType]);
 
-
-    // Render CT slice
     useEffect(() => {
-        if (loading || !imageData || !canvasRef.current) return;
+        if (loading || !imageData || !canvasRef.current) {
+            return;
+        }
 
         const canvas = canvasRef.current;
         if (canvas.width !== imageData.width || canvas.height !== imageData.height) {
@@ -137,47 +159,60 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         }
 
         const ctx = canvas.getContext('2d', { alpha: false });
-        if (ctx) {
-            ctx.putImageData(imageData, 0, 0);
-            if (!firstFrameMeasuredRef.current) {
-                firstFrameMeasuredRef.current = true;
-                performance.mark(`case-first-2d-frame-complete:${caseId}:${viewType}`);
-                performance.measure(
-                    `case-first-2d-frame:${caseId}:${viewType}`,
-                    `case-first-2d-frame-start:${caseId}:${viewType}`,
-                    `case-first-2d-frame-complete:${caseId}:${viewType}`
-                );
-            }
+        if (!ctx) {
+            return;
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+
+        if (!firstFrameMeasuredRef.current) {
+            firstFrameMeasuredRef.current = true;
+            performance.mark(`case-first-2d-frame-complete:${caseId}:${viewType}`);
+            performance.measure(
+                `case-first-2d-frame:${caseId}:${viewType}`,
+                `case-first-2d-frame-start:${caseId}:${viewType}`,
+                `case-first-2d-frame-complete:${caseId}:${viewType}`,
+            );
         }
     }, [caseId, imageData, loading, viewType]);
 
-    // Render mask overlay
     useEffect(() => {
-        if (loading || !maskCanvasRef.current) return;
+        if (loading || !maskCanvasRef.current) {
+            return;
+        }
 
         const maskCanvas = maskCanvasRef.current;
         const ctx = maskCanvas.getContext('2d', { alpha: true });
-        if (!ctx) return;
+        if (!ctx) {
+            return;
+        }
 
         if (maskImageData && showSegmentation) {
-            // Resize mask canvas to match
             if (maskCanvas.width !== maskImageData.width || maskCanvas.height !== maskImageData.height) {
                 maskCanvas.width = maskImageData.width;
                 maskCanvas.height = maskImageData.height;
             }
 
-            // Clear and draw mask
             ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
             ctx.globalAlpha = segmentationOpacity;
             ctx.putImageData(maskImageData, 0, 0);
-        } else {
-            // Clear mask when not showing
-            ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+            return;
         }
-    }, [maskImageData, showSegmentation, segmentationOpacity, loading, segmentationLabels, segmentationVisibility]);
+
+        ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    }, [loading, maskImageData, segmentationLabels, segmentationOpacity, segmentationVisibility, showSegmentation]);
 
     const sliceCount = dims?.maxSlice || totalSlices;
     const spacingAspect = dims ? (dims.spacing.y / dims.spacing.x) : 1;
+    const sortedNoduleEntities = useMemo(
+        () => [...noduleEntities].sort((left, right) => (
+            left.slice_range[0] - right.slice_range[0] ||
+            right.estimated_diameter_mm - left.estimated_diameter_mm ||
+            left.display_name.localeCompare(right.display_name)
+        )),
+        [noduleEntities],
+    );
+
     const fittedCanvasSize = useMemo(() => {
         if (!dims || containerSize.width <= 0 || containerSize.height <= 0) {
             return null;
@@ -199,7 +234,9 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
 
     useEffect(() => {
         const container = containerRef.current;
-        if (!container) return;
+        if (!container) {
+            return;
+        }
 
         const updateSize = () => {
             const rect = container.getBoundingClientRect();
@@ -217,29 +254,35 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         return () => observer.disconnect();
     }, []);
 
-    // Use native event listener for wheel to avoid passive issues
     useEffect(() => {
         const container = containerRef.current;
-        if (!container) return;
+        if (!container) {
+            return;
+        }
 
-        const onWheel = (e: WheelEvent) => {
-            e.preventDefault();
-            // Calculate new index and sync it correctly
-            const delta = Math.sign(e.deltaY);
-            const newIndex = Math.max(0, Math.min(sliceCount - 1, currentSlice - delta));
+        const onWheel = (event: WheelEvent) => {
+            event.preventDefault();
 
-            if (newIndex !== currentSlice) {
-                updateCrosshair(viewType, newIndex);
-                onIndexChange?.(newIndex);
+            const delta = Math.sign(event.deltaY);
+            const nextSlice = Math.max(0, Math.min(sliceCount - 1, currentSlice - delta));
+
+            if (nextSlice !== currentSlice) {
+                updateCrosshair(viewType, nextSlice);
+                onIndexChange?.(nextSlice);
             }
         };
 
         container.addEventListener('wheel', onWheel, { passive: false });
-        // Make sure to add dependencies otherwise the handlers have stale state
         return () => container.removeEventListener('wheel', onWheel);
-    }, [currentSlice, sliceCount, onIndexChange, updateCrosshair, viewType]);
+    }, [currentSlice, onIndexChange, sliceCount, updateCrosshair, viewType]);
 
-    // Loading state
+    const handleNoduleJump = (noduleId: string, targetSlice: number) => {
+        const nextSlice = Math.max(0, Math.min(sliceCount - 1, targetSlice));
+        setSelectedNoduleId(noduleId);
+        updateCrosshair(viewType, nextSlice);
+        onIndexChange?.(nextSlice);
+    };
+
     if (loading) {
         return (
             <div
@@ -257,12 +300,11 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
             >
                 <Loader2 size={40} color="#6366f1" style={{ animation: 'spin 1s linear infinite' }} />
                 <div>Loading volume... {loadProgress}%</div>
-                <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+                <style>{'@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }'}</style>
             </div>
         );
     }
 
-    // Error state
     if (error) {
         return (
             <div
@@ -281,6 +323,13 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
         );
     }
 
+    const showAxialNavigator =
+        showUiOverlays &&
+        showNoduleNavigator &&
+        viewType === 'AXIAL' &&
+        sortedNoduleEntities.length > 0;
+    const sliceProgressPercent = sliceCount > 1 ? (currentSlice / (sliceCount - 1)) * 100 : 0;
+
     return (
         <div
             ref={containerRef}
@@ -294,54 +343,55 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                 overflow: 'hidden',
                 userSelect: 'none',
             }}
-            onContextMenu={(e) => e.preventDefault()}
+            onContextMenu={(event) => event.preventDefault()}
         >
-            {/* View Label */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: 8,
-                    left: 8,
-                    zIndex: 10,
-                    background: 'rgba(0,0,0,0.7)',
-                    backdropFilter: 'blur(4px)',
-                    padding: '4px 12px',
-                    borderRadius: 4,
-                    border: '1px solid rgba(99, 102, 241, 0.4)',
-                    fontSize: '0.75rem',
-                    fontWeight: 600,
-                    color: '#6366f1',
-                }}
-            >
-                {viewLabel}
-            </div>
+            {showUiOverlays && (
+                <>
+                    <div
+                        style={{
+                            position: 'absolute',
+                            top: 8,
+                            left: 16,
+                            zIndex: 10,
+                            background: 'rgba(0,0,0,0.7)',
+                            backdropFilter: 'blur(4px)',
+                            padding: '4px 12px',
+                            borderRadius: 4,
+                            border: '1px solid rgba(99, 102, 241, 0.4)',
+                            fontSize: '0.75rem',
+                            fontWeight: 600,
+                            color: '#6366f1',
+                        }}
+                    >
+                        {viewLabel}
+                    </div>
 
-            {/* Slice Counter */}
-            <div
-                style={{
-                    position: 'absolute',
-                    top: 8,
-                    right: 8,
-                    zIndex: 10,
-                    background: 'rgba(0,0,0,0.7)',
-                    padding: '4px 8px',
-                    borderRadius: 4,
-                    fontSize: '0.7rem',
-                    fontFamily: 'monospace',
-                    color: '#aaa',
-                }}
-            >
-                {currentSlice + 1}/{sliceCount}
-            </div>
+                    <div
+                        style={{
+                            position: 'absolute',
+                            top: 8,
+                            right: 8,
+                            zIndex: 10,
+                            background: 'rgba(0,0,0,0.7)',
+                            padding: '4px 8px',
+                            borderRadius: 4,
+                            fontSize: '0.7rem',
+                            fontFamily: 'monospace',
+                            color: '#aaa',
+                        }}
+                    >
+                        {currentSlice + 1}/{sliceCount}
+                    </div>
+                </>
+            )}
 
-            {/* Canvas Container */}
             <div
                 style={{
                     flex: 1,
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    cursor: isDragging ? 'grabbing' : isZooming ? 'ns-resize' : 'crosshair',
+                    cursor: viewerCursor,
                 }}
                 onMouseDown={handleMouseDown}
                 onMouseMove={handleMouseMove}
@@ -360,7 +410,6 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         maxHeight: '100%',
                     }}
                 >
-                    {/* CT Canvas (base layer) */}
                     <canvas
                         ref={canvasRef}
                         style={{
@@ -371,7 +420,6 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         }}
                     />
 
-                    {/* Mask Overlay Canvas */}
                     <canvas
                         ref={maskCanvasRef}
                         style={{
@@ -387,16 +435,34 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         }}
                     />
 
-                    {/* Crosshair Overlay */}
-                    {(viewMode === 'MPR' || viewMode === 'MPR_3D' || activeTool === 'crosshair') && crosshairPos && (
-                        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'none' }}>
-                            <div style={{ position: 'absolute', top: `${crosshairPos.cy}%`, left: 0, right: 0, height: `${1/zoom}px`, background: 'rgba(244, 63, 94, 0.7)', transform: 'translateY(-50%)' }} />
-                            <div style={{ position: 'absolute', left: `${crosshairPos.cx}%`, top: 0, bottom: 0, width: `${1/zoom}px`, background: 'rgba(244, 63, 94, 0.7)', transform: 'translateX(-50%)' }} />
+                    {isMprCrosshairView && crosshairPos && (
+                        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+                            <div
+                                style={{
+                                    position: 'absolute',
+                                    top: `${crosshairPos.cy}%`,
+                                    left: 0,
+                                    right: 0,
+                                    height: `${1 / zoom}px`,
+                                    background: 'rgba(244, 63, 94, 0.7)',
+                                    transform: 'translateY(-50%)',
+                                }}
+                            />
+                            <div
+                                style={{
+                                    position: 'absolute',
+                                    left: `${crosshairPos.cx}%`,
+                                    top: 0,
+                                    bottom: 0,
+                                    width: `${1 / zoom}px`,
+                                    background: 'rgba(244, 63, 94, 0.7)',
+                                    transform: 'translateX(-50%)',
+                                }}
+                            />
                         </div>
                     )}
                 </div>
 
-                {/* Loading placeholder */}
                 {!isLoaded && (
                     <div
                         style={{
@@ -410,11 +476,161 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                 )}
             </div>
 
-            {/* Window Preset Control Overlay */}
-            <WindowPresetControl />
+            {showAxialNavigator && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        right: 16,
+                        bottom: showControls ? 56 : 16,
+                        width: 'min(320px, calc(100% - 32px))',
+                        maxHeight: 'min(320px, calc(100% - 240px))',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: 8,
+                        padding: '10px',
+                        borderRadius: 12,
+                        background: 'rgba(9, 12, 18, 0.84)',
+                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                        backdropFilter: 'blur(12px)',
+                        boxShadow: '0 18px 40px rgba(0, 0, 0, 0.32)',
+                        zIndex: 12,
+                    }}
+                >
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            gap: 8,
+                        }}
+                    >
+                        <div>
+                            <div
+                                style={{
+                                    fontSize: '0.72rem',
+                                    fontWeight: 700,
+                                    letterSpacing: '0.05em',
+                                    textTransform: 'uppercase',
+                                    color: '#fdba74',
+                                }}
+                            >
+                                Nodule Slice List
+                            </div>
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                                Select a nodule to jump to its first slice
+                            </div>
+                        </div>
+                        <span
+                            style={{
+                                padding: '2px 7px',
+                                borderRadius: '999px',
+                                background: 'rgba(249, 115, 22, 0.14)',
+                                color: '#fdba74',
+                                fontSize: '0.68rem',
+                                fontWeight: 700,
+                            }}
+                        >
+                            {sortedNoduleEntities.length}
+                        </span>
+                    </div>
 
-            {/* Bottom Controls */}
-            {showControls && (
+                    <div
+                        style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 6,
+                            overflowY: 'auto',
+                            paddingRight: 2,
+                        }}
+                    >
+                        {sortedNoduleEntities.map((nodule) => {
+                            const isSelected = selectedNoduleId === nodule.id;
+                            const isVisibleOnCurrentSlice =
+                                currentSlice >= nodule.slice_range[0] &&
+                                currentSlice <= nodule.slice_range[1];
+                            const buttonBorderColor = isSelected
+                                ? 'rgba(251, 146, 60, 0.85)'
+                                : isVisibleOnCurrentSlice
+                                    ? 'rgba(59, 130, 246, 0.42)'
+                                    : 'rgba(255, 255, 255, 0.06)';
+                            const buttonBackground = isSelected
+                                ? 'linear-gradient(135deg, rgba(249, 115, 22, 0.34) 0%, rgba(124, 45, 18, 0.92) 100%)'
+                                : isVisibleOnCurrentSlice
+                                    ? 'rgba(59, 130, 246, 0.1)'
+                                    : 'rgba(255, 255, 255, 0.03)';
+                            const buttonBoxShadow = isSelected
+                                ? '0 0 0 1px rgba(255, 237, 213, 0.14), 0 12px 24px rgba(249, 115, 22, 0.22)'
+                                : isVisibleOnCurrentSlice
+                                    ? '0 8px 18px rgba(37, 99, 235, 0.12)'
+                                    : 'none';
+
+                            return (
+                                <button
+                                    key={`slice-nodule:${nodule.id}`}
+                                    type="button"
+                                    onClick={() => handleNoduleJump(nodule.id, nodule.slice_range[0])}
+                                    title={`Jump to slice ${nodule.slice_range[0] + 1}`}
+                                    style={{
+                                        width: '100%',
+                                        display: 'grid',
+                                        gridTemplateColumns: 'minmax(0, 1fr) auto auto',
+                                        alignItems: 'center',
+                                        columnGap: 8,
+                                        padding: '8px 10px',
+                                        borderRadius: 10,
+                                        border: '1px solid',
+                                        borderColor: buttonBorderColor,
+                                        background: buttonBackground,
+                                        boxShadow: buttonBoxShadow,
+                                        color: 'var(--text-primary)',
+                                        cursor: 'pointer',
+                                        textAlign: 'left',
+                                        opacity: isSelected ? 1 : 0.84,
+                                        transition: 'background 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease',
+                                    }}
+                                >
+                                    <span
+                                        style={{
+                                            minWidth: 0,
+                                            overflow: 'hidden',
+                                            textOverflow: 'ellipsis',
+                                            whiteSpace: 'nowrap',
+                                            fontSize: '0.78rem',
+                                            fontWeight: isSelected ? 700 : 600,
+                                            color: isSelected ? '#fff7ed' : 'var(--text-primary)',
+                                        }}
+                                    >
+                                        {nodule.display_name}
+                                    </span>
+                                    <span
+                                        style={{
+                                            whiteSpace: 'nowrap',
+                                            fontSize: '0.7rem',
+                                            color: isSelected ? '#fed7aa' : 'var(--text-secondary)',
+                                        }}
+                                    >
+                                        Diameter {nodule.estimated_diameter_mm.toFixed(1)} mm
+                                    </span>
+                                    <span
+                                        style={{
+                                            whiteSpace: 'nowrap',
+                                            fontSize: '0.7rem',
+                                            fontWeight: 700,
+                                            color: isSelected ? '#fdba74' : 'var(--text-muted)',
+                                        }}
+                                    >
+                                        Z {nodule.slice_range[0] + 1} - {nodule.slice_range[1] + 1}
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </div>
+            )}
+
+            {showUiOverlays && <WindowPresetControl />}
+
+            {showUiOverlays && showControls && (
                 <div
                     style={{
                         position: 'absolute',
@@ -428,27 +644,77 @@ export const SliceViewer: React.FC<SliceViewerProps> = ({
                         gap: 8,
                     }}
                 >
-                    <input
-                        type="range"
-                        min={0}
-                        max={sliceCount - 1}
-                        value={currentSlice}
-                        onChange={(e) => {
-                            const newIndex = parseInt(e.target.value);
-                            updateCrosshair(viewType, newIndex);
-                            onIndexChange?.(newIndex);
+                    <div
+                        style={{
+                            flex: 1,
+                            position: 'relative',
+                            paddingTop: 22,
                         }}
-                        style={{ flex: 1, height: 4 }}
-                    />
+                    >
+                        <div
+                            style={{
+                                position: 'absolute',
+                                left: `${sliceProgressPercent}%`,
+                                top: 0,
+                                transform: 'translateX(-50%)',
+                                pointerEvents: 'none',
+                            }}
+                        >
+                            <div
+                                style={{
+                                    position: 'relative',
+                                    minWidth: 52,
+                                    padding: '4px 8px',
+                                    borderRadius: 999,
+                                    background: 'rgba(15, 23, 42, 0.92)',
+                                    border: '1px solid rgba(96, 165, 250, 0.35)',
+                                    color: '#dbeafe',
+                                    fontSize: '0.68rem',
+                                    fontWeight: 700,
+                                    lineHeight: 1,
+                                    textAlign: 'center',
+                                    boxShadow: '0 10px 22px rgba(0, 0, 0, 0.32)',
+                                    backdropFilter: 'blur(8px)',
+                                }}
+                            >
+                                {currentSlice + 1}/{sliceCount}
+                                <div
+                                    style={{
+                                        position: 'absolute',
+                                        left: '50%',
+                                        top: '100%',
+                                        width: 2,
+                                        height: 10,
+                                        transform: 'translateX(-50%)',
+                                        background: 'rgba(147, 197, 253, 0.6)',
+                                        borderRadius: 999,
+                                    }}
+                                />
+                            </div>
+                        </div>
+
+                        <input
+                            type="range"
+                            min={0}
+                            max={sliceCount - 1}
+                            value={currentSlice}
+                            onChange={(event) => {
+                                const nextSlice = Number.parseInt(event.target.value, 10);
+                                updateCrosshair(viewType, nextSlice);
+                                onIndexChange?.(nextSlice);
+                            }}
+                            style={{ width: '100%', height: 4 }}
+                        />
+                    </div>
                     <button
-                        onClick={() => setZoom(z => Math.min(z * 1.25, 20))}
+                        onClick={() => setZoom((currentZoom) => Math.min(currentZoom * 1.25, 20))}
                         style={btnStyle}
                         title="Zoom In"
                     >
                         <ZoomIn size={14} />
                     </button>
                     <button
-                        onClick={() => setZoom(z => Math.max(z / 1.25, 0.1))}
+                        onClick={() => setZoom((currentZoom) => Math.max(currentZoom / 1.25, 0.1))}
                         style={btnStyle}
                         title="Zoom Out"
                     >

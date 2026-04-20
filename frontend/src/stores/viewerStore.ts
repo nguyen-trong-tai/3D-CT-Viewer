@@ -10,6 +10,7 @@ import {
   PIPELINE_STEPS,
   WINDOW_PRESETS,
   type CaseMetadata,
+  type NoduleEntity,
   type PipelineStep,
   type MeshVisibilityPreset,
   type SegmentationLabel,
@@ -44,11 +45,16 @@ interface ViewerState {
   segmentationOpacity: number;
   segmentationVisibility: SegmentationVisibility;
   segmentationLabels: SegmentationLabel[];
+  noduleEntities: NoduleEntity[];
+  selectedNoduleId: string | null;
+  focusedNoduleId: string | null;
+  noduleFocusVersion: number;
   meshVisibilityPreset: MeshVisibilityPreset;
   showWireframe: boolean;
 
   // MPR State
   mprCrosshair: MprCrosshair;
+  mprCrosshairCaseId: string | null;
 }
 
 interface ViewerActions {
@@ -81,11 +87,16 @@ interface ViewerActions {
     updater: SegmentationVisibility | ((current: SegmentationVisibility) => SegmentationVisibility)
   ) => void;
   setSegmentationLabels: (labels: SegmentationLabel[]) => void;
+  setNoduleEntities: (noduleEntities: NoduleEntity[]) => void;
+  setSelectedNoduleId: (noduleId: string | null) => void;
+  focusNodule: (noduleId: string) => void;
+  clearNoduleSelection: () => void;
   setMeshVisibilityPreset: (preset: MeshVisibilityPreset) => void;
   setShowWireframe: (show: boolean) => void;
 
   // MPR Actions
   setMprCrosshair: (crosshair: MprCrosshair | ((current: MprCrosshair) => MprCrosshair)) => void;
+  setMprCrosshairCaseId: (caseId: string | null) => void;
 }
 
 const initialState: ViewerState = {
@@ -104,16 +115,29 @@ const initialState: ViewerState = {
   segmentationOpacity: 0.5,
   segmentationVisibility: {},
   segmentationLabels: [],
+  noduleEntities: [],
+  selectedNoduleId: null,
+  focusedNoduleId: null,
+  noduleFocusVersion: 0,
   meshVisibilityPreset: 'default',
   showWireframe: false,
   mprCrosshair: { x: 0, y: 0, z: 0 },
+  mprCrosshairCaseId: null,
 };
 
 export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
   ...initialState,
 
   setAppState: (appState) => set({ appState }),
-  setViewMode: (viewMode) => set({ viewMode }),
+  setViewMode: (viewMode) =>
+    set((state) => ({
+      viewMode,
+      sliceIndex: viewMode === '2D' ? state.mprCrosshair.z : state.sliceIndex,
+      activeTool:
+        viewMode === 'MPR' || viewMode === 'MPR_3D' || state.activeTool !== 'crosshair'
+          ? state.activeTool
+          : 'none',
+    })),
   setSliceIndex: (sliceIndex) => set({ sliceIndex }),
   setActiveTool: (activeTool) => set({ activeTool }),
 
@@ -124,6 +148,15 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
       sliceIndex: Math.floor(meta.totalSlices / 2),
       activeTool: 'none',
       appState: 'VISUALIZATION',
+      segmentationLabels: [],
+      noduleEntities: [],
+      selectedNoduleId: null,
+      focusedNoduleId: null,
+      noduleFocusVersion: 0,
+      segmentationVisibility: {},
+      meshVisibilityPreset: 'default',
+      mprCrosshair: { x: 0, y: 0, z: 0 },
+      mprCrosshairCaseId: null,
       pipelineSteps: PIPELINE_STEPS.map((step, index) => ({
         ...step,
         status:
@@ -151,9 +184,15 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
       sliceIndex: 0,
       showSegmentation: false,
       segmentationLabels: [],
+      noduleEntities: [],
+      selectedNoduleId: null,
+      focusedNoduleId: null,
+      noduleFocusVersion: 0,
       segmentationVisibility: {},
       meshVisibilityPreset: 'default',
       showWireframe: false,
+      mprCrosshair: { x: 0, y: 0, z: 0 },
+      mprCrosshairCaseId: null,
     }),
 
   setPipelineSteps: (updater) =>
@@ -203,6 +242,47 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
         segmentationVisibility: nextVisibility,
       };
     }),
+  setNoduleEntities: (noduleEntities) =>
+    set((state) => {
+      const nextSelectedId =
+        state.selectedNoduleId && noduleEntities.some((nodule) => nodule.id === state.selectedNoduleId)
+          ? state.selectedNoduleId
+          : null;
+      const nextFocusedId =
+        state.focusedNoduleId && noduleEntities.some((nodule) => nodule.id === state.focusedNoduleId)
+          ? state.focusedNoduleId
+          : null;
+
+      return {
+        noduleEntities,
+        selectedNoduleId: nextSelectedId,
+        focusedNoduleId: nextFocusedId,
+      };
+    }),
+  setSelectedNoduleId: (selectedNoduleId) => set({ selectedNoduleId }),
+  focusNodule: (noduleId) =>
+    set((state) => {
+      const isSameNodule =
+        state.selectedNoduleId === noduleId && state.focusedNoduleId === noduleId;
+
+      if (isSameNodule) {
+        return {
+          selectedNoduleId: null,
+          focusedNoduleId: null,
+        };
+      }
+
+      return {
+        selectedNoduleId: noduleId,
+        focusedNoduleId: noduleId,
+        noduleFocusVersion: state.noduleFocusVersion + 1,
+      };
+    }),
+  clearNoduleSelection: () =>
+    set({
+      selectedNoduleId: null,
+      focusedNoduleId: null,
+    }),
   setMeshVisibilityPreset: (meshVisibilityPreset) => set({ meshVisibilityPreset }),
   setShowWireframe: (showWireframe) => set({ showWireframe }),
   setMprCrosshair: (mprCrosshair) =>
@@ -212,4 +292,5 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
           ? mprCrosshair(state.mprCrosshair)
           : mprCrosshair,
     })),
+  setMprCrosshairCaseId: (mprCrosshairCaseId) => set({ mprCrosshairCaseId }),
 }));

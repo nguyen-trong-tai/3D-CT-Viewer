@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useViewerStore } from '../../stores/viewerStore';
-import { Layers, Box, LogOut, RotateCcw, Eye, LayoutTemplate, SquareDashed, MousePointer2, ZoomIn, Hand, RefreshCw, LayoutGrid, Columns, Crosshair } from 'lucide-react';
+import { Layers, Box, LogOut, RotateCcw, Eye, LayoutTemplate, MousePointer2, ZoomIn, Hand, RefreshCw, LayoutGrid, Columns, Crosshair } from 'lucide-react';
 import { SegmentedControl, ToggleSwitch } from '../UI';
 
 // Custom hook to handle click outside
@@ -215,6 +215,7 @@ export const HeaderToolbar: React.FC = () => {
     );
     const supportsNoduleFocus = has3DLung && has3DNodule;
     const is3DViewActive = viewMode === '3D' || viewMode === 'MPR_3D';
+    const isMprViewActive = viewMode === 'MPR' || viewMode === 'MPR_3D';
 
     return (
         <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', background: 'transparent', padding: '6px' }}>
@@ -237,11 +238,7 @@ export const HeaderToolbar: React.FC = () => {
                 active={showSegmentation || availableLabels.some((label) => segmentationVisibility[label.key])}
                 colorTheme="cyan"
             >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '-4px' }}>
-                    <SquareDashed size={14} />
-                    <label>Segments</label>
-                </div>
-                {has2DSegments && (
+                {has2DSegments && !is3DViewActive && (
                     <ToggleSwitch
                         label="2D Overlay"
                         checked={showSegmentation}
@@ -358,10 +355,10 @@ export const HeaderToolbar: React.FC = () => {
             />
             <IconButton
                 icon={<Crosshair size={18} />}
-                title="Crosshair Tool (MPR)"
+                title="Crosshair Tool"
                 colorTheme="rose"
-                disabled={viewMode === '3D'}
-                active={activeTool === 'crosshair'}
+                disabled={!isMprViewActive}
+                active={isMprViewActive && activeTool === 'crosshair'}
                 onClick={() => setActiveTool('crosshair')}
             />
 

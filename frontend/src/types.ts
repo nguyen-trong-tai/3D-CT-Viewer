@@ -154,9 +154,30 @@ export interface SegmentationLabel {
     mesh_component_name?: string | null;
 }
 
+export interface NoduleEntity {
+    id: string;
+    display_name: string;
+    mesh_component_name: string;
+    voxel_count: number;
+    volume_mm3: number;
+    volume_ml: number;
+    centroid_xyz: [number, number, number];
+    centroid_mm: [number, number, number];
+    bbox_xyz: [[number, number], [number, number], [number, number]];
+    bbox_mm: [[number, number], [number, number], [number, number]];
+    extents_mm: [number, number, number];
+    estimated_diameter_mm: number;
+    slice_range: [number, number];
+    match_source?: string;
+    candidate_index?: number;
+    detection_score_probability?: number;
+    detection_score_logit?: number;
+}
+
 export interface SegmentationManifest {
     case_id: string;
     labels: SegmentationLabel[];
+    nodule_entities: NoduleEntity[];
     has_labeled_mask: boolean;
 }
 

@@ -3,6 +3,7 @@ import { Activity, Info } from 'lucide-react';
 import { ErrorBoundary } from '../UI/ErrorBoundary';
 import { HeaderToolbar } from './HeaderToolbar';
 import { PatientInfoPanel } from './PatientInfoPanel';
+import { PipelineStatusOverlay } from './PipelineStatusOverlay';
 import type { ViewMode } from '../../types';
 
 interface MainLayoutProps {
@@ -27,6 +28,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
     viewMode,
 }) => {
     const [showInfoPanel, setShowInfoPanel] = useState(true);
+    const show2DGlobalOverlays = viewMode === '2D' || viewMode === 'MPR';
     return (
         <div
             style={{
@@ -136,6 +138,7 @@ export const MainLayout: React.FC<MainLayoutProps> = ({
                         position: 'relative'
                     }}
                 >
+                    {show2DGlobalOverlays && <PipelineStatusOverlay />}
                     {/* Floating Info Panel Overlay */}
                     {showInfoPanel && <PatientInfoPanel />}
                     {/* 2D View */}

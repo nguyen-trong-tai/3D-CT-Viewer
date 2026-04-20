@@ -129,6 +129,7 @@ function App() {
   const updateMetadata = useViewerStore((state) => state.updateMetadata);
   const setPipelineSteps = useViewerStore((state) => state.setPipelineSteps);
   const setSegmentationLabels = useViewerStore((state) => state.setSegmentationLabels);
+  const setNoduleEntities = useViewerStore((state) => state.setNoduleEntities);
   const bumpArtifactRefreshVersion = useViewerStore((state) => state.bumpArtifactRefreshVersion);
 
   const [showVTK, setShowVTK] = useState(false);
@@ -147,8 +148,10 @@ function App() {
         return;
       }
       const labels = manifest?.labels ?? [];
+      const noduleEntities = manifest?.nodule_entities ?? [];
 
       setSegmentationLabels(labels);
+      setNoduleEntities(noduleEntities);
       ctApi.invalidateMetadata(caseId);
       bumpArtifactRefreshVersion();
 
@@ -161,7 +164,7 @@ function App() {
         autoEnabledSegmentationRef.current.add(caseId);
       }
     },
-    [bumpArtifactRefreshVersion, setSegmentationLabels, setShowSegmentation]
+    [bumpArtifactRefreshVersion, setNoduleEntities, setSegmentationLabels, setShowSegmentation]
   );
 
   const applyPipelineSnapshot = useCallback(
@@ -350,6 +353,10 @@ function App() {
         ? 'Pipeline updates will appear here as each stage finishes.'
         : 'Preparing background pipeline state...';
   const currentStageLabel = runningStep ? `Current stage: ${runningStep.label}.` : '';
+  const show2DViewerOverlays = viewMode !== 'MPR_3D';
+  const show2DNoduleNavigator = viewMode === '2D' || viewMode === 'MPR';
+  const isSingleSlice2DMode = viewMode === '2D';
+  const show3DCrosshairGuide = viewMode === 'MPR_3D';
 
   return (
     <MainLayout
@@ -359,13 +366,15 @@ function App() {
           <SliceViewer
             caseId={metadata.id}
             totalSlices={metadata.totalSlices}
-            currentIndex={sliceIndex}
-            onIndexChange={setSliceIndex}
-            showControls={true}
+            currentIndex={isSingleSlice2DMode ? sliceIndex : undefined}
+            onIndexChange={isSingleSlice2DMode ? setSliceIndex : undefined}
+            showControls={show2DViewerOverlays}
             viewLabel="Axial CT"
             windowPreset={windowPreset}
             showSegmentation={showSegmentation}
             segmentationOpacity={segmentationOpacity}
+            showNoduleNavigator={show2DNoduleNavigator}
+            showUiOverlays={show2DViewerOverlays}
             useCustomWindow={useCustomWindow}
             customWindowLevel={customWindowLevel}
             customWindowWidth={customWindowWidth}
@@ -390,12 +399,13 @@ function App() {
           <SliceViewer
             caseId={metadata.id}
             totalSlices={metadata.totalSlices}
-            showControls={true}
+            showControls={show2DViewerOverlays}
             viewLabel="Coronal MPR"
             viewType="CORONAL"
             windowPreset={windowPreset}
             showSegmentation={showSegmentation}
             segmentationOpacity={segmentationOpacity}
+            showUiOverlays={show2DViewerOverlays}
             useCustomWindow={useCustomWindow}
             customWindowLevel={customWindowLevel}
             customWindowWidth={customWindowWidth}
@@ -407,12 +417,13 @@ function App() {
           <SliceViewer
             caseId={metadata.id}
             totalSlices={metadata.totalSlices}
-            showControls={true}
+            showControls={show2DViewerOverlays}
             viewLabel="Sagittal MPR"
             viewType="SAGITTAL"
             windowPreset={windowPreset}
             showSegmentation={showSegmentation}
             segmentationOpacity={segmentationOpacity}
+            showUiOverlays={show2DViewerOverlays}
             useCustomWindow={useCustomWindow}
             customWindowLevel={customWindowLevel}
             customWindowWidth={customWindowWidth}
@@ -445,7 +456,7 @@ function App() {
               </div>
             ) : (
               <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-                <button
+                {/* <button
                   onClick={() => setShowVTK(true)}
                   style={{
                     position: 'absolute',
@@ -461,14 +472,13 @@ function App() {
                   }}
                 >
                   Try VTK.js PoC
-                </button>
+                </button> */}
                 <ModelViewer
                   caseId={metadata.id}
-                  currentSliceIndex={sliceIndex}
+                  volumeDimensions={metadata.dimensions}
                   voxelSpacing={metadata.voxelSpacing}
                   showWireframe={showWireframe}
-                  totalSlices={metadata.totalSlices}
-                  showSliceIndicator={false}
+                  showCrosshairGuide={show3DCrosshairGuide}
                 />
               </div>
             )

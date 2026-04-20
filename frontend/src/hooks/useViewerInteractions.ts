@@ -33,16 +33,18 @@ export function useViewerInteractions({
         if (!dims || !volume) return null;
         let cx = 0;
         let cy = 0;
+        const widthDenominator = Math.max(dims.width - 1, 1);
+        const heightDenominator = Math.max(dims.height - 1, 1);
         
         if (viewType === 'AXIAL') {
-            cx = (crosshair.x / dims.width) * 100;
-            cy = (crosshair.y / dims.height) * 100;
+            cx = (crosshair.x / widthDenominator) * 100;
+            cy = (crosshair.y / heightDenominator) * 100;
         } else if (viewType === 'CORONAL') {
-            cx = (crosshair.x / dims.width) * 100;
-            cy = ((dims.height - 1 - crosshair.z) / dims.height) * 100;
+            cx = (crosshair.x / widthDenominator) * 100;
+            cy = ((dims.height - 1 - crosshair.z) / heightDenominator) * 100;
         } else if (viewType === 'SAGITTAL') {
-            cx = (crosshair.y / dims.width) * 100;
-            cy = ((dims.height - 1 - crosshair.z) / dims.height) * 100;
+            cx = (crosshair.y / widthDenominator) * 100;
+            cy = ((dims.height - 1 - crosshair.z) / heightDenominator) * 100;
         }
         return { cx, cy };
     }, [viewType, crosshair, dims, volume]);
@@ -57,8 +59,8 @@ export function useViewerInteractions({
         const pctX = Math.max(0, Math.min(1, x / rect.width));
         const pctY = Math.max(0, Math.min(1, y / rect.height));
 
-        const newX = Math.floor(pctX * dims.width);
-        const newY = Math.floor(pctY * dims.height);
+        const newX = Math.round(pctX * Math.max(dims.width - 1, 0));
+        const newY = Math.round(pctY * Math.max(dims.height - 1, 0));
 
         let voxelX = crosshair.x;
         let voxelY = crosshair.y;
