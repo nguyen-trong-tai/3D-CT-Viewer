@@ -16,6 +16,7 @@ from enum import Enum
 
 import numpy as np
 
+from config import settings
 from storage.repository import CaseRepository
 from models.enums import CaseStatus
 from processing import (
@@ -175,7 +176,7 @@ class PipelineService:
             # Stage 4: Mesh Extraction
             self.repo.update_pipeline_stage(case_id, "mesh", "running")
             stage_result = self._stage_mesh(
-                case_id, sdf_volume, spacing, mesh_components, force_recompute
+                case_id, mask, spacing, mesh_components, force_recompute, sdf=sdf_volume
             )
             result.stages.append(stage_result)
             self.repo.update_pipeline_stage(
@@ -376,44 +377,19 @@ class PipelineService:
         start = time.time()
         
         try:
-            # Check if SDF already exists
-            if not force_recompute and self.repo.sdf_exists(case_id):
-                sdf = self.repo.load_sdf(case_id)
-                if sdf is None:
-                    return (
-                        PipelineStageResult(
-                            name="sdf",
-                            status=PipelineStageStatus.FAILED,
-                            duration_seconds=time.time() - start,
-                            message="SDF manifest exists but artifact could not be loaded"
-                        ),
-                        None,
-                    )
+            if not settings.EAGER_SDF_ARTIFACTS:
+                self.repo.delete_sdf(case_id)
                 return (
                     PipelineStageResult(
                         name="sdf",
                         status=PipelineStageStatus.SKIPPED,
                         duration_seconds=time.time() - start,
-                        output_shape=sdf.shape,
-                        message="Using existing SDF"
+                        message="Deferred until needed by fallback mesh extraction"
                     ),
-                    sdf,
+                    None,
                 )
-            
-            # Determine optimal downsample factor based on volume size
-            downsample_factor = SDFProcessor.get_optimal_downsample_factor(mask.shape)
-            
-            if downsample_factor > 1:
-                print(f"[Pipeline] SDF: Using downsample factor {downsample_factor}")
-                sdf = SDFProcessor.compute_downsampled(mask, factor=downsample_factor)
-            else:
-                sdf = SDFProcessor.compute_fast(mask)
 
-            if sdf.dtype != np.float32:
-                sdf = sdf.astype(np.float32, copy=False)
-            
-            # Store result (not full SDF to save space - mesh is what matters)
-            # But PRD requires intermediate artifacts to be stored
+            sdf, downsample_factor = self._compute_mask_sdf(mask)
             self.repo.save_sdf(case_id, sdf)
             
             return (
@@ -441,10 +417,11 @@ class PipelineService:
     def _stage_mesh(
         self,
         case_id: str,
-        sdf: np.ndarray,
+        mask: np.ndarray,
         spacing: tuple,
         mesh_components: list[SegmentationComponent],
-        force_recompute: bool
+        force_recompute: bool,
+        sdf: Optional[np.ndarray] = None,
     ) -> PipelineStageResult:
         """Stage 4: Extract surface mesh using Marching Cubes."""
         start = time.time()
@@ -479,6 +456,7 @@ class PipelineService:
                     step_size=mesh_step_size,
                     allow_placeholder=False,
                 )
+                component_mesh = self._smooth_mesh_if_enabled(component_mesh)
 
                 if len(component_mesh.vertices) == 0 or len(component_mesh.faces) == 0:
                     continue
@@ -516,10 +494,17 @@ class PipelineService:
                 )
 
             # Fallback to the legacy single-mesh path when no component meshes exist.
-            mesh_step_size = MeshProcessor.get_optimal_step_size(sdf.shape)
-            mesh = MeshProcessor.extract_mesh(sdf, spacing, step_size=mesh_step_size)
+            fallback_sdf = sdf
+            fallback_downsample_factor: Optional[int] = None
+            if fallback_sdf is None:
+                fallback_sdf, fallback_downsample_factor = self._compute_mask_sdf(mask)
+
+            mesh_step_size = MeshProcessor.get_optimal_step_size(fallback_sdf.shape)
+            mesh = MeshProcessor.extract_mesh(fallback_sdf, spacing, step_size=mesh_step_size)
+            mesh = self._smooth_mesh_if_enabled(mesh)
             self.repo.save_mesh(case_id, mesh)
             stats = MeshProcessor.compute_stats(mesh)
+            fallback_details = f", downsample={fallback_downsample_factor}" if fallback_downsample_factor is not None else ""
 
             return PipelineStageResult(
                 name="mesh",
@@ -527,7 +512,7 @@ class PipelineService:
                 duration_seconds=time.time() - start,
                 message=(
                     f"{stats['vertex_count']:,} vertices, "
-                    f"{stats['face_count']:,} faces (fallback, step_size={mesh_step_size})"
+                    f"{stats['face_count']:,} faces (fallback, step_size={mesh_step_size}{fallback_details})"
                 )
             )
             
@@ -538,6 +523,22 @@ class PipelineService:
                 duration_seconds=time.time() - start,
                 message=str(e)
             )
+
+    @staticmethod
+    def _smooth_mesh_if_enabled(mesh):
+        """Apply conservative Laplacian smoothing when mesh smoothing is enabled."""
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            return mesh
+
+        iterations = max(0, int(settings.MESH_SMOOTHING_ITERATIONS))
+        if iterations == 0:
+            return mesh
+
+        return MeshProcessor.smooth_laplacian(
+            mesh,
+            iterations=iterations,
+            lamb=float(settings.MESH_SMOOTHING_LAMBDA),
+        )
 
     @staticmethod
     def _normalize_segmentation_result(
@@ -868,12 +869,22 @@ class PipelineService:
                 stages.append({"name": "segmentation", "status": "running" if len(stages) == 1 else "pending"})
             if artifacts.get("sdf"):
                 stages.append({"name": "sdf", "status": "completed"})
+            elif not settings.EAGER_SDF_ARTIFACTS and (
+                artifacts.get("segmentation_mask") or artifacts.get("mesh") or status == CaseStatus.READY.value
+            ):
+                stages.append({"name": "sdf", "status": "skipped"})
             elif status == CaseStatus.PROCESSING.value:
                 stages.append({"name": "sdf", "status": "running" if len(stages) == 2 else "pending"})
             if artifacts.get("mesh"):
                 stages.append({"name": "mesh", "status": "completed"})
             elif status == CaseStatus.PROCESSING.value:
-                stages.append({"name": "mesh", "status": "running" if len(stages) == 3 else "pending"})
+                prior_stage_count = sum(
+                    1
+                    for payload in stages
+                    if payload.get("name") in {"load_volume", "segmentation", "sdf"}
+                    and payload.get("status") in {"completed", "skipped"}
+                )
+                stages.append({"name": "mesh", "status": "running" if prior_stage_count == 3 else "pending"})
         
         return {
             "case_id": case_id,

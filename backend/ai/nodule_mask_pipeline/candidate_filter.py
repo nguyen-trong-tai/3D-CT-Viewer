@@ -23,16 +23,28 @@ class CandidateProbabilityFilter:
         local_prob_xyz: np.ndarray,
         local_lung_xyz: np.ndarray,
         center_local_xyz: np.ndarray,
+        capture_debug: bool = False,
     ) -> tuple[np.ndarray | None, dict[str, Any], dict[str, np.ndarray]]:
         if str(self.config.local_filter_mode).strip().lower() == "binary_slice":
-            return self._filter_binary_slice_first(local_prob_xyz, local_lung_xyz, center_local_xyz)
-        return self._filter_probability_first(local_prob_xyz, local_lung_xyz, center_local_xyz)
+            return self._filter_binary_slice_first(
+                local_prob_xyz,
+                local_lung_xyz,
+                center_local_xyz,
+                capture_debug=capture_debug,
+            )
+        return self._filter_probability_first(
+            local_prob_xyz,
+            local_lung_xyz,
+            center_local_xyz,
+            capture_debug=capture_debug,
+        )
 
     def _filter_probability_first(
         self,
         local_prob_xyz: np.ndarray,
         local_lung_xyz: np.ndarray,
         center_local_xyz: np.ndarray,
+        capture_debug: bool = False,
     ) -> tuple[np.ndarray | None, dict[str, Any], dict[str, np.ndarray]]:
         seed_threshold, support_threshold = resolve_seed_and_support_thresholds(
             min(self.config.foreground_threshold, self.config.local_foreground_threshold),
@@ -52,6 +64,7 @@ class CandidateProbabilityFilter:
                     "threshold_used": seed_threshold,
                     "support_threshold_used": support_threshold,
                 },
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 seed_binary_xyz=seed_binary_xyz,
                 support_binary_xyz=support_binary_xyz,
@@ -66,6 +79,7 @@ class CandidateProbabilityFilter:
                     "threshold_used": seed_threshold,
                     "support_threshold_used": support_threshold,
                 },
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 seed_binary_xyz=seed_binary_xyz,
                 support_binary_xyz=support_binary_xyz,
@@ -83,6 +97,7 @@ class CandidateProbabilityFilter:
             return self._reject(
                 "selected_component_empty",
                 {},
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 seed_binary_xyz=seed_binary_xyz,
                 support_binary_xyz=support_binary_xyz,
@@ -116,14 +131,15 @@ class CandidateProbabilityFilter:
                 "center_label": int(center_label),
                 "valid_label_count": int(len(valid_labels)),
             },
-            {
-                "relaxed_lung_xyz": relaxed_lung_xyz.astype(np.uint8, copy=False),
-                "seed_binary_xyz": seed_binary_xyz.astype(np.uint8, copy=False),
-                "support_binary_xyz": support_binary_xyz.astype(np.uint8, copy=False),
-                "labeled_seed_xyz": labeled.astype(np.int16, copy=False),
-                "selected_mask_xyz": selected_mask.astype(np.uint8, copy=False),
-                "grown_mask_xyz": grown_mask.astype(np.uint8, copy=False),
-            },
+            self._build_debug_arrays(
+                capture_debug,
+                relaxed_lung_xyz=relaxed_lung_xyz,
+                seed_binary_xyz=seed_binary_xyz,
+                support_binary_xyz=support_binary_xyz,
+                labeled_seed_xyz=labeled,
+                selected_mask_xyz=selected_mask,
+                grown_mask_xyz=grown_mask,
+            ),
         )
 
     def _filter_binary_slice_first(
@@ -131,6 +147,7 @@ class CandidateProbabilityFilter:
         local_prob_xyz: np.ndarray,
         local_lung_xyz: np.ndarray,
         center_local_xyz: np.ndarray,
+        capture_debug: bool = False,
     ) -> tuple[np.ndarray | None, dict[str, Any], dict[str, np.ndarray]]:
         relaxed_lung_xyz = self._build_relaxed_lung_mask(local_lung_xyz, local_prob_xyz, center_local_xyz)
         slice_threshold, support_threshold = resolve_seed_and_support_thresholds(
@@ -159,6 +176,7 @@ class CandidateProbabilityFilter:
                     "threshold_used": slice_threshold,
                     "support_threshold_used": support_threshold,
                 },
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 slice_binary_xyz=binary_xyz,
             )
@@ -181,6 +199,7 @@ class CandidateProbabilityFilter:
                     "threshold_used": slice_threshold,
                     "support_threshold_used": support_threshold,
                 },
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 slice_binary_xyz=binary_xyz,
                 support_binary_xyz=support_binary_xyz,
@@ -198,6 +217,7 @@ class CandidateProbabilityFilter:
             return self._reject(
                 "selected_component_empty",
                 {"filter_mode": "binary_slice"},
+                capture_debug=capture_debug,
                 relaxed_lung_xyz=relaxed_lung_xyz,
                 slice_binary_xyz=binary_xyz,
                 support_binary_xyz=support_binary_xyz,
@@ -232,14 +252,15 @@ class CandidateProbabilityFilter:
                 "center_label": int(center_label),
                 "valid_label_count": int(len(valid_labels)),
             },
-            {
-                "relaxed_lung_xyz": relaxed_lung_xyz.astype(np.uint8, copy=False),
-                "slice_binary_xyz": binary_xyz.astype(np.uint8, copy=False),
-                "support_binary_xyz": support_binary_xyz.astype(np.uint8, copy=False),
-                "labeled_slice_stack_xyz": labeled.astype(np.int16, copy=False),
-                "selected_mask_xyz": selected_mask.astype(np.uint8, copy=False),
-                "grown_mask_xyz": grown_mask.astype(np.uint8, copy=False),
-            },
+            self._build_debug_arrays(
+                capture_debug,
+                relaxed_lung_xyz=relaxed_lung_xyz,
+                slice_binary_xyz=binary_xyz,
+                support_binary_xyz=support_binary_xyz,
+                labeled_slice_stack_xyz=labeled,
+                selected_mask_xyz=selected_mask,
+                grown_mask_xyz=grown_mask,
+            ),
         )
 
     def minimum_component_voxels(self) -> int:
@@ -530,9 +551,22 @@ class CandidateProbabilityFilter:
         return best_label
 
     @staticmethod
-    def _reject(reason: str, extra_stats: dict[str, Any], **debug_arrays: np.ndarray) -> tuple[None, dict[str, Any], dict[str, np.ndarray]]:
+    def _reject(
+        reason: str,
+        extra_stats: dict[str, Any],
+        capture_debug: bool = False,
+        **debug_arrays: np.ndarray,
+    ) -> tuple[None, dict[str, Any], dict[str, np.ndarray]]:
         stats = {"reason": str(reason)}
         stats.update(extra_stats)
+        debug = CandidateProbabilityFilter._build_debug_arrays(capture_debug, **debug_arrays)
+        return None, stats, debug
+
+    @staticmethod
+    def _build_debug_arrays(capture_debug: bool, **debug_arrays: np.ndarray) -> dict[str, np.ndarray]:
+        if not capture_debug:
+            return {}
+
         debug: dict[str, np.ndarray] = {}
         for key, value in debug_arrays.items():
             array = np.asarray(value)
@@ -540,4 +574,4 @@ class CandidateProbabilityFilter:
                 debug[key] = np.asarray(array, dtype=np.int16)
             else:
                 debug[key] = np.asarray(array, dtype=np.uint8)
-        return None, stats, debug
+        return debug

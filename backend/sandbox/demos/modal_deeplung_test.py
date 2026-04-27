@@ -461,7 +461,7 @@ def detect_case_remote(
     _configure_runtime()
 
     from api.dependencies import get_repository, reset_dependencies
-    from processing.Segmentation import LungSegmenter
+    from processing import LungSegmenter
     from sandbox.deeplung import DeepLungDetector, DeepLungDetectorConfig
 
     reset_dependencies()
@@ -523,7 +523,7 @@ def _run_detector_on_volume(
     top_k: int | None,
     source_tag: str,
 ) -> dict[str, Any]:
-    from processing.Segmentation import LungSegmenter
+    from processing import LungSegmenter
     from sandbox.deeplung import DeepLungDetector, DeepLungDetectorConfig
 
     volume_xyz = np.asarray(volume_xyz)
@@ -653,7 +653,16 @@ def _load_volume_from_filesystem_path(resolved: Path) -> tuple[np.ndarray, tuple
 def _normalize_volume_path(volume_path: str) -> Path:
     resolved = Path(volume_path).expanduser()
     normalized_text = str(resolved).replace("\\", "/")
-
+    modal_volumes_prefix = "/__modal/volumes/"
+    if normalized_text == modal_volumes_prefix.rstrip("/"):
+        return Path(RAW_DATA_PATH).resolve()
+    if normalized_text.startswith(modal_volumes_prefix):
+        suffix = normalized_text.removeprefix(modal_volumes_prefix)
+        parts = [part for part in suffix.split("/") if part]
+        if not parts:
+            return Path(RAW_DATA_PATH).resolve()
+        relative_parts = parts[1:]
+        return (Path(RAW_DATA_PATH) / Path(*relative_parts)).resolve() if relative_parts else Path(RAW_DATA_PATH).resolve()
     if normalized_text == "/__modal/volumes/data_raw":
         return Path(RAW_DATA_PATH).resolve()
     if normalized_text.startswith("/__modal/volumes/data_raw/"):

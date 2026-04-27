@@ -296,12 +296,21 @@ def _save_contact_sheet_rgb(
     image.save(output_path)
 
 
+def _sample_z_indices(z_indices: list[int], max_slices: int | None = None) -> list[int]:
+    if max_slices is None or max_slices <= 0 or len(z_indices) <= max_slices:
+        return [int(value) for value in z_indices]
+    sampled_positions = np.linspace(0, len(z_indices) - 1, num=max_slices)
+    sampled_indices = sorted({int(round(float(position))) for position in sampled_positions})
+    return [int(z_indices[index]) for index in sampled_indices]
+
+
 def _visualize_final_mask_contact_sheet(
     output_dir: Path,
     volume_xyz: np.ndarray,
     final_mask_xyz: np.ndarray,
     output_subdir: str = "final_mask_views",
     stem_prefix: str = "axial_stack",
+    max_slices: int | None = None,
 ) -> dict[str, Any]:
     mask_bool = np.asarray(final_mask_xyz, dtype=bool)
     occupied_z = np.where(mask_bool.any(axis=(0, 1)))[0]
@@ -314,7 +323,8 @@ def _visualize_final_mask_contact_sheet(
 
     final_dir = output_dir / output_subdir
     final_dir.mkdir(parents=True, exist_ok=True)
-    z_indices = [int(value) for value in occupied_z.tolist()]
+    occupied_z_indices = [int(value) for value in occupied_z.tolist()]
+    z_indices = _sample_z_indices(occupied_z_indices, max_slices=max_slices)
 
     overlay_tiles = [
         _compose_mask_overlay_rgb(
@@ -336,6 +346,7 @@ def _visualize_final_mask_contact_sheet(
     return {
         "present": True,
         "slice_count": int(len(z_indices)),
+        "occupied_slice_count": int(len(occupied_z_indices)),
         "z_indices": z_indices,
         "axial_stack_overlay_contact_sheet": _relative_output_path(overlay_sheet_path),
         "axial_stack_mask_only_contact_sheet": _relative_output_path(mask_only_sheet_path),
@@ -698,6 +709,136 @@ def _build_quantitative_validation(
     }
 
 
+def _normalized_patch_to_uint8(patch_2d: np.ndarray) -> np.ndarray:
+    patch = np.nan_to_num(np.asarray(patch_2d, dtype=np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+    if patch.size == 0:
+        return np.zeros((0, 0), dtype=np.uint8)
+    patch = np.clip(patch, 0.0, 1.0)
+    return np.rint(patch * 255.0).astype(np.uint8)
+
+
+def _compose_input_patch_debug_rgb(input_patch_yx: np.ndarray, mapping: dict[str, Any]) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    image_uint8 = _normalized_patch_to_uint8(input_patch_yx)
+    image = Image.fromarray(image_uint8, mode="L").convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    line_width = max(1, int(round(min(image.size) * 0.02)))
+    patch_row_start = int(mapping.get("patch_row_start", 0))
+    patch_row_end = int(mapping.get("patch_row_end", image.height))
+    patch_col_start = int(mapping.get("patch_col_start", 0))
+    patch_col_end = int(mapping.get("patch_col_end", image.width))
+
+    left = max(0.0, min(float(image.width - 1), float(patch_col_start)))
+    top = max(0.0, min(float(image.height - 1), float(patch_row_start)))
+    right = max(left, min(float(image.width - 1), float(max(patch_col_end - 1, patch_col_start))))
+    bottom = max(top, min(float(image.height - 1), float(max(patch_row_end - 1, patch_row_start))))
+    draw.rectangle((left, top, right, bottom), outline=(64, 220, 255), width=line_width)
+
+    center_x = float(mapping.get("target_center_x_in_roi", image.width / 2.0))
+    center_y = float(mapping.get("target_center_y_in_roi", image.height / 2.0))
+    crosshair = max(4, int(round(min(image.size) * 0.06)))
+    center_color = (255, 96, 96)
+    draw.line((center_x - crosshair, center_y, center_x + crosshair, center_y), fill=center_color, width=line_width)
+    draw.line((center_x, center_y - crosshair, center_x, center_y + crosshair), fill=center_color, width=line_width)
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _serialize_segmentor_slice_artifacts(
+    candidate_dir: Path,
+    segmentor_slices: list[dict[str, Any]],
+    foreground_threshold: float,
+) -> dict[str, Any]:
+    slices_dir = candidate_dir / "slices"
+    slices_dir.mkdir(parents=True, exist_ok=True)
+
+    slice_records: list[dict[str, Any]] = []
+    input_tiles: list[np.ndarray] = []
+    probability_tiles: list[np.ndarray] = []
+    input_labels: list[int] = []
+    probability_labels: list[int] = []
+
+    for slice_item in segmentor_slices:
+        z_index = int(slice_item.get("z_index_resampled", 0))
+        mapping = dict(slice_item.get("mapping", {}) or {})
+        slice_record: dict[str, Any] = {
+            "z_index_resampled": z_index,
+            "mapping": mapping,
+        }
+
+        input_patch = slice_item.get("input_patch_yx")
+        if input_patch is not None:
+            input_array = np.asarray(input_patch, dtype=np.float32)
+            if input_array.ndim == 2 and input_array.size > 0:
+                input_npy_path = slices_dir / f"input_z{z_index:04d}.npy"
+                input_png_path = slices_dir / f"input_z{z_index:04d}.png"
+                np.save(input_npy_path, input_array)
+                input_rgb = _compose_input_patch_debug_rgb(input_array, mapping)
+                _save_contact_sheet_rgb([input_rgb], input_png_path)
+                input_tiles.append(input_rgb)
+                input_labels.append(z_index)
+                slice_record["input_patch"] = {
+                    "shape": [int(value) for value in input_array.shape],
+                    "min_value": float(input_array.min(initial=0.0)),
+                    "max_value": float(input_array.max(initial=0.0)),
+                    "npy": _relative_output_path(input_npy_path),
+                    "png": _relative_output_path(input_png_path),
+                }
+
+        probability_patch = slice_item.get("probability_patch_yx")
+        if probability_patch is not None:
+            probability_array = np.asarray(probability_patch, dtype=np.float32)
+            if probability_array.ndim == 2 and probability_array.size > 0:
+                probability_npy_path = slices_dir / f"probability_z{z_index:04d}.npy"
+                probability_png_path = slices_dir / f"probability_overlay_z{z_index:04d}.png"
+                np.save(probability_npy_path, probability_array)
+                probability_rgb = _compose_probability_overlay_rgb(
+                    _normalized_patch_to_uint8(
+                        np.asarray(input_patch, dtype=np.float32)
+                        if input_patch is not None
+                        else np.zeros_like(probability_array, dtype=np.float32)
+                    ),
+                    probability_array,
+                    threshold=foreground_threshold,
+                )
+                _save_contact_sheet_rgb([probability_rgb], probability_png_path)
+                probability_tiles.append(probability_rgb)
+                probability_labels.append(z_index)
+                slice_record["probability_patch"] = {
+                    "shape": [int(value) for value in probability_array.shape],
+                    "max_value": float(probability_array.max(initial=0.0)),
+                    "npy": _relative_output_path(probability_npy_path),
+                    "overlay_png": _relative_output_path(probability_png_path),
+                }
+        slice_records.append(slice_record)
+
+    input_contact_sheet_path = None
+    if input_tiles:
+        input_contact_sheet_path = slices_dir / "input_contact_sheet.png"
+        _save_contact_sheet_rgb(input_tiles, input_contact_sheet_path, tile_label_values=input_labels)
+
+    probability_contact_sheet_path = None
+    if probability_tiles:
+        probability_contact_sheet_path = slices_dir / "probability_overlay_contact_sheet.png"
+        _save_contact_sheet_rgb(
+            probability_tiles,
+            probability_contact_sheet_path,
+            tile_label_values=probability_labels,
+        )
+
+    return {
+        "slices_dir": _relative_output_path(slices_dir),
+        "slice_records": slice_records,
+        "input_contact_sheet_png": (
+            _relative_output_path(input_contact_sheet_path) if input_contact_sheet_path is not None else None
+        ),
+        "probability_overlay_contact_sheet_png": (
+            _relative_output_path(probability_contact_sheet_path) if probability_contact_sheet_path is not None else None
+        ),
+    }
+
+
 def _serialize_detector_debug_artifacts(output_dir: Path, pipeline_result: Any) -> dict[str, Any]:
     detector_output = getattr(pipeline_result, "detector_output", None)
     if detector_output is None:
@@ -767,6 +908,11 @@ def _serialize_segmentor_debug_artifacts(output_dir: Path, pipeline_result: Any)
 
         segmentor_slices = list(item.get("segmentor_slices", []))
         z_indices = [int(slice_item.get("z_index_resampled", 0)) for slice_item in segmentor_slices]
+        slice_artifacts = _serialize_segmentor_slice_artifacts(
+            candidate_dir,
+            segmentor_slices,
+            foreground_threshold=float(getattr(pipeline_result, "debug", {}).get("foreground_threshold", 0.45)),
+        )
 
         metadata_path.write_text(
             json.dumps(
@@ -779,7 +925,13 @@ def _serialize_segmentor_debug_artifacts(output_dir: Path, pipeline_result: Any)
                     "local_bbox_resampled_xyz": item.get("local_bbox_resampled_xyz"),
                     "slice_count": len(segmentor_slices),
                     "slice_z_indices_resampled": z_indices,
+                    "slice_artifacts": {
+                        "slices_dir": slice_artifacts["slices_dir"],
+                        "input_contact_sheet_png": slice_artifacts["input_contact_sheet_png"],
+                        "probability_overlay_contact_sheet_png": slice_artifacts["probability_overlay_contact_sheet_png"],
+                    },
                     "filter_debug_summary": filter_debug_summary,
+                    "slices": slice_artifacts["slice_records"],
                 },
                 indent=2,
             ),
@@ -791,6 +943,9 @@ def _serialize_segmentor_debug_artifacts(output_dir: Path, pipeline_result: Any)
                 "metadata_json": _relative_output_path(metadata_path),
                 "slice_count": len(segmentor_slices),
                 "slice_z_indices_resampled": z_indices,
+                "slices_dir": slice_artifacts["slices_dir"],
+                "input_contact_sheet_png": slice_artifacts["input_contact_sheet_png"],
+                "probability_overlay_contact_sheet_png": slice_artifacts["probability_overlay_contact_sheet_png"],
                 "filter_debug_summary": filter_debug_summary,
             }
         )
@@ -1021,6 +1176,86 @@ def _visualize_final_mask_resampled(
     }
 
 
+def _visualize_lung_mask(
+    output_dir: Path,
+    volume_xyz: np.ndarray,
+    lung_mask_xyz: np.ndarray,
+) -> dict[str, Any]:
+    lung_mask_bool = np.asarray(lung_mask_xyz, dtype=bool)
+    if not lung_mask_bool.any():
+        return {
+            "present": False,
+            "axial_stack": {},
+        }
+
+    mask_coords = np.argwhere(lung_mask_bool)
+    center_x, center_y, center_z = [int(round(float(value))) for value in mask_coords.mean(axis=0)]
+    center_x = _clip_index(center_x, lung_mask_bool.shape[0])
+    center_y = _clip_index(center_y, lung_mask_bool.shape[1])
+    center_z = _clip_index(center_z, lung_mask_bool.shape[2])
+
+    axial_contact_sheet = _visualize_final_mask_contact_sheet(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(volume_xyz),
+        final_mask_xyz=lung_mask_bool,
+        output_subdir="lung_mask_views",
+        stem_prefix="axial_stack_lung_mask",
+        max_slices=36,
+    )
+    return {
+        "present": True,
+        "center_xyz": [int(center_x), int(center_y), int(center_z)],
+        "axial_stack": axial_contact_sheet,
+    }
+
+
+def _visualize_lung_mask_resampled(
+    output_dir: Path,
+    volume_xyz: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    pipeline_result: Any,
+) -> dict[str, Any]:
+    from sandbox.nodule_mask_pipeline import resample_volume_xyz
+
+    lung_mask_resampled_xyz = np.asarray(pipeline_result.lung_mask_resampled_xyz, dtype=bool)
+    if not lung_mask_resampled_xyz.any():
+        return {
+            "present": False,
+            "axial_stack": {},
+        }
+
+    target_spacing_xyz = tuple(
+        float(value)
+        for value in pipeline_result.debug.get("target_spacing_xyz_mm", spacing_xyz_mm)
+    )
+    resampled_volume_xyz = resample_volume_xyz(
+        np.asarray(volume_xyz),
+        spacing_xyz=spacing_xyz_mm,
+        new_spacing_xyz=target_spacing_xyz,
+        order=1,
+    ).astype(np.float32, copy=False)
+
+    occupied_coords = np.argwhere(lung_mask_resampled_xyz)
+    center_x, center_y, center_z = [int(round(float(value))) for value in occupied_coords.mean(axis=0)]
+    center_x = _clip_index(center_x, lung_mask_resampled_xyz.shape[0])
+    center_y = _clip_index(center_y, lung_mask_resampled_xyz.shape[1])
+    center_z = _clip_index(center_z, lung_mask_resampled_xyz.shape[2])
+
+    axial_contact_sheet = _visualize_final_mask_contact_sheet(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(resampled_volume_xyz),
+        final_mask_xyz=lung_mask_resampled_xyz,
+        output_subdir="lung_mask_resampled_views",
+        stem_prefix="axial_stack_lung_mask_resampled",
+        max_slices=36,
+    )
+    return {
+        "present": True,
+        "center_xyz_resampled": [int(center_x), int(center_y), int(center_z)],
+        "axial_stack": axial_contact_sheet,
+    }
+
+
 def _load_volume_from_filesystem_path(resolved: Path) -> tuple[np.ndarray, tuple[float, float, float]]:
     from processing.loader import MedicalVolumeLoader
 
@@ -1045,6 +1280,16 @@ def _load_volume_from_filesystem_path(resolved: Path) -> tuple[np.ndarray, tuple
 def _normalize_volume_path(volume_path: str) -> Path:
     resolved = Path(volume_path).expanduser()
     normalized_text = str(resolved).replace("\\", "/")
+    modal_volumes_prefix = "/__modal/volumes/"
+    if normalized_text == modal_volumes_prefix.rstrip("/"):
+        return Path(RAW_DATA_PATH).resolve()
+    if normalized_text.startswith(modal_volumes_prefix):
+        suffix = normalized_text.removeprefix(modal_volumes_prefix)
+        parts = [part for part in suffix.split("/") if part]
+        if not parts:
+            return Path(RAW_DATA_PATH).resolve()
+        relative_parts = parts[1:]
+        return (Path(RAW_DATA_PATH) / Path(*relative_parts)).resolve() if relative_parts else Path(RAW_DATA_PATH).resolve()
     if normalized_text == "/__modal/volumes/data_raw":
         return Path(RAW_DATA_PATH).resolve()
     if normalized_text.startswith("/__modal/volumes/data_raw/"):
@@ -1067,7 +1312,7 @@ def _save_local_json(output_path: str, payload: dict[str, Any]) -> None:
 
 
 def _build_pipeline(device: str) -> Any:
-    from processing.Segmentation import LungSegmenter
+    from processing import LungSegmenter
     from sandbox.deeplung import DeepLungDetector, DeepLungDetectorConfig
     from sandbox.nodule_mask_pipeline import NoduleMaskPipeline, NoduleMaskPipelineConfig
     from sandbox.transattunet import (
@@ -1105,11 +1350,13 @@ def _serialize_pipeline_result(
     final_mask_original_path = output_dir / "final_mask_original.npy"
     final_mask_resampled_path = output_dir / "final_mask_resampled.npy"
     lung_mask_path = output_dir / "lung_mask.npy"
+    lung_mask_resampled_path = output_dir / "lung_mask_resampled.npy"
     candidates_path = output_dir / "candidates.json"
 
     np.save(final_mask_original_path, np.asarray(pipeline_result.final_mask_xyz, dtype=np.uint8))
     np.save(final_mask_resampled_path, np.asarray(pipeline_result.final_mask_resampled_xyz, dtype=np.uint8))
     np.save(lung_mask_path, np.asarray(pipeline_result.lung_mask_xyz, dtype=np.uint8))
+    np.save(lung_mask_resampled_path, np.asarray(pipeline_result.lung_mask_resampled_xyz, dtype=np.uint8))
     candidates_path.write_text(json.dumps(pipeline_result.candidates, indent=2), encoding="utf-8")
 
     candidate_visualizations = _visualize_candidates(
@@ -1124,6 +1371,17 @@ def _serialize_pipeline_result(
     )
     segmentor_debug_artifacts = _serialize_segmentor_debug_artifacts(
         output_dir=output_dir,
+        pipeline_result=pipeline_result,
+    )
+    lung_mask_views = _visualize_lung_mask(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(volume_xyz),
+        lung_mask_xyz=np.asarray(pipeline_result.lung_mask_xyz),
+    )
+    lung_mask_resampled_views = _visualize_lung_mask_resampled(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(volume_xyz),
+        spacing_xyz_mm=spacing_xyz_mm,
         pipeline_result=pipeline_result,
     )
     final_mask_views = _visualize_final_mask(
@@ -1151,6 +1409,7 @@ def _serialize_pipeline_result(
         "final_mask_voxel_count": int(np.asarray(pipeline_result.final_mask_xyz, dtype=np.uint8).sum()),
         "final_mask_resampled_voxel_count": int(np.asarray(pipeline_result.final_mask_resampled_xyz, dtype=np.uint8).sum()),
         "lung_mask_voxel_count": int(np.asarray(pipeline_result.lung_mask_xyz, dtype=np.uint8).sum()),
+        "lung_mask_resampled_voxel_count": int(np.asarray(pipeline_result.lung_mask_resampled_xyz, dtype=np.uint8).sum()),
         "component_stats": pipeline_result.component_stats,
         "candidates": pipeline_result.candidates,
         "debug": pipeline_result.debug,
@@ -1164,10 +1423,13 @@ def _serialize_pipeline_result(
             "final_mask_original_npy": _relative_output_path(final_mask_original_path),
             "final_mask_resampled_npy": _relative_output_path(final_mask_resampled_path),
             "lung_mask_npy": _relative_output_path(lung_mask_path),
+            "lung_mask_resampled_npy": _relative_output_path(lung_mask_resampled_path),
             "candidates_json": _relative_output_path(candidates_path),
             "candidate_visualizations": candidate_visualizations,
             "detector_debug": detector_debug_artifacts,
             "segmentor_debug": segmentor_debug_artifacts,
+            "lung_mask_views": lung_mask_views,
+            "lung_mask_resampled_views": lung_mask_resampled_views,
             "final_mask_views": final_mask_views,
             "final_mask_resampled_views": final_mask_resampled_views,
             "final_mask_mesh": final_mask_mesh,

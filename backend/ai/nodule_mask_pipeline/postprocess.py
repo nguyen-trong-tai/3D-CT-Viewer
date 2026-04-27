@@ -184,6 +184,7 @@ class MaskPostProcessor:
             return []
 
         labeled, _ = ndimage.label(mask_bool, structure=ndimage.generate_binary_structure(3, 1))
+        mask_uint8 = np.asarray(mask_bool, dtype=np.uint8)
         component_sizes = np.bincount(labeled.ravel())
         objects = ndimage.find_objects(labeled)
         voxel_volume_mm3 = float(np.prod(np.asarray(spacing_xyz, dtype=np.float32)))
@@ -194,18 +195,24 @@ class MaskPostProcessor:
             voxel_count = int(component_sizes[label_id])
             if voxel_count <= 0:
                 continue
-            centroid = ndimage.center_of_mass(mask_bool.astype(np.uint8), labeled, label_id)
+            centroid = ndimage.center_of_mass(mask_uint8, labeled, label_id)
+            x0, x1 = int(bbox[0].start), int(bbox[0].stop)
+            y0, y1 = int(bbox[1].start), int(bbox[1].stop)
+            z0, z1 = int(bbox[2].start), int(bbox[2].stop)
+            local_mask = np.asarray(labeled[x0:x1, y0:y1, z0:z1] == int(label_id), dtype=np.uint8)
             stats.append(
                 {
                     "label_id": int(label_id),
                     "voxel_count": voxel_count,
                     "volume_mm3": float(voxel_count * voxel_volume_mm3),
                     "bbox_xyz": [
-                        [int(bbox[0].start), int(bbox[0].stop)],
-                        [int(bbox[1].start), int(bbox[1].stop)],
-                        [int(bbox[2].start), int(bbox[2].stop)],
+                        [x0, x1],
+                        [y0, y1],
+                        [z0, z1],
                     ],
                     "centroid_xyz": [float(value) for value in centroid],
+                    "mask_origin_xyz": [x0, y0, z0],
+                    "local_mask_xyz": local_mask,
                 }
             )
         stats.sort(key=lambda item: item["voxel_count"], reverse=True)

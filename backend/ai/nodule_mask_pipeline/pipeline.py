@@ -99,19 +99,33 @@ class NoduleMaskPipeline:
         post_processor_end_time = time.time()
         print(f"Segmentor stage completed in {segmentor_end_time - segmentor_start_time:.2f} seconds.", flush=True)
         print(f"Post-processing completed in {post_processor_end_time - post_processor_start_time:.2f} seconds.", flush=True)
+        capture_detector_debug = bool(self.config.capture_detector_debug)
+        capture_segmentor_debug = bool(self.config.capture_segmentor_debug)
 
         return NoduleMaskPipelineResult(
             final_mask_xyz=final_mask_xyz,
             final_mask_resampled_xyz=final_mask_resampled_xyz,
             lung_mask_xyz=prepared.lung_mask_xyz,
             lung_mask_resampled_xyz=prepared.resampled_lung_mask_xyz,
-            probability_volume_resampled_xyz=segmentor_output.probability_volume_resampled_xyz,
-            binary_volume_resampled_xyz=segmentor_output.binary_volume_resampled_xyz,
             candidates=segmentor_output.candidate_records,
-            candidate_debug_volumes=segmentor_output.candidate_debug_volumes,
             component_stats=component_stats,
-            detector_output=detector_output,
-            segmentor_output=segmentor_output,
+            probability_volume_resampled_xyz=(
+                segmentor_output.probability_volume_resampled_xyz
+                if capture_segmentor_debug
+                else None
+            ),
+            binary_volume_resampled_xyz=(
+                segmentor_output.binary_volume_resampled_xyz
+                if capture_segmentor_debug
+                else None
+            ),
+            candidate_debug_volumes=(
+                list(segmentor_output.candidate_debug_volumes)
+                if capture_segmentor_debug
+                else []
+            ),
+            detector_output=detector_output if capture_detector_debug else None,
+            segmentor_output=segmentor_output if capture_segmentor_debug else None,
             debug=self._build_debug_summary(
                 volume_xyz=volume_xyz,
                 spacing_xyz=spacing_xyz,
@@ -129,11 +143,19 @@ class NoduleMaskPipeline:
             final_mask_resampled_xyz=empty_resampled,
             lung_mask_xyz=prepared.lung_mask_xyz,
             lung_mask_resampled_xyz=prepared.resampled_lung_mask_xyz,
-            probability_volume_resampled_xyz=np.zeros_like(prepared.resampled_volume_xyz, dtype=np.float32),
-            binary_volume_resampled_xyz=np.zeros_like(prepared.resampled_volume_xyz, dtype=bool),
             candidates=[],
-            candidate_debug_volumes=[],
             component_stats=[],
+            probability_volume_resampled_xyz=(
+                np.zeros_like(prepared.resampled_volume_xyz, dtype=np.float32)
+                if bool(self.config.capture_segmentor_debug)
+                else None
+            ),
+            binary_volume_resampled_xyz=(
+                np.zeros_like(prepared.resampled_volume_xyz, dtype=bool)
+                if bool(self.config.capture_segmentor_debug)
+                else None
+            ),
+            candidate_debug_volumes=[],
             detector_output=None,
             segmentor_output=None,
             debug={

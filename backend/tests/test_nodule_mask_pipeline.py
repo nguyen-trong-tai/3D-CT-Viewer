@@ -227,6 +227,31 @@ class NoduleMaskPipelineTests(unittest.TestCase):
         self.assertTrue(all(candidate["accepted"] for candidate in result.candidates))
         self.assertGreater(int(result.final_mask_resampled_xyz.sum()), 0)
 
+    def test_production_result_omits_debug_payloads_by_default(self):
+        candidates = [
+            {
+                "center_xyz": [20.0, 20.0, 5.0],
+                "score_logit": 1.1,
+                "score_probability": 0.75,
+                "diameter_mm": 5.0,
+            }
+        ]
+        pipeline = NoduleMaskPipeline(
+            detector=FakeDetector(candidates),
+            patch_segmenter=FakePatchSegmenter(),
+            config=NoduleMaskPipelineConfig(),
+        )
+
+        volume = np.zeros((48, 48, 16), dtype=np.int16)
+        lung_mask = np.ones_like(volume, dtype=bool)
+        result = pipeline.run(volume, spacing_xyz_mm=(1.0, 1.0, 1.0), lung_mask_xyz=lung_mask)
+
+        self.assertIsNone(result.detector_output)
+        self.assertIsNone(result.segmentor_output)
+        self.assertIsNone(result.probability_volume_resampled_xyz)
+        self.assertIsNone(result.binary_volume_resampled_xyz)
+        self.assertEqual(result.candidate_debug_volumes, [])
+
     def test_empty_patch_predictions_are_rejected(self):
         candidates = [
             {
@@ -239,7 +264,7 @@ class NoduleMaskPipelineTests(unittest.TestCase):
         pipeline = NoduleMaskPipeline(
             detector=FakeDetector(candidates),
             patch_segmenter=FakePatchSegmenter(emit_empty=True),
-            config=NoduleMaskPipelineConfig(),
+            config=NoduleMaskPipelineConfig(capture_segmentor_debug=True),
         )
 
         volume = np.zeros((32, 32, 12), dtype=np.int16)
@@ -264,7 +289,10 @@ class NoduleMaskPipelineTests(unittest.TestCase):
         pipeline = NoduleMaskPipeline(
             detector=FakeDetector(candidates),
             patch_segmenter=FakePatchSegmenter(),
-            config=NoduleMaskPipelineConfig(),
+            config=NoduleMaskPipelineConfig(
+                capture_detector_debug=True,
+                capture_segmentor_debug=True,
+            ),
         )
 
         volume = np.zeros((48, 48, 16), dtype=np.int16)
@@ -357,7 +385,10 @@ class NoduleMaskPipelineTests(unittest.TestCase):
         pipeline = NoduleMaskPipeline(
             detector=FakeDetector(candidates),
             patch_segmenter=HollowCorePatchSegmenter(),
-            config=NoduleMaskPipelineConfig(local_support_threshold=0.15),
+            config=NoduleMaskPipelineConfig(
+                local_support_threshold=0.15,
+                capture_segmentor_debug=True,
+            ),
         )
 
         volume = np.zeros((64, 64, 16), dtype=np.int16)
@@ -391,6 +422,7 @@ class NoduleMaskPipelineTests(unittest.TestCase):
             config=NoduleMaskPipelineConfig(
                 local_support_threshold=0.15,
                 postprocess_lung_mask_dilation_iters=0,
+                capture_segmentor_debug=True,
             ),
         )
 

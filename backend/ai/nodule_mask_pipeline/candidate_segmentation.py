@@ -43,6 +43,7 @@ class CandidateSegmentationStage:
         prepared: PreparedPipelineInputs,
         detector_output: DetectorStageOutput,
     ) -> CandidateSegmentationStageOutput:
+        capture_segmentor_debug = bool(self.config.capture_segmentor_debug)
         probability_resampled_xyz = np.zeros_like(prepared.resampled_volume_xyz, dtype=np.float32)
         binary_resampled_xyz = np.zeros_like(prepared.resampled_volume_xyz, dtype=bool)
         candidate_records: list[dict[str, Any]] = []
@@ -53,8 +54,13 @@ class CandidateSegmentationStage:
         for candidate_index, candidate in enumerate(detector_output.candidates, start=1):
             candidate_result = self._process_candidate(prepared, dict(candidate), candidate_index)
             candidate_records.append(candidate_result.record)
-            structured_candidates.append(self._build_structured_candidate(candidate_result))
-            if candidate_result.raw_probability_xyz is not None and candidate_result.local_bbox_xyz is not None:
+            if capture_segmentor_debug:
+                structured_candidates.append(self._build_structured_candidate(candidate_result))
+            if (
+                capture_segmentor_debug
+                and candidate_result.raw_probability_xyz is not None
+                and candidate_result.local_bbox_xyz is not None
+            ):
                 candidate_debug_volumes.append(self._build_debug_volume(candidate_result))
             if (
                 not candidate_result.accepted
@@ -76,9 +82,9 @@ class CandidateSegmentationStage:
             probability_volume_resampled_xyz=probability_resampled_xyz,
             binary_volume_resampled_xyz=binary_resampled_xyz,
             candidate_records=candidate_records,
+            accepted_candidate_count=int(accepted_candidates),
             candidate_debug_volumes=candidate_debug_volumes,
             candidates=structured_candidates,
-            accepted_candidate_count=int(accepted_candidates),
         )
 
     def _process_candidate(
@@ -87,6 +93,7 @@ class CandidateSegmentationStage:
         candidate: dict[str, Any],
         candidate_index: int,
     ) -> CandidateMaskResult:
+        capture_segmentor_debug = bool(self.config.capture_segmentor_debug)
         center_original_xyz = np.asarray(candidate.get("center_xyz", (0.0, 0.0, 0.0)), dtype=np.float32)
         center_resampled_xyz = self._map_center_to_resampled(center_original_xyz, prepared.spacing_xyz_mm)
         center_resampled_xyz = np.clip(
@@ -119,6 +126,7 @@ class CandidateSegmentationStage:
             center_y=float(center_resampled_xyz[1]),
             center_x=float(center_resampled_xyz[0]),
             z_index=reference_z,
+            capture_input_patch=capture_segmentor_debug,
         )
 
         x_start = int(reference_result.mapping["slice_col_start"])
@@ -148,6 +156,7 @@ class CandidateSegmentationStage:
                 center_y=float(center_resampled_xyz[1]),
                 center_x=float(center_resampled_xyz[0]),
                 z_index=z_index,
+                capture_input_patch=capture_segmentor_debug,
             )
             self._merge_slice_probability(local_prob_xyz, slice_result, x_start, y_start, z_index - z_start)
             if self.config.capture_segmentor_debug:
@@ -173,6 +182,7 @@ class CandidateSegmentationStage:
             local_prob_xyz=local_prob_xyz,
             local_lung_xyz=local_lung_xyz,
             center_local_xyz=center_local_xyz,
+            capture_debug=capture_segmentor_debug,
         )
 
         if filtered_prob_xyz is None:
@@ -188,9 +198,17 @@ class CandidateSegmentationStage:
                     local_bbox_xyz=local_bbox,
                     extra_stats=filtered_stats,
                 ),
-                raw_probability_xyz=local_prob_xyz.astype(np.float32, copy=False),
+                raw_probability_xyz=(
+                    local_prob_xyz.astype(np.float32, copy=False)
+                    if capture_segmentor_debug
+                    else None
+                ),
                 filtered_probability_xyz=None,
-                filter_debug={key: np.asarray(value) for key, value in filter_debug.items()},
+                filter_debug=(
+                    {key: np.asarray(value) for key, value in filter_debug.items()}
+                    if capture_segmentor_debug
+                    else {}
+                ),
                 local_bbox_xyz=local_bbox,
                 slice_outputs=slice_outputs,
             )
@@ -211,9 +229,17 @@ class CandidateSegmentationStage:
             ),
             local_probability_xyz=filtered_prob_xyz,
             local_binary_xyz=local_binary_xyz,
-            raw_probability_xyz=local_prob_xyz.astype(np.float32, copy=False),
-            filtered_probability_xyz=filtered_prob_xyz,
-            filter_debug={key: np.asarray(value) for key, value in filter_debug.items()},
+            raw_probability_xyz=(
+                local_prob_xyz.astype(np.float32, copy=False)
+                if capture_segmentor_debug
+                else None
+            ),
+            filtered_probability_xyz=filtered_prob_xyz if capture_segmentor_debug else None,
+            filter_debug=(
+                {key: np.asarray(value) for key, value in filter_debug.items()}
+                if capture_segmentor_debug
+                else {}
+            ),
             local_bbox_xyz=local_bbox,
             slice_outputs=slice_outputs,
         )
@@ -237,7 +263,14 @@ class CandidateSegmentationStage:
             slice_result.probability_patch[patch_rows, patch_cols].T,
         )
 
-    def _segment_slice(self, slice_2d: np.ndarray, center_y: float, center_x: float, z_index: int) -> _SliceSegmentationResult:
+    def _segment_slice(
+        self,
+        slice_2d: np.ndarray,
+        center_y: float,
+        center_x: float,
+        z_index: int,
+        capture_input_patch: bool = False,
+    ) -> _SliceSegmentationResult:
         slice_result = self.patch_segmenter.segment_slice_with_mapping(
             np.asarray(slice_2d),
             center_y=center_y,
@@ -245,7 +278,7 @@ class CandidateSegmentationStage:
         )
         probability_patch = np.asarray(getattr(slice_result, "probability_patch"), dtype=np.float32)
         mapping = self._mapping_to_dict(getattr(slice_result, "mapping"))
-        input_patch = getattr(slice_result, "input_patch", None)
+        input_patch = getattr(slice_result, "input_patch", None) if capture_input_patch else None
         input_patch_array = None if input_patch is None else np.asarray(input_patch, dtype=np.float32)
         return _SliceSegmentationResult(
             z_index=int(z_index),

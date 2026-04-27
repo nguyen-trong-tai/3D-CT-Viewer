@@ -95,9 +95,9 @@ class CandidateSegmentationStageOutput:
     probability_volume_resampled_xyz: np.ndarray
     binary_volume_resampled_xyz: np.ndarray
     candidate_records: list[dict[str, Any]]
-    candidate_debug_volumes: list[dict[str, Any]]
-    candidates: list[SegmentorCandidateOutput]
     accepted_candidate_count: int
+    candidate_debug_volumes: list[dict[str, Any]] = field(default_factory=list)
+    candidates: list[SegmentorCandidateOutput] = field(default_factory=list)
 
 
 @dataclass
@@ -106,11 +106,11 @@ class NoduleMaskPipelineResult:
     final_mask_resampled_xyz: np.ndarray
     lung_mask_xyz: np.ndarray
     lung_mask_resampled_xyz: np.ndarray
-    probability_volume_resampled_xyz: np.ndarray
-    binary_volume_resampled_xyz: np.ndarray
     candidates: list[dict[str, Any]]
-    candidate_debug_volumes: list[dict[str, Any]]
     component_stats: list[dict[str, Any]]
+    probability_volume_resampled_xyz: np.ndarray | None = None
+    binary_volume_resampled_xyz: np.ndarray | None = None
+    candidate_debug_volumes: list[dict[str, Any]] = field(default_factory=list)
     detector_output: DetectorStageOutput | None = None
     segmentor_output: CandidateSegmentationStageOutput | None = None
     debug: dict[str, Any] = field(default_factory=dict)

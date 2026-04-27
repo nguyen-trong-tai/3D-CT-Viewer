@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from config import settings
 from models.enums import CaseStatus
 from storage.repository import CaseRepository
 
@@ -128,12 +129,16 @@ class CaseService:
 
         if artifacts.get("sdf"):
             stage_state["sdf"]["status"] = "completed"
+        elif not settings.EAGER_SDF_ARTIFACTS and (
+            artifacts.get("segmentation_mask") or artifacts.get("mesh") or status == CaseStatus.READY.value
+        ):
+            stage_state["sdf"]["status"] = "skipped"
         elif status == CaseStatus.PROCESSING.value and stage_state["segmentation"]["status"] == "completed":
             stage_state["sdf"]["status"] = "running"
 
         if artifacts.get("mesh"):
             stage_state["mesh"]["status"] = "completed"
-        elif status == CaseStatus.PROCESSING.value and stage_state["sdf"]["status"] == "completed":
+        elif status == CaseStatus.PROCESSING.value and stage_state["sdf"]["status"] in {"completed", "skipped"}:
             stage_state["mesh"]["status"] = "running"
 
         if status == CaseStatus.ERROR.value:
@@ -142,7 +147,9 @@ class CaseService:
                     payload["status"] = "failed"
 
         if status == CaseStatus.READY.value:
-            for payload in stage_state.values():
+            for stage_name, payload in stage_state.items():
+                if stage_name == "sdf" and payload["status"] == "skipped":
+                    continue
                 payload["status"] = "completed"
 
         return stage_state

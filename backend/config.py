@@ -164,6 +164,7 @@ class Settings:
     SDF_VOXEL_THRESHOLD_LARGE: int = 100_000_000  # > 100M voxels -> factor 4
     SDF_VOXEL_THRESHOLD_MEDIUM: int = 50_000_000   # > 50M voxels -> factor 3
     SDF_VOXEL_THRESHOLD_SMALL: int = 20_000_000    # > 20M voxels -> factor 2
+    EAGER_SDF_ARTIFACTS: bool = _env_bool("EAGER_SDF_ARTIFACTS", False)
 
     # Preview artifacts for fast remote viewing
     PREVIEW_MAX_DIM: int = int(os.getenv("PREVIEW_MAX_DIM", "256"))
@@ -180,6 +181,8 @@ class Settings:
     MESH_STEP_SIZE_MEDIUM: int = int(os.getenv("MESH_STEP_SIZE_MEDIUM", "1"))
     MESH_STEP_SIZE_LARGE: int = int(os.getenv("MESH_STEP_SIZE_LARGE", "2"))
     MESH_STEP_SIZE_HUGE: int = int(os.getenv("MESH_STEP_SIZE_HUGE", "3"))
+    MESH_SMOOTHING_ITERATIONS: int = int(os.getenv("MESH_SMOOTHING_ITERATIONS", "3"))
+    MESH_SMOOTHING_LAMBDA: float = float(os.getenv("MESH_SMOOTHING_LAMBDA", "0.5"))
     
     # Draco compression settings
     DRACO_COMPRESSION_LEVEL: int = 7
@@ -240,11 +243,14 @@ class Settings:
         )
 
         self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.cpu_count() or 4))
+        self.EAGER_SDF_ARTIFACTS = _env_bool("EAGER_SDF_ARTIFACTS", False)
         self.PREVIEW_MAX_DIM = int(os.getenv("PREVIEW_MAX_DIM", "256"))
         self.PREVIEW_MAX_VOXELS = int(os.getenv("PREVIEW_MAX_VOXELS", "16000000"))
         self.MESH_STEP_SIZE_MEDIUM = int(os.getenv("MESH_STEP_SIZE_MEDIUM", "1"))
         self.MESH_STEP_SIZE_LARGE = int(os.getenv("MESH_STEP_SIZE_LARGE", "2"))
         self.MESH_STEP_SIZE_HUGE = int(os.getenv("MESH_STEP_SIZE_HUGE", "3"))
+        self.MESH_SMOOTHING_ITERATIONS = int(os.getenv("MESH_SMOOTHING_ITERATIONS", "3"))
+        self.MESH_SMOOTHING_LAMBDA = float(os.getenv("MESH_SMOOTHING_LAMBDA", "0.5"))
 
         # Ensure storage directories exist after refresh.
         self.STORAGE_ROOT.mkdir(parents=True, exist_ok=True)

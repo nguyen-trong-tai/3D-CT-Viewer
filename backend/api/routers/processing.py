@@ -268,7 +268,7 @@ async def get_implicit_info(
     if status not in [CaseStatus.READY.value, "ready"]:
         raise HTTPException(status_code=400, detail="Processing not complete")
 
-    if not repo.sdf_exists(case_id):
+    if settings.EAGER_SDF_ARTIFACTS and not repo.sdf_exists(case_id):
         raise HTTPException(status_code=404, detail="SDF not available")
 
     return ImplicitMetadataResponse()

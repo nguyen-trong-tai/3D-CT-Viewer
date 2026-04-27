@@ -65,6 +65,66 @@ class SegmentationManifestRepositoryTests(unittest.TestCase):
 
 
 class AISegmentationServiceNoduleEntityTests(unittest.TestCase):
+    def test_segment_returns_production_contract_without_legacy_volume_keys(self):
+        left_mask = np.zeros((8, 8, 8), dtype=bool)
+        right_mask = np.zeros((8, 8, 8), dtype=bool)
+        nodule_mask = np.zeros((8, 8, 8), dtype=bool)
+        left_mask[1:4, 1:4, 1:4] = True
+        right_mask[4:7, 1:4, 1:4] = True
+        nodule_mask[3:5, 3:5, 3:5] = True
+
+        class StubLungSegmenter:
+            def segment(self, volume_xyz):
+                return {
+                    "left_mask": left_mask,
+                    "right_mask": right_mask,
+                    "lung_mask": np.asarray(left_mask | right_mask, dtype=bool),
+                }
+
+        class StubPipeline:
+            def run(self, **kwargs):
+                return type(
+                    "StubPipelineResult",
+                    (),
+                    {
+                        "final_mask_xyz": nodule_mask,
+                        "candidates": [
+                            {
+                                "accepted": True,
+                                "candidate_index": 1,
+                                "score_probability": 0.95,
+                                "score_logit": 2.1,
+                                "center_xyz": [3.5, 3.5, 3.5],
+                                "center_xyz_rounded": [4, 4, 4],
+                                "diameter_mm": 2.0,
+                            }
+                        ],
+                        "component_stats": [
+                            {
+                                "label_id": 1,
+                                "voxel_count": 8,
+                                "bbox_xyz": [[3, 5], [3, 5], [3, 5]],
+                                "centroid_xyz": [3.5, 3.5, 3.5],
+                                "mask_origin_xyz": [3, 3, 3],
+                                "local_mask_xyz": np.ones((2, 2, 2), dtype=np.uint8),
+                            }
+                        ],
+                        "debug": {"stub": True},
+                    },
+                )()
+
+        service = AISegmentationService(lung_segmenter=StubLungSegmenter())
+        service._nodule_pipeline = StubPipeline()
+
+        result = service.segment(np.zeros((8, 8, 8), dtype=np.int16), (1.0, 1.0, 1.0))
+
+        self.assertEqual(set(result.keys()), {"labeled_mask", "components", "manifest", "stats"})
+        self.assertNotIn("lung_mask", result)
+        self.assertNotIn("left_mask", result)
+        self.assertNotIn("right_mask", result)
+        self.assertNotIn("nodule_mask", result)
+        self.assertEqual(result["manifest"]["nodule_entities"][0]["candidate_index"], 1)
+
     def test_build_nodule_components_splits_connected_components(self):
         service = AISegmentationService()
 
@@ -146,6 +206,44 @@ class AISegmentationServiceNoduleEntityTests(unittest.TestCase):
         self.assertEqual(nodule_components[0]["entity"]["candidate_index"], 1)
         self.assertEqual(nodule_components[0]["entity"]["bbox_xyz"], [[12, 15], [12, 15], [12, 15]])
         self.assertEqual(nodule_components[1]["entity"]["candidate_index"], 2)
+
+    def test_build_nodule_components_reuses_precomputed_component_stats(self):
+        service = AISegmentationService()
+
+        nodule_mask = np.zeros((12, 12, 12), dtype=bool)
+        nodule_mask[1:4, 1:4, 2:5] = True
+        nodule_mask[7:10, 6:9, 7:10] = True
+
+        component_stats = [
+            {
+                "label_id": 1,
+                "voxel_count": 27,
+                "bbox_xyz": [[1, 4], [1, 4], [2, 5]],
+                "centroid_xyz": [2.0, 2.0, 3.0],
+                "mask_origin_xyz": [1, 1, 2],
+                "local_mask_xyz": np.ones((3, 3, 3), dtype=np.uint8),
+            },
+            {
+                "label_id": 2,
+                "voxel_count": 27,
+                "bbox_xyz": [[7, 10], [6, 9], [7, 10]],
+                "centroid_xyz": [8.0, 7.0, 8.0],
+                "mask_origin_xyz": [7, 6, 7],
+                "local_mask_xyz": np.ones((3, 3, 3), dtype=np.uint8),
+            },
+        ]
+
+        nodule_components = service._build_nodule_components(
+            nodule_mask,
+            (1.0, 1.0, 2.0),
+            component_stats=component_stats,
+        )
+
+        self.assertEqual(len(nodule_components), 2)
+        self.assertEqual(tuple(nodule_components[0]["mask"].shape), (3, 3, 3))
+        self.assertEqual(tuple(nodule_components[0]["mask_origin_xyz"]), (1, 1, 2))
+        self.assertEqual(tuple(nodule_components[1]["mask"].shape), (3, 3, 3))
+        self.assertEqual(tuple(nodule_components[1]["mask_origin_xyz"]), (7, 6, 7))
 
 
 if __name__ == "__main__":

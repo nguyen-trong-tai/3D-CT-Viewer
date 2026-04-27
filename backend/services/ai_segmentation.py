@@ -95,11 +95,15 @@ class AISegmentationService:
                     dict(component)
                     for component in (getattr(pipeline_result, "component_stats", []) or [])
                 ]
+                summarized_component_stats = [
+                    self._summarize_component_stat(component)
+                    for component in pipeline_component_stats
+                ]
                 nodule_debug = {
-                    "mode": "sandbox_ai",
+                    "mode": "nodule_pipeline",
                     "candidate_count": int(len(getattr(pipeline_result, "candidates", []) or [])),
                     "component_count": int(len(pipeline_component_stats)),
-                    "component_stats": list(pipeline_component_stats),
+                    "component_stats": summarized_component_stats,
                     "pipeline_debug": dict(getattr(pipeline_result, "debug", {}) or {}),
                 }
             except Exception as exc:
@@ -120,10 +124,6 @@ class AISegmentationService:
         components = self._build_components(left_mask, right_mask, nodule_components)
 
         return {
-            "lung_mask": (left_mask | right_mask).astype(np.uint8),
-            "left_mask": left_mask.astype(np.uint8),
-            "right_mask": right_mask.astype(np.uint8),
-            "nodule_mask": nodule_mask.astype(np.uint8),
             "labeled_mask": labeled_mask,
             "components": components,
             "manifest": manifest,
@@ -219,18 +219,20 @@ class AISegmentationService:
         if not mask_bool.any():
             return []
 
-        labeled, _ = ndimage.label(mask_bool, structure=ndimage.generate_binary_structure(3, 1))
-        component_sizes = np.bincount(labeled.ravel())
-        objects = ndimage.find_objects(labeled)
         spacing = np.asarray(spacing_xyz_mm, dtype=np.float32)
         voxel_volume_mm3 = float(np.prod(spacing))
         min_voxel_count = self._minimum_nodule_component_voxels(spacing_xyz_mm)
-        component_records = self._build_component_records(
-            labeled,
-            component_sizes,
-            objects,
-            component_stats or [],
-        )
+        component_records = self._build_component_records_from_stats(component_stats or [])
+        if not component_records:
+            labeled, _ = ndimage.label(mask_bool, structure=ndimage.generate_binary_structure(3, 1))
+            component_sizes = np.bincount(labeled.ravel())
+            objects = ndimage.find_objects(labeled)
+            component_records = self._build_component_records_from_labeled(
+                labeled,
+                component_sizes,
+                objects,
+                component_stats or [],
+            )
         matched_candidates_by_label, matched_label_order = self._match_candidates_to_components(
             component_records,
             spacing_xyz_mm,
@@ -313,7 +315,53 @@ class AISegmentationService:
 
         return nodule_components
 
-    def _build_component_records(
+    def _build_component_records_from_stats(
+        self,
+        component_stats: list[dict[str, Any]],
+    ) -> dict[int, NoduleComponentRecord]:
+        if not component_stats:
+            return {}
+
+        component_records: dict[int, NoduleComponentRecord] = {}
+        for component_stat in component_stats:
+            try:
+                label_id = int(component_stat.get("label_id", 0))
+                voxel_count = int(component_stat.get("voxel_count", 0))
+            except (TypeError, ValueError):
+                return {}
+
+            if label_id <= 0 or voxel_count <= 0:
+                return {}
+
+            bbox_xyz = self._coerce_bbox_xyz(component_stat.get("bbox_xyz"))
+            if bbox_xyz is None:
+                return {}
+
+            local_mask = np.asarray(component_stat.get("local_mask_xyz"))
+            if local_mask.ndim != 3 or local_mask.size == 0:
+                return {}
+            local_mask_uint8 = np.asarray(local_mask > 0, dtype=np.uint8)
+            local_origin_xyz = self._resolve_origin_xyz(component_stat.get("mask_origin_xyz"), bbox_xyz)
+            if local_origin_xyz is None:
+                return {}
+
+            centroid_xyz = self._resolve_centroid_xyz(
+                component_stat.get("centroid_xyz"),
+                local_mask_uint8,
+                local_origin_xyz,
+            )
+            component_records[label_id] = NoduleComponentRecord(
+                label_id=label_id,
+                voxel_count=voxel_count,
+                centroid_xyz=centroid_xyz,
+                bbox_xyz=bbox_xyz,
+                local_mask=local_mask_uint8,
+                local_mask_origin_xyz=local_origin_xyz,
+            )
+
+        return component_records
+
+    def _build_component_records_from_labeled(
         self,
         labeled: np.ndarray,
         component_sizes: np.ndarray,
@@ -338,7 +386,11 @@ class AISegmentationService:
             component_stat = stats_by_label.get(label_id, {})
             bbox_xyz = self._resolve_bbox_xyz(component_stat.get("bbox_xyz"), bbox)
             local_mask, local_origin_xyz = self._extract_local_component_mask(labeled, label_id, bbox_xyz)
-            centroid_xyz = self._resolve_centroid_xyz(component_stat.get("centroid_xyz"), labeled, label_id)
+            centroid_xyz = self._resolve_centroid_xyz(
+                component_stat.get("centroid_xyz"),
+                local_mask,
+                local_origin_xyz,
+            )
             component_records[label_id] = NoduleComponentRecord(
                 label_id=int(label_id),
                 voxel_count=voxel_count,
@@ -431,10 +483,10 @@ class AISegmentationService:
     @staticmethod
     def _resolve_centroid_xyz(
         centroid_value: Any,
-        labeled: np.ndarray,
-        label_id: int,
+        local_mask: np.ndarray,
+        local_origin_xyz: tuple[int, int, int],
     ) -> tuple[float, float, float]:
-        if isinstance(centroid_value, list) and len(centroid_value) == 3:
+        if isinstance(centroid_value, (list, tuple)) and len(centroid_value) == 3:
             try:
                 return (
                     float(centroid_value[0]),
@@ -444,9 +496,13 @@ class AISegmentationService:
             except (TypeError, ValueError):
                 pass
 
-        component_mask = np.asarray(labeled == label_id, dtype=np.uint8)
-        centroid = ndimage.center_of_mass(component_mask)
-        return (float(centroid[0]), float(centroid[1]), float(centroid[2]))
+        component_mask = np.asarray(local_mask, dtype=np.uint8)
+        centroid_local = ndimage.center_of_mass(component_mask)
+        return (
+            float(local_origin_xyz[0]) + float(centroid_local[0]),
+            float(local_origin_xyz[1]) + float(centroid_local[1]),
+            float(local_origin_xyz[2]) + float(centroid_local[2]),
+        )
 
     @staticmethod
     def _extract_local_component_mask(
@@ -457,6 +513,46 @@ class AISegmentationService:
         (x0, x1), (y0, y1), (z0, z1) = bbox_xyz
         local_mask = np.asarray(labeled[x0:x1, y0:y1, z0:z1] == int(label_id), dtype=np.uint8)
         return local_mask, (int(x0), int(y0), int(z0))
+
+    @staticmethod
+    def _coerce_bbox_xyz(
+        bbox_value: Any,
+    ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]] | None:
+        if isinstance(bbox_value, (list, tuple)) and len(bbox_value) == 3:
+            try:
+                return (
+                    (int(bbox_value[0][0]), int(bbox_value[0][1])),
+                    (int(bbox_value[1][0]), int(bbox_value[1][1])),
+                    (int(bbox_value[2][0]), int(bbox_value[2][1])),
+                )
+            except (TypeError, ValueError, IndexError):
+                return None
+        return None
+
+    @staticmethod
+    def _resolve_origin_xyz(
+        origin_value: Any,
+        bbox_xyz: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+    ) -> tuple[int, int, int] | None:
+        if isinstance(origin_value, (list, tuple)) and len(origin_value) == 3:
+            try:
+                return (
+                    int(origin_value[0]),
+                    int(origin_value[1]),
+                    int(origin_value[2]),
+                )
+            except (TypeError, ValueError):
+                return None
+        return (int(bbox_xyz[0][0]), int(bbox_xyz[1][0]), int(bbox_xyz[2][0]))
+
+    @staticmethod
+    def _summarize_component_stat(component_stat: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key, value in dict(component_stat).items():
+            if isinstance(value, np.ndarray):
+                continue
+            summary[key] = value
+        return summary
 
     @classmethod
     def _score_candidate_component_match(

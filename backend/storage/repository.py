@@ -846,6 +846,28 @@ class CaseRepository:
         if self.object_store and object_key and self.object_store.object_exists(object_key):
             return True
         return (self._case_dir(case_id) / "sdf_volume.npy").exists()
+
+    def delete_sdf(self, case_id: str) -> None:
+        """Remove a persisted SDF artifact when the pipeline switches to lazy mode."""
+        local_path = self._case_dir(case_id) / "sdf_volume.npy"
+        if local_path.exists():
+            local_path.unlink()
+
+        cache_path = self._artifact_cache_path(case_id, "sdf", local_path.name)
+        if cache_path.exists():
+            self._cleanup_temp_artifact_path(cache_path)
+
+        object_key = self.get_artifact_object_key(case_id, "sdf")
+        if self.object_store and object_key:
+            try:
+                self.object_store.delete_object(object_key)
+            except Exception:
+                pass
+
+        if self.state_store:
+            self.state_store.set_artifact(case_id, "sdf", False, object_key=object_key)
+
+        self.sync_for_write(scope="artifact")
     
     # Mesh Storage
     

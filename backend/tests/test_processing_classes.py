@@ -14,7 +14,9 @@ if str(ROOT) not in sys.path:
 from processing import MedicalVolumeLoader, MeshProcessor, SDFProcessor
 from processing.mesh import extract_mesh
 from processing.sdf import compute_sdf_fast
-from services.pipeline import PipelineService, PipelineStageStatus
+from models.enums import CaseStatus
+from services.pipeline import PipelineService, PipelineStageStatus, SegmentationComponent
+from config import settings
 
 
 class ProcessingClassTests(unittest.TestCase):
@@ -289,6 +291,157 @@ class ProcessingClassTests(unittest.TestCase):
         self.assertEqual(tuple(cropped_mask.shape), (5, 5, 5))
         np.testing.assert_array_equal(origin_xyz, np.array([9, 11, 13], dtype=np.int32))
         self.assertEqual(int(np.count_nonzero(cropped_mask)), 27)
+
+    def test_stage_sdf_is_skipped_when_eager_artifacts_are_disabled(self):
+        repo = mock.Mock()
+        pipeline = PipelineService(repo)
+        mask = np.zeros((8, 8, 8), dtype=np.uint8)
+        mask[2:6, 2:6, 2:6] = 1
+
+        original_eager_sdf = settings.EAGER_SDF_ARTIFACTS
+        settings.EAGER_SDF_ARTIFACTS = False
+
+        try:
+            result, sdf = pipeline._stage_sdf("case-1", mask, force_recompute=False)
+        finally:
+            settings.EAGER_SDF_ARTIFACTS = original_eager_sdf
+
+        self.assertEqual(result.status, PipelineStageStatus.SKIPPED)
+        self.assertIsNone(sdf)
+        self.assertIn("Deferred", result.message)
+        repo.delete_sdf.assert_called_once_with("case-1")
+        repo.save_sdf.assert_not_called()
+        repo.load_sdf.assert_not_called()
+        repo.sdf_exists.assert_not_called()
+
+    def test_stage_sdf_recomputes_current_mask_instead_of_loading_old_artifact(self):
+        repo = mock.Mock()
+        repo.sdf_exists.return_value = True
+
+        pipeline = PipelineService(repo)
+        mask = np.zeros((8, 8, 8), dtype=np.uint8)
+        mask[2:6, 2:6, 2:6] = 1
+        fresh_sdf = np.ones((4, 4, 4), dtype=np.float32)
+
+        original_eager_sdf = settings.EAGER_SDF_ARTIFACTS
+        settings.EAGER_SDF_ARTIFACTS = True
+
+        try:
+            with mock.patch.object(
+                PipelineService,
+                "_compute_mask_sdf",
+                return_value=(fresh_sdf, 2),
+            ) as compute_sdf_mock:
+                result, sdf = pipeline._stage_sdf("case-1", mask, force_recompute=False)
+        finally:
+            settings.EAGER_SDF_ARTIFACTS = original_eager_sdf
+
+        self.assertEqual(result.status, PipelineStageStatus.COMPLETED)
+        self.assertIs(sdf, fresh_sdf)
+        compute_sdf_mock.assert_called_once_with(mask)
+        repo.save_sdf.assert_called_once_with("case-1", fresh_sdf)
+        repo.load_sdf.assert_not_called()
+        repo.sdf_exists.assert_not_called()
+
+    def test_stage_mesh_applies_laplacian_smoothing_before_saving(self):
+        repo = mock.Mock()
+        repo.mesh_exists.return_value = False
+
+        pipeline = PipelineService(repo)
+        component_mask = np.zeros((10, 10, 10), dtype=np.uint8)
+        component_mask[2:8, 2:8, 2:8] = 1
+        component = SegmentationComponent(
+            key="nodule_001",
+            display_name="Nodule 1",
+            mask=component_mask,
+            color_hex="#f97316",
+            render_3d=True,
+        )
+
+        original_iterations = settings.MESH_SMOOTHING_ITERATIONS
+        original_lambda = settings.MESH_SMOOTHING_LAMBDA
+        settings.MESH_SMOOTHING_ITERATIONS = 2
+        settings.MESH_SMOOTHING_LAMBDA = 0.25
+
+        try:
+            with mock.patch.object(
+                MeshProcessor,
+                "smooth_laplacian",
+                side_effect=lambda mesh, iterations, lamb: mesh,
+            ) as smooth_mock:
+                result = pipeline._stage_mesh(
+                    "case-1",
+                    np.zeros((4, 4, 4), dtype=np.float32),
+                    (1.0, 1.0, 1.0),
+                    [component],
+                    force_recompute=True,
+                )
+        finally:
+            settings.MESH_SMOOTHING_ITERATIONS = original_iterations
+            settings.MESH_SMOOTHING_LAMBDA = original_lambda
+
+        self.assertEqual(result.status, PipelineStageStatus.COMPLETED)
+        smooth_mock.assert_called_once()
+        self.assertEqual(smooth_mock.call_args.kwargs["iterations"], 2)
+        self.assertEqual(smooth_mock.call_args.kwargs["lamb"], 0.25)
+        repo.save_mesh.assert_called_once()
+
+    def test_stage_mesh_fallback_computes_current_sdf_on_demand(self):
+        repo = mock.Mock()
+        repo.mesh_exists.return_value = False
+
+        pipeline = PipelineService(repo)
+        mask = np.zeros((10, 10, 10), dtype=np.uint8)
+        mask[2:8, 2:8, 2:8] = 1
+        fallback_mesh = MeshProcessor._create_placeholder_mesh((4, 4, 4), (1.0, 1.0, 1.0))
+
+        with mock.patch.object(
+            PipelineService,
+            "_compute_mask_sdf",
+            return_value=(np.zeros((4, 4, 4), dtype=np.float32), 3),
+        ) as compute_sdf_mock:
+            with mock.patch.object(
+                MeshProcessor,
+                "extract_mesh",
+                return_value=fallback_mesh,
+            ):
+                result = pipeline._stage_mesh(
+                    "case-1",
+                    mask,
+                    (1.0, 1.0, 1.0),
+                    [],
+                    force_recompute=True,
+                )
+
+        self.assertEqual(result.status, PipelineStageStatus.COMPLETED)
+        self.assertIn("downsample=3", result.message)
+        compute_sdf_mock.assert_called_once_with(mask)
+        repo.save_mesh.assert_called_once()
+
+    def test_get_pipeline_status_marks_lazy_sdf_stage_as_skipped(self):
+        repo = mock.Mock()
+        repo.get_status.return_value = CaseStatus.PROCESSING.value
+        repo.get_available_artifacts.return_value = {
+            "ct_volume": True,
+            "segmentation_mask": True,
+            "sdf": False,
+            "mesh": False,
+        }
+        repo.get_pipeline_state.return_value = {}
+
+        pipeline = PipelineService(repo)
+
+        original_eager_sdf = settings.EAGER_SDF_ARTIFACTS
+        settings.EAGER_SDF_ARTIFACTS = False
+
+        try:
+            status = pipeline.get_pipeline_status("case-1")
+        finally:
+            settings.EAGER_SDF_ARTIFACTS = original_eager_sdf
+
+        stage_statuses = {stage["name"]: stage["status"] for stage in status["stages"]}
+        self.assertEqual(stage_statuses["sdf"], "skipped")
+        self.assertEqual(stage_statuses["mesh"], "running")
 
 
 if __name__ == "__main__":
