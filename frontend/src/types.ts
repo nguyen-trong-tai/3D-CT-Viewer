@@ -183,12 +183,13 @@ export interface SegmentationManifest {
 
 export type SegmentationVisibility = Record<string, boolean>;
 export type MeshVisibilityPreset = 'default' | 'nodule_focus';
+export type SegmentationPaletteMode = 'clinical' | 'color_safe';
 
 export const DEFAULT_SEGMENTATION_CONFIG: SegmentationConfig = {
     visible: false,
     opacity: 0.5,
-    lungColor: '#22c55e',
-    tumorColor: '#ef4444',
+    lungColor: '#7db3c8',
+    tumorColor: '#d97706',
 };
 
 /**
@@ -238,6 +239,7 @@ export interface ViewerState {
     customWindow?: { level: number; width: number };
     segmentation: SegmentationConfig;
     segmentationVisibility: SegmentationVisibility;
+    segmentationPaletteMode: SegmentationPaletteMode;
     meshVisibilityPreset: MeshVisibilityPreset;
     showWireframe: boolean;
     zoomLevel: number;
@@ -250,6 +252,7 @@ export const DEFAULT_VIEWER_STATE: ViewerState = {
     windowPreset: 'LUNG',
     segmentation: DEFAULT_SEGMENTATION_CONFIG,
     segmentationVisibility: {},
+    segmentationPaletteMode: 'clinical',
     meshVisibilityPreset: 'default',
     showWireframe: false,
     zoomLevel: 1,

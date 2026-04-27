@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useViewerStore } from '../../stores/viewerStore';
 import { Layers, Box, LogOut, RotateCcw, Eye, LayoutTemplate, MousePointer2, ZoomIn, Hand, RefreshCw, LayoutGrid, Columns, Crosshair } from 'lucide-react';
 import { SegmentedControl, ToggleSwitch } from '../UI';
+import { getDisplaySegmentationLabels } from '../../utils/segmentationPalette';
 
 // Custom hook to handle click outside
 function useOnClickOutside(ref: React.RefObject<HTMLElement | null>, handler: () => void) {
@@ -186,6 +187,7 @@ export const HeaderToolbar: React.FC = () => {
         showSegmentation,
         setShowSegmentation,
         segmentationLabels,
+        segmentationPaletteMode,
         segmentationVisibility,
         setSegmentationVisibility,
         meshVisibilityPreset,
@@ -205,6 +207,8 @@ export const HeaderToolbar: React.FC = () => {
         { value: 'MPR_3D' as const, label: 'MPR+3D', icon: <Columns size={14} /> },
     ];
     const availableLabels = segmentationLabels.filter((label) => label.available);
+    const displaySegmentationLabels = getDisplaySegmentationLabels(segmentationLabels, segmentationPaletteMode);
+    const availableDisplayLabels = displaySegmentationLabels.filter((label) => label.available);
     const has2DSegments = availableLabels.some((label) => label.render_2d);
     const has3DSegments = availableLabels.some((label) => label.render_3d);
     const has3DLung = availableLabels.some(
@@ -235,7 +239,7 @@ export const HeaderToolbar: React.FC = () => {
                 icon={<Eye size={20} />}
                 title="Segmentation Visibility"
                 disabled={!has2DSegments && !has3DSegments}
-                active={showSegmentation || availableLabels.some((label) => segmentationVisibility[label.key])}
+                active={showSegmentation || availableDisplayLabels.some((label) => segmentationVisibility[label.key])}
                 colorTheme="cyan"
             >
                 {has2DSegments && !is3DViewActive && (
@@ -246,7 +250,7 @@ export const HeaderToolbar: React.FC = () => {
                         description="Show segmentation labels on CT slices"
                     />
                 )}
-                {availableLabels.map((label) => {
+                {availableDisplayLabels.map((label) => {
                     const isVisible = segmentationVisibility[label.key] ?? label.visible_by_default;
                     const supportedViews = [
                         label.render_2d ? '2D' : null,
@@ -281,7 +285,7 @@ export const HeaderToolbar: React.FC = () => {
                         />
                     );
                 })}
-                {!availableLabels.length && (
+                {!availableDisplayLabels.length && (
                     <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                         Waiting for backend segmentation masks...
                     </div>
@@ -320,6 +324,106 @@ export const HeaderToolbar: React.FC = () => {
                     </div>
                 )}
             </ToolbarPopover>
+
+            <div style={{ width: 1, height: 24, background: 'var(--border-subtle)', margin: '0 4px' }} />
+
+            {/* <ToolbarPopover
+                icon={<Download size={20} />}
+                title="Export"
+                active={Boolean(exportBusyKey)}
+                colorTheme="amber"
+            >
+                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    Export the current 2D/3D state directly from the mounted viewers.
+                </div>
+
+                <ActionButton
+                    title="Current 2D Slice PNG"
+                    description=""
+                    icon={<FileImage size={16} />}
+                    onClick={exportCurrentSlicePng}
+                    disabled={!canExportCurrentSlice}
+                    busy={exportBusyKey === 'slice-png'}
+                />
+
+                <ActionButton
+                    title="MPR PNG"
+                    description=""
+                    icon={<FileImage size={16} />}
+                    onClick={exportMprPng}
+                    disabled={!canExportMpr}
+                    busy={exportBusyKey === 'mpr-png'}
+                />
+
+                <ActionButton
+                    title="3D Snapshot PNG"
+                    description=""
+                    icon={<FileImage size={16} />}
+                    onClick={export3DSnapshotPng}
+                    disabled={!canExport3DSnapshot}
+                    busy={exportBusyKey === '3d-png'}
+                />
+
+                <ActionButton
+                    title="Mesh GLB"
+                    description=""
+                    icon={<Box size={16} />}
+                    onClick={downloadMeshGlb}
+                    disabled={!meshReady}
+                    busy={exportBusyKey === 'mesh-glb'}
+                />
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }}>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                        FPS
+                        <input
+                            type="number"
+                            min={1}
+                            max={30}
+                            value={videoFps}
+                            onChange={(event) => setVideoFps(Math.max(1, Math.min(30, Number.parseInt(event.target.value || '12', 10) || 12)))}
+                            style={numberInputStyle}
+                        />
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                        Start
+                        <input
+                            type="number"
+                            min={1}
+                            max={metadata.totalSlices}
+                            value={videoStartSlice}
+                            onChange={(event) => setVideoStartSlice(Math.max(1, Math.min(metadata.totalSlices, Number.parseInt(event.target.value || '1', 10) || 1)))}
+                            style={numberInputStyle}
+                        />
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                        End
+                        <input
+                            type="number"
+                            min={1}
+                            max={metadata.totalSlices}
+                            value={videoEndSlice}
+                            onChange={(event) => setVideoEndSlice(Math.max(1, Math.min(metadata.totalSlices, Number.parseInt(event.target.value || `${metadata.totalSlices}`, 10) || metadata.totalSlices)))}
+                            style={numberInputStyle}
+                        />
+                    </label>
+                </div>
+
+                <ActionButton
+                    title="2D Slice Video (WebM)"
+                    description=""
+                    icon={<Film size={16} />}
+                    onClick={exportSliceVideo}
+                    disabled={!canExportSliceVideo}
+                    busy={exportBusyKey === 'slice-video'}
+                />
+
+                {(exportFeedback.message || exportBusyKey) && (
+                    <div style={{ fontSize: '0.74rem', color: feedbackColor, lineHeight: 1.5 }}>
+                        {exportFeedback.message}
+                    </div>
+                )}
+            </ToolbarPopover> */}
 
             <div style={{ width: 1, height: 24, background: 'var(--border-subtle)', margin: '0 4px' }} />
 

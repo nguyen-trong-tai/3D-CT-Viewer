@@ -6,12 +6,20 @@ import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import { meshApi } from '../../services/api';
 import { Box, RotateCcw, Move3d } from 'lucide-react';
 import { useViewerStore, type ToolMode } from '../../stores/viewerStore';
+import { canvasToBlob, createExportCanvas, wait } from '../../utils/export';
+import { registerModelExporter } from '../../utils/exportRegistry';
 import { DRACO_DECODER_PATH } from '../../utils/draco';
 import type {
     CrosshairPosition,
     MeshVisibilityPreset,
+    SegmentationPaletteMode,
     SegmentationVisibility,
 } from '../../types';
+import {
+    getDisplaySegmentationLabels,
+    getSegmentationPaletteTokens,
+    resolveSegmentationLabelColor,
+} from '../../utils/segmentationPalette';
 
 interface ModelViewerProps {
     caseId: string;
@@ -50,13 +58,6 @@ type SceneAlignment = {
     size: THREE.Vector3;
 };
 
-const COMPONENT_COLOR_MAP: Record<string, string> = {
-    lung: '#ef4444',
-    left_lung: '#60a5fa',
-    right_lung: '#34d399',
-    nodule: '#f97316',
-};
-
 const FALLBACK_COMPONENT_COLORS = ['#f59e0b', '#a855f7', '#14b8a6', '#fb7185'];
 const MATERIAL_EMISSIVE_INTENSITY = 0.18;
 const SELECTED_NODULE_EMISSIVE_INTENSITY = 0.7;
@@ -65,8 +66,31 @@ const DIMMED_NODULE_OPACITY = 0.28;
 const MIN_FOCUS_DISTANCE = 80;
 const MAX_FOCUS_DISTANCE = 320;
 const HOVER_TINT = new THREE.Color('#fff7ed');
+const SELECTED_TINT = new THREE.Color('#fff7bf');
 const DEFAULT_CAMERA_POSITION = new THREE.Vector3(250, 200, 250);
 const DEFAULT_CAMERA_TARGET = new THREE.Vector3(0, 0, 0);
+
+const drawRoundedRect = (
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    radius: number
+) => {
+    const safeRadius = Math.max(0, Math.min(radius, width / 2, height / 2));
+    ctx.beginPath();
+    ctx.moveTo(x + safeRadius, y);
+    ctx.lineTo(x + width - safeRadius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+    ctx.lineTo(x + width, y + height - safeRadius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+    ctx.lineTo(x + safeRadius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+    ctx.lineTo(x, y + safeRadius);
+    ctx.quadraticCurveTo(x, y, x + safeRadius, y);
+    ctx.closePath();
+};
 
 const formatTooltipVolume = (volumeMm3: number, volumeMl: number): string =>
     volumeMl >= 0.1 ? `${volumeMl.toFixed(2)} ml` : `${volumeMm3.toFixed(1)} mm3`;
@@ -165,7 +189,12 @@ const getMaterialColor = (material: THREE.Material | THREE.Material[]): THREE.Co
     return null;
 };
 
-const resolveMeshColor = (mesh: THREE.Mesh, fallbackColor: string, index: number): THREE.Color => {
+const resolveMeshColor = (
+    mesh: THREE.Mesh,
+    fallbackColor: string,
+    index: number,
+    paletteMode: SegmentationPaletteMode,
+): THREE.Color => {
     const candidateKeys = [
         mesh.name,
         mesh.parent?.name,
@@ -175,8 +204,9 @@ const resolveMeshColor = (mesh: THREE.Mesh, fallbackColor: string, index: number
         .filter(Boolean);
 
     for (const key of candidateKeys) {
-        const mapped = COMPONENT_COLOR_MAP[key];
-        if (mapped) {
+        const groupedKey = resolveComponentGroupKey(key);
+        if (groupedKey === 'left_lung' || groupedKey === 'right_lung' || groupedKey === 'lung' || groupedKey === 'nodule') {
+            const mapped = resolveSegmentationLabelColor(groupedKey, paletteMode);
             return new THREE.Color(mapped);
         }
     }
@@ -274,6 +304,7 @@ const ProcessedMesh: React.FC<{
         color: string;
         mesh_component_name?: string | null;
     }>;
+    paletteMode: SegmentationPaletteMode;
     color?: string;
     onLoad?: () => void;
     onNoduleClick?: (noduleId: string) => void;
@@ -292,6 +323,7 @@ const ProcessedMesh: React.FC<{
     selectedNoduleId,
     hoveredNoduleId,
     labels,
+    paletteMode,
     color = '#ef4444',
     onLoad,
     onNoduleClick,
@@ -334,7 +366,7 @@ const ProcessedMesh: React.FC<{
             const visibilityKey = matchedLabel?.key ?? componentKey ?? meshComponentName;
             const surfaceColor = matchedLabel?.color
                 ? new THREE.Color(matchedLabel.color)
-                : resolveMeshColor(mesh, color, meshIndex);
+                : resolveMeshColor(mesh, color, meshIndex, paletteMode);
 
             const material = new THREE.MeshStandardMaterial({
                 color: surfaceColor,
@@ -387,7 +419,7 @@ const ProcessedMesh: React.FC<{
             focusTargets: createdFocusTargets,
             sceneAlignment: alignment,
         };
-    }, [color, labels, scene]);
+    }, [color, labels, paletteMode, scene]);
 
     useEffect(() => {
         onLoad?.();
@@ -430,7 +462,9 @@ const ProcessedMesh: React.FC<{
                     : baseOpacity;
 
             material.color.copy(baseColor);
-            if (isHoveredNodule) {
+            if (isSelectedNodule) {
+                material.color.lerp(SELECTED_TINT, 0.22);
+            } else if (isHoveredNodule) {
                 material.color.lerp(HOVER_TINT, 0.16);
             }
             material.emissive.copy(baseColor);
@@ -524,6 +558,7 @@ const SceneContent = React.memo<ModelViewerProps & {
     activeTool: ToolMode;
     selectedNoduleId: string | null;
     hoveredNoduleId: string | null;
+    paletteMode: SegmentationPaletteMode;
     onNoduleClick?: (noduleId: string) => void;
     onHoverNoduleChange?: (payload: NoduleHoverPayload) => void;
     onFocusTargetsReady?: (targets: NoduleFocusTarget[]) => void;
@@ -540,6 +575,7 @@ const SceneContent = React.memo<ModelViewerProps & {
     activeTool,
     selectedNoduleId,
     hoveredNoduleId,
+    paletteMode,
     onNoduleClick,
     onHoverNoduleChange,
     onFocusTargetsReady,
@@ -548,6 +584,10 @@ const SceneContent = React.memo<ModelViewerProps & {
     const meshUrl = meshApi.getMeshUrl(caseId);
     const componentVisibility = useViewerStore((state) => state.segmentationVisibility);
     const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
+    const displaySegmentationLabels = useMemo(
+        () => getDisplaySegmentationLabels(segmentationLabels, paletteMode),
+        [paletteMode, segmentationLabels],
+    );
 
     return (
         <>
@@ -580,7 +620,8 @@ const SceneContent = React.memo<ModelViewerProps & {
                     activeTool={activeTool}
                     selectedNoduleId={selectedNoduleId}
                     hoveredNoduleId={hoveredNoduleId}
-                    labels={segmentationLabels}
+                    labels={displaySegmentationLabels}
+                    paletteMode={paletteMode}
                     onLoad={onModelLoad}
                     onNoduleClick={onNoduleClick}
                     onHoverNoduleChange={onHoverNoduleChange}
@@ -755,7 +796,9 @@ const ViewerControls: React.FC<{
 };
 
 export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
+    const containerRef = useRef<HTMLDivElement>(null);
     const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
+    const segmentationPaletteMode = useViewerStore((state) => state.segmentationPaletteMode);
     const noduleEntities = useViewerStore((state) => state.noduleEntities);
     const visibilityPreset = useViewerStore((state) => state.meshVisibilityPreset);
     const setMeshVisibilityPreset = useViewerStore((state) => state.setMeshVisibilityPreset);
@@ -763,7 +806,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
     const selectedNoduleId = useViewerStore((state) => state.selectedNoduleId);
     const focusedNoduleId = useViewerStore((state) => state.focusedNoduleId);
     const noduleFocusVersion = useViewerStore((state) => state.noduleFocusVersion);
-    const focusNodule = useViewerStore((state) => state.focusNodule);
+    const activateNodule = useViewerStore((state) => state.activateNodule);
     const crosshair = useViewerStore((state) => state.mprCrosshair);
     const setMprCrosshair = useViewerStore((state) => state.setMprCrosshair);
     const setMprCrosshairCaseId = useViewerStore((state) => state.setMprCrosshairCaseId);
@@ -772,10 +815,18 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
     const [focusTargets, setFocusTargets] = useState<NoduleFocusTarget[]>([]);
     const [hoveredNoduleId, setHoveredNoduleId] = useState<string | null>(null);
     const [hoveredTooltip, setHoveredTooltip] = useState<NoduleTooltipState | null>(null);
-    const has3DLung = segmentationLabels.some(
+    const displaySegmentationLabels = useMemo(
+        () => getDisplaySegmentationLabels(segmentationLabels, segmentationPaletteMode),
+        [segmentationLabels, segmentationPaletteMode],
+    );
+    const paletteTokens = useMemo(
+        () => getSegmentationPaletteTokens(segmentationPaletteMode),
+        [segmentationPaletteMode],
+    );
+    const has3DLung = displaySegmentationLabels.some(
         (label) => label.available && label.render_3d && (label.key === 'left_lung' || label.key === 'right_lung' || label.key === 'lung')
     );
-    const has3DNodule = segmentationLabels.some(
+    const has3DNodule = displaySegmentationLabels.some(
         (label) => label.available && label.render_3d && label.key === 'nodule'
     );
     const supportsNoduleFocus = has3DLung && has3DNodule;
@@ -819,6 +870,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
         antialias: true,
         stencil: false,
         alpha: true,
+        preserveDrawingBuffer: true,
         powerPreference: 'high-performance' as const,
         precision: 'mediump' as const,
     }), []);
@@ -873,8 +925,194 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
         lastSyncedFocusIdRef.current = focusedNoduleEntity.id;
     }, [focusedNoduleEntity, syncCrosshairToNodule]);
 
+    const renderExportFrame = useCallback(async () => {
+        await wait(0);
+
+        const host = containerRef.current;
+        const glCanvas = host?.querySelector('canvas');
+
+        if (!host || !(glCanvas instanceof HTMLCanvasElement)) {
+            throw new Error('3D renderer is not ready yet.');
+        }
+
+        const rect = host.getBoundingClientRect();
+        const exportWidth = Math.max(glCanvas.width || Math.round(rect.width), 1);
+        const exportHeight = Math.max(glCanvas.height || Math.round(rect.height), 1);
+        const scaleX = exportWidth / Math.max(rect.width, 1);
+        const scaleY = exportHeight / Math.max(rect.height, 1);
+        const exportCanvas = createExportCanvas(exportWidth, exportHeight);
+        const ctx = exportCanvas.getContext('2d', { alpha: false });
+
+        if (!ctx) {
+            throw new Error('Unable to create 3D export canvas.');
+        }
+
+        const background = ctx.createLinearGradient(0, 0, 0, exportCanvas.height);
+        background.addColorStop(0, '#0f1115');
+        background.addColorStop(1, '#0a0c10');
+        ctx.fillStyle = background;
+        ctx.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+        ctx.drawImage(glCanvas, 0, 0, exportCanvas.width, exportCanvas.height);
+
+        const padX = 16 * scaleX;
+        const padY = 16 * scaleY;
+
+        ctx.save();
+        ctx.font = `${Math.max(14 * scaleY, 12)}px sans-serif`;
+        const titleText = '3D Reconstruction';
+        const titleWidth = ctx.measureText(titleText).width + 52 * scaleX;
+        const titleHeight = 34 * scaleY;
+        drawRoundedRect(ctx, padX, padY, titleWidth, titleHeight, 8 * scaleY);
+        ctx.fillStyle = 'rgba(9, 12, 18, 0.84)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+        ctx.lineWidth = Math.max(1, scaleY);
+        ctx.stroke();
+        ctx.fillStyle = '#f8fafc';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(titleText, padX + 34 * scaleX, padY + titleHeight / 2);
+        ctx.restore();
+
+        if (props.showCrosshairGuide) {
+            ctx.save();
+            ctx.font = `${Math.max(13 * scaleY, 11)}px monospace`;
+            const crosshairText = `X ${crosshair.x} | Y ${crosshair.y} | Z ${crosshair.z}`;
+            const crosshairWidth = ctx.measureText(crosshairText).width + 28 * scaleX;
+            const crosshairHeight = 30 * scaleY;
+            const crosshairX = padX + titleWidth + 8 * scaleX;
+
+            drawRoundedRect(ctx, crosshairX, padY, crosshairWidth, crosshairHeight, 8 * scaleY);
+            ctx.fillStyle = 'rgba(9, 12, 18, 0.84)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+            ctx.lineWidth = Math.max(1, scaleY);
+            ctx.stroke();
+            ctx.fillStyle = '#cbd5e1';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(crosshairText, crosshairX + 14 * scaleX, padY + crosshairHeight / 2);
+            ctx.restore();
+        }
+
+        const legendLabels = displaySegmentationLabels.filter((label) => label.available && label.render_3d);
+        if (legendLabels.length > 0) {
+            ctx.save();
+            ctx.font = `${Math.max(12 * scaleY, 10)}px sans-serif`;
+            const rowGap = 8 * scaleY;
+            const dotSize = 10 * scaleY;
+            const panelPaddingX = 12 * scaleX;
+            const panelPaddingY = 10 * scaleY;
+            const lineHeight = 18 * scaleY;
+            const maxLabelWidth = legendLabels.reduce((width, label) => (
+                Math.max(width, ctx.measureText(label.display_name).width)
+            ), 0);
+            const panelWidth = maxLabelWidth + panelPaddingX * 2 + dotSize + 12 * scaleX;
+            const panelHeight = panelPaddingY * 2 + legendLabels.length * lineHeight + Math.max(legendLabels.length - 1, 0) * rowGap;
+            const panelX = exportCanvas.width - panelWidth - padX;
+
+            drawRoundedRect(ctx, panelX, padY, panelWidth, panelHeight, 10 * scaleY);
+            ctx.fillStyle = 'rgba(9, 12, 18, 0.84)';
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+            ctx.lineWidth = Math.max(1, scaleY);
+            ctx.stroke();
+
+            legendLabels.forEach((label, index) => {
+                const rowY = padY + panelPaddingY + index * (lineHeight + rowGap);
+                ctx.fillStyle = label.color;
+                ctx.beginPath();
+                ctx.arc(
+                    panelX + panelPaddingX + dotSize / 2,
+                    rowY + lineHeight / 2,
+                    dotSize / 2,
+                    0,
+                    Math.PI * 2
+                );
+                ctx.fill();
+
+                ctx.fillStyle = '#cbd5e1';
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(
+                    label.display_name,
+                    panelX + panelPaddingX + dotSize + 8 * scaleX,
+                    rowY + lineHeight / 2
+                );
+            });
+            ctx.restore();
+        }
+
+        if (hoveredTooltip && hoveredNoduleEntity) {
+            ctx.save();
+            ctx.font = `${Math.max(13 * scaleY, 11)}px sans-serif`;
+            const title = hoveredNoduleEntity.display_name;
+            const detail = `${hoveredNoduleEntity.estimated_diameter_mm.toFixed(1)} mm | ${formatTooltipVolume(
+                hoveredNoduleEntity.volume_mm3,
+                hoveredNoduleEntity.volume_ml
+            )}`;
+            const tooltipWidth = Math.max(
+                ctx.measureText(title).width,
+                ctx.measureText(detail).width,
+            ) + 24 * scaleX;
+            const tooltipHeight = 52 * scaleY;
+            const tooltipX = Math.min(
+                exportCanvas.width - tooltipWidth - padX,
+                (hoveredTooltip.x + 14) * scaleX
+            );
+            const tooltipY = Math.min(
+                exportCanvas.height - tooltipHeight - padY,
+                (hoveredTooltip.y + 14) * scaleY
+            );
+
+            drawRoundedRect(ctx, tooltipX, tooltipY, tooltipWidth, tooltipHeight, 10 * scaleY);
+            ctx.fillStyle = 'rgba(12, 16, 24, 0.92)';
+            ctx.fill();
+            ctx.strokeStyle = `${paletteTokens.nodule}59`;
+            ctx.lineWidth = Math.max(1, scaleY);
+            ctx.stroke();
+            ctx.fillStyle = '#f8fafc';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText(title, tooltipX + 12 * scaleX, tooltipY + 10 * scaleY);
+            ctx.fillStyle = '#cbd5e1';
+            ctx.fillText(detail, tooltipX + 12 * scaleX, tooltipY + 28 * scaleY);
+            ctx.restore();
+        }
+
+        return exportCanvas;
+    }, [
+        crosshair.x,
+        crosshair.y,
+        crosshair.z,
+        hoveredNoduleEntity,
+        hoveredTooltip,
+        props.showCrosshairGuide,
+        displaySegmentationLabels,
+        paletteTokens.nodule,
+    ]);
+
+    const capturePng = useCallback(async () => {
+        const exportCanvas = await renderExportFrame();
+        return canvasToBlob(exportCanvas, 'image/png');
+    }, [renderExportFrame]);
+
+    const renderExportFrameRef = useRef(renderExportFrame);
+    const capturePngRef = useRef(capturePng);
+
+    useEffect(() => {
+        renderExportFrameRef.current = renderExportFrame;
+        capturePngRef.current = capturePng;
+    }, [capturePng, renderExportFrame]);
+
+    useEffect(() => registerModelExporter({
+        renderFrame: () => renderExportFrameRef.current(),
+        capturePng: () => capturePngRef.current(),
+    }), []);
+
     return (
         <div
+            ref={containerRef}
             style={{
                 width: '100%',
                 height: '100%',
@@ -979,7 +1217,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                 </div>
             </div>
 
-            {segmentationLabels.some((label) => label.available && label.render_3d) && (
+            {displaySegmentationLabels.some((label) => label.available && label.render_3d) && (
                 <div
                     style={{
                         position: 'absolute',
@@ -996,7 +1234,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                         border: '1px solid var(--border-subtle)',
                     }}
                 >
-                    {segmentationLabels
+                    {displaySegmentationLabels
                         .filter((label) => label.available && label.render_3d)
                         .map((label) => (
                             <div
@@ -1044,7 +1282,8 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                     activeTool={activeTool}
                     selectedNoduleId={selectedNoduleId}
                     hoveredNoduleId={hoveredNoduleId}
-                    onNoduleClick={focusNodule}
+                    paletteMode={segmentationPaletteMode}
+                    onNoduleClick={activateNodule}
                     onHoverNoduleChange={handleHoverNoduleChange}
                     onFocusTargetsReady={setFocusTargets}
                     crosshair={crosshair}
@@ -1064,7 +1303,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                         padding: '10px 12px',
                         borderRadius: 'var(--radius-md)',
                         background: 'rgba(12, 16, 24, 0.92)',
-                        border: '1px solid rgba(249, 115, 22, 0.35)',
+                        border: `1px solid ${paletteTokens.nodule}59`,
                         boxShadow: 'var(--shadow-lg)',
                         backdropFilter: 'blur(10px)',
                     }}
@@ -1074,7 +1313,7 @@ export const ModelViewer: React.FC<ModelViewerProps> = (props) => {
                     </div>
                     <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', lineHeight: 1.45 }}>
                         {hoveredNoduleEntity.estimated_diameter_mm.toFixed(1)} mm
-                        {' • '}
+                        {' | '}
                         {formatTooltipVolume(hoveredNoduleEntity.volume_mm3, hoveredNoduleEntity.volume_ml)}
                     </div>
                     <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: 4 }}>

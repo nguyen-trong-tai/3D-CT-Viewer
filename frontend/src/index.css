@@ -37,8 +37,12 @@
   --text-disabled: #475569;
 
   /* Medical Colors */
-  --medical-lung: #22c55e;
-  --medical-tumor: #ef4444;
+  --medical-lung-left: #9bc2d3;
+  --medical-lung-right: #78afc4;
+  --medical-lung: #86b8ca;
+  --medical-tumor: #d97706;
+  --medical-tumor-selected: #fde047;
+  --medical-crosshair: #38bdf8;
   --medical-bone: #f5f5f5;
   --medical-soft-tissue: #a78bfa;
 

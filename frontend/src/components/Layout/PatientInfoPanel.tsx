@@ -1,6 +1,8 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useViewerStore } from '../../stores/viewerStore';
 import { Divider, InfoRow } from '../UI';
+import { getSegmentationPaletteTokens } from '../../utils/segmentationPalette';
 
 const formatVolume = (volumeMm3: number, volumeMl: number): string =>
     volumeMl >= 0.1 ? `${volumeMl.toFixed(2)} ml` : `${volumeMm3.toFixed(1)} mm3`;
@@ -11,14 +13,44 @@ const formatConfidence = (score?: number): string | null =>
 export const PatientInfoPanel: React.FC = () => {
     const metadata = useViewerStore((state) => state.metadata);
     const viewMode = useViewerStore((state) => state.viewMode);
+    const segmentationPaletteMode = useViewerStore((state) => state.segmentationPaletteMode);
     const noduleEntities = useViewerStore((state) => state.noduleEntities);
     const selectedNoduleId = useViewerStore((state) => state.selectedNoduleId);
-    const focusNodule = useViewerStore((state) => state.focusNodule);
+    const activateNodule = useViewerStore((state) => state.activateNodule);
     const clearNoduleSelection = useViewerStore((state) => state.clearNoduleSelection);
 
     const selectedItemRef = useRef<HTMLButtonElement | null>(null);
     const is3DContext = viewMode === '3D' || viewMode === 'MPR_3D';
+    const paletteTokens = useMemo(
+        () => getSegmentationPaletteTokens(segmentationPaletteMode),
+        [segmentationPaletteMode],
+    );
+    const sortedNoduleEntities = useMemo(
+        () => [...noduleEntities].sort((left, right) => (
+            left.slice_range[0] - right.slice_range[0]
+            || right.estimated_diameter_mm - left.estimated_diameter_mm
+            || left.display_name.localeCompare(right.display_name)
+        )),
+        [noduleEntities],
+    );
+    const selectedNoduleIndex = useMemo(
+        () => sortedNoduleEntities.findIndex((nodule) => nodule.id === selectedNoduleId),
+        [selectedNoduleId, sortedNoduleEntities],
+    );
     const selectedNodule = noduleEntities.find((nodule) => nodule.id === selectedNoduleId) ?? null;
+
+    const navigateNodule = useCallback((direction: -1 | 1) => {
+        if (sortedNoduleEntities.length === 0) {
+            return;
+        }
+
+        const nextIndex = selectedNoduleIndex === -1
+            ? direction > 0
+                ? 0
+                : sortedNoduleEntities.length - 1
+            : (selectedNoduleIndex + direction + sortedNoduleEntities.length) % sortedNoduleEntities.length;
+        activateNodule(sortedNoduleEntities[nextIndex].id);
+    }, [activateNodule, selectedNoduleIndex, sortedNoduleEntities]);
 
     useEffect(() => {
         selectedItemRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -102,13 +134,13 @@ export const PatientInfoPanel: React.FC = () => {
                             style={{
                                 padding: '2px 8px',
                                 borderRadius: '999px',
-                                background: 'rgba(249, 115, 22, 0.16)',
-                                color: '#fdba74',
+                                background: paletteTokens.noduleChipBackground,
+                                color: paletteTokens.noduleChipText,
                                 fontSize: '0.72rem',
                                 fontWeight: 600,
                             }}
                         >
-                            {noduleEntities.length} nodule{noduleEntities.length === 1 ? '' : 's'}
+                            {sortedNoduleEntities.length} nodule{sortedNoduleEntities.length === 1 ? '' : 's'}
                         </span>
                     </div>
 
@@ -119,8 +151,8 @@ export const PatientInfoPanel: React.FC = () => {
                                 marginBottom: 'var(--space-sm)',
                                 padding: '12px',
                                 borderRadius: 'var(--radius-md)',
-                                border: '1px solid rgba(249, 115, 22, 0.35)',
-                                background: 'linear-gradient(180deg, rgba(249, 115, 22, 0.16) 0%, rgba(255, 255, 255, 0.04) 100%)',
+                                border: `1px solid ${paletteTokens.nodule}59`,
+                                background: `linear-gradient(180deg, ${paletteTokens.noduleChipBackground} 0%, rgba(255, 255, 255, 0.04) 100%)`,
                             }}
                         >
                             <div
@@ -133,11 +165,34 @@ export const PatientInfoPanel: React.FC = () => {
                                 }}
                             >
                                 <div>
-                                    <div style={{ fontSize: '0.72rem', color: '#fdba74', fontWeight: 700, marginBottom: 4 }}>
+                                    <div style={{ fontSize: '0.72rem', color: paletteTokens.noduleChipText, fontWeight: 700, marginBottom: 4 }}>
                                         Selected Nodule
                                     </div>
                                     <div style={{ fontSize: '0.92rem', fontWeight: 700, color: 'var(--text-primary)' }}>
                                         {selectedNodule.display_name}
+                                    </div>
+                                    <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                        <button
+                                            type="button"
+                                            onClick={() => navigateNodule(-1)}
+                                            disabled={sortedNoduleEntities.length <= 1}
+                                            style={navButtonStyle}
+                                        >
+                                            <ChevronLeft size={14} />
+                                            Prev
+                                        </button>
+                                        <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                                            {selectedNoduleIndex + 1}/{sortedNoduleEntities.length}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => navigateNodule(1)}
+                                            disabled={sortedNoduleEntities.length <= 1}
+                                            style={navButtonStyle}
+                                        >
+                                            Next
+                                            <ChevronRight size={14} />
+                                        </button>
                                     </div>
                                 </div>
                                 <button
@@ -146,7 +201,7 @@ export const PatientInfoPanel: React.FC = () => {
                                     style={{
                                         padding: '5px 9px',
                                         borderRadius: '999px',
-                                        border: '1px solid rgba(255,255,255,0.12)',
+                                        border: `1px solid ${paletteTokens.nodule}40`,
                                         background: 'rgba(255,255,255,0.06)',
                                         color: 'var(--text-secondary)',
                                         fontSize: '0.7rem',
@@ -173,12 +228,8 @@ export const PatientInfoPanel: React.FC = () => {
                             </div>
 
                             <div style={{ marginTop: 8, fontSize: '0.72rem', color: 'var(--text-muted)' }}>
-                                {/* <div style={{ marginBottom: 4 }}>
-                                    Centroid: <span style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>{formatCentroid(selectedNodule.centroid_xyz)}</span>
-                                </div> */}
                                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
                                     <span>{formatConfidence(selectedNodule.detection_score_probability) ?? 'Connected component'}</span>
-                                    
                                 </div>
                             </div>
                         </div>
@@ -196,7 +247,7 @@ export const PatientInfoPanel: React.FC = () => {
                             // left align
                         }}
                     >
-                        {noduleEntities.map((nodule) => {
+                        {sortedNoduleEntities.map((nodule) => {
                             const isSelected = selectedNoduleId === nodule.id;
                             const confidenceLabel = formatConfidence(nodule.detection_score_probability);
 
@@ -204,7 +255,7 @@ export const PatientInfoPanel: React.FC = () => {
                                 <button
                                     key={nodule.id}
                                     ref={isSelected ? selectedItemRef : null}
-                                    onClick={() => focusNodule(nodule.id)}
+                                    onClick={() => activateNodule(nodule.id)}
                                     aria-pressed={isSelected}
                                     title={isSelected ? `Clear focus for ${nodule.display_name}` : `Focus ${nodule.display_name}`}
                                     style={{
@@ -215,11 +266,12 @@ export const PatientInfoPanel: React.FC = () => {
                                         columnGap: 10,
                                         textAlign: 'left',
                                         border: '1px solid',
-                                        borderColor: isSelected ? 'rgba(249, 115, 22, 0.65)' : 'var(--border-subtle)',
+                                        borderColor: isSelected ? `${paletteTokens.noduleOutline}aa` : 'var(--border-subtle)',
                                         borderRadius: 'var(--radius-md)',
-                                        background: isSelected ? 'rgba(249, 115, 22, 0.14)' : 'rgba(255, 255, 255, 0.03)',
+                                        background: isSelected ? paletteTokens.noduleChipBackground : 'rgba(255, 255, 255, 0.03)',
                                         padding: '10px 12px',
                                         cursor: 'pointer',
+                                        boxShadow: isSelected ? `0 0 0 1px ${paletteTokens.noduleOutline}33, 0 10px 24px ${paletteTokens.nodule}24` : 'none',
                                         transition: 'border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast)',
                                     }}
                                 >
@@ -237,8 +289,8 @@ export const PatientInfoPanel: React.FC = () => {
                                                 height: 10,
                                                 flexShrink: 0,
                                                 borderRadius: '50%',
-                                                background: '#f41d06',
-                                                boxShadow: '0 0 12px rgba(249, 115, 22, 0.55)',
+                                                background: isSelected ? paletteTokens.noduleSelected : paletteTokens.nodule,
+                                                boxShadow: `0 0 12px ${isSelected ? paletteTokens.noduleOutline : `${paletteTokens.nodule}80`}`,
                                             }}
                                         />
                                         <span
@@ -261,7 +313,7 @@ export const PatientInfoPanel: React.FC = () => {
                                             flexShrink: 0,
                                             padding: '4px 8px',
                                             borderRadius: '999px',
-                                            background: isSelected ? 'rgba(249, 115, 22, 0.12)' : 'rgba(255, 255, 255, 0.05)',
+                                            background: isSelected ? paletteTokens.noduleChipBackground : 'rgba(255, 255, 255, 0.05)',
                                             border: '1px solid rgba(255, 255, 255, 0.06)',
                                             color: 'var(--text-secondary)',
                                             fontSize: '0.7rem',
@@ -293,7 +345,7 @@ export const PatientInfoPanel: React.FC = () => {
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis',
                                             whiteSpace: 'nowrap',
-                                            color: isSelected ? '#fdba74' : 'var(--text-muted)',
+                                            color: isSelected ? paletteTokens.noduleChipText : 'var(--text-muted)',
                                             fontSize: '0.71rem',
                                             fontWeight: isSelected ? 700 : 600,
                                         }}
@@ -325,4 +377,18 @@ export const PatientInfoPanel: React.FC = () => {
             ) : null}
         </div>
     );
+};
+
+const navButtonStyle: React.CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: '4px 8px',
+    borderRadius: '999px',
+    border: '1px solid var(--border-subtle)',
+    background: 'rgba(255,255,255,0.05)',
+    color: 'var(--text-secondary)',
+    fontSize: '0.72rem',
+    fontWeight: 600,
+    cursor: 'pointer',
 };

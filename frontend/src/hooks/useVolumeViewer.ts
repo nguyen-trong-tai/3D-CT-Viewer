@@ -3,6 +3,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { ctApi, maskApi } from '../services/api';
 import { WINDOW_PRESETS, type WindowPresetKey, type MPRView, type SegmentationManifest } from '../types';
 import { useViewerStore } from '../stores/viewerStore';
+import { resolveSegmentationLabelColor } from '../utils/segmentationPalette';
 
 interface VolumeData {
     data: Int16Array;
@@ -640,6 +641,7 @@ export function useVolumeViewer(caseId: string | null) {
         const strideX = dimY * dimZ;
         const strideY = dimZ;
         const viewerState = useViewerStore.getState();
+        const paletteMode = viewerState.segmentationPaletteMode;
         const hasRenderableManifestLabels = viewerState.segmentationLabels.some(
             (label) => label.available && label.render_2d
         );
@@ -649,7 +651,7 @@ export function useVolumeViewer(caseId: string | null) {
         const labelColors = new Map<number, { r: number; g: number; b: number }>();
 
         activeLabels.forEach((label) => {
-            const color = hexToRgb(label.color);
+            const color = hexToRgb(resolveSegmentationLabelColor(label, paletteMode));
             if (color) {
                 labelColors.set(label.label_id, color);
             }

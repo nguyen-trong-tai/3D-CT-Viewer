@@ -13,6 +13,7 @@ import {
   type NoduleEntity,
   type PipelineStep,
   type MeshVisibilityPreset,
+  type SegmentationPaletteMode,
   type SegmentationLabel,
   type SegmentationVisibility,
   type ViewMode,
@@ -45,6 +46,7 @@ interface ViewerState {
   segmentationOpacity: number;
   segmentationVisibility: SegmentationVisibility;
   segmentationLabels: SegmentationLabel[];
+  segmentationPaletteMode: SegmentationPaletteMode;
   noduleEntities: NoduleEntity[];
   selectedNoduleId: string | null;
   focusedNoduleId: string | null;
@@ -87,7 +89,9 @@ interface ViewerActions {
     updater: SegmentationVisibility | ((current: SegmentationVisibility) => SegmentationVisibility)
   ) => void;
   setSegmentationLabels: (labels: SegmentationLabel[]) => void;
+  setSegmentationPaletteMode: (mode: SegmentationPaletteMode) => void;
   setNoduleEntities: (noduleEntities: NoduleEntity[]) => void;
+  activateNodule: (noduleId: string) => void;
   setSelectedNoduleId: (noduleId: string | null) => void;
   focusNodule: (noduleId: string) => void;
   clearNoduleSelection: () => void;
@@ -115,6 +119,7 @@ const initialState: ViewerState = {
   segmentationOpacity: 0.5,
   segmentationVisibility: {},
   segmentationLabels: [],
+  segmentationPaletteMode: 'clinical',
   noduleEntities: [],
   selectedNoduleId: null,
   focusedNoduleId: null,
@@ -242,6 +247,7 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
         segmentationVisibility: nextVisibility,
       };
     }),
+  setSegmentationPaletteMode: (segmentationPaletteMode) => set({ segmentationPaletteMode }),
   setNoduleEntities: (noduleEntities) =>
     set((state) => {
       const nextSelectedId =
@@ -257,6 +263,24 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
         noduleEntities,
         selectedNoduleId: nextSelectedId,
         focusedNoduleId: nextFocusedId,
+      };
+    }),
+  activateNodule: (noduleId) =>
+    set((state) => {
+      const isSameNodule =
+        state.selectedNoduleId === noduleId && state.focusedNoduleId === noduleId;
+
+      if (isSameNodule) {
+        return {
+          selectedNoduleId: null,
+          focusedNoduleId: null,
+        };
+      }
+
+      return {
+        selectedNoduleId: noduleId,
+        focusedNoduleId: noduleId,
+        noduleFocusVersion: state.noduleFocusVersion + 1,
       };
     }),
   setSelectedNoduleId: (selectedNoduleId) => set({ selectedNoduleId }),
