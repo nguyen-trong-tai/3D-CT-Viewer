@@ -22,6 +22,8 @@ import {
 
 export type ToolMode = 'none' | 'zoom' | 'pan' | 'rotate' | 'crosshair';
 type MprCrosshair = { x: number; y: number; z: number };
+const DEFAULT_WINDOW_PRESET: WindowPresetKey = 'LUNG';
+const DEFAULT_WINDOW_VALUES = WINDOW_PRESETS[DEFAULT_WINDOW_PRESET];
 
 interface ViewerState {
   // App state
@@ -111,10 +113,10 @@ const initialState: ViewerState = {
   viewMode: '2D',
   sliceIndex: 0,
   activeTool: 'none',
-  windowPreset: 'SOFT_TISSUE',
+  windowPreset: DEFAULT_WINDOW_PRESET,
   useCustomWindow: false,
-  customWindowLevel: 40,
-  customWindowWidth: 400,
+  customWindowLevel: DEFAULT_WINDOW_VALUES.windowLevel,
+  customWindowWidth: DEFAULT_WINDOW_VALUES.windowWidth,
   showSegmentation: false,
   segmentationOpacity: 0.5,
   segmentationVisibility: {},
@@ -152,6 +154,10 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
       viewMode: '2D',
       sliceIndex: Math.floor(meta.totalSlices / 2),
       activeTool: 'none',
+      windowPreset: DEFAULT_WINDOW_PRESET,
+      useCustomWindow: false,
+      customWindowLevel: DEFAULT_WINDOW_VALUES.windowLevel,
+      customWindowWidth: DEFAULT_WINDOW_VALUES.windowWidth,
       appState: 'VISUALIZATION',
       segmentationLabels: [],
       noduleEntities: [],
@@ -187,6 +193,10 @@ export const useViewerStore = create<ViewerState & ViewerActions>((set) => ({
       viewMode: '2D',
       activeTool: 'none',
       sliceIndex: 0,
+      windowPreset: DEFAULT_WINDOW_PRESET,
+      useCustomWindow: false,
+      customWindowLevel: DEFAULT_WINDOW_VALUES.windowLevel,
+      customWindowWidth: DEFAULT_WINDOW_VALUES.windowWidth,
       showSegmentation: false,
       segmentationLabels: [],
       noduleEntities: [],

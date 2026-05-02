@@ -608,7 +608,7 @@ export const UploadPage: React.FC<UploadPageProps> = ({ onUploadComplete }) => {
                                 marginBottom: 'var(--space-lg)',
                             }}
                         >
-                            {progressLabel || 'Please wait...'}
+                            {/* {progressLabel || 'Please wait...'} */}
                         </p>
 
                         <ProgressBar value={progress} showLabel size="md" />

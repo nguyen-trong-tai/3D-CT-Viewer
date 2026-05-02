@@ -68,7 +68,7 @@ export function useVolumeViewer(caseId: string | null) {
     const [error, setError] = useState<string | null>(null);
 
     // View state
-    const [windowPreset, setWindowPreset] = useState<WindowPresetKey>('SOFT_TISSUE');
+    const [windowPreset, setWindowPreset] = useState<WindowPresetKey>('LUNG');
     const [showMask, setShowMask] = useState(false);
     const [maskOpacity, setMaskOpacity] = useState(0.5);
 
