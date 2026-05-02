@@ -23,7 +23,15 @@ class ArtifactService:
         if not self.repo.is_artifact_available(case_id, "mesh"):
             raise FileNotFoundError(case_id)
 
-        mesh_path = self.repo.get_mesh_path(case_id, prefer_remote=True)
+        mesh_url = self._get_remote_artifact_download_url(
+            case_id,
+            "mesh",
+            expires_in_seconds=expires_in_seconds,
+        )
+        if mesh_url:
+            return {"type": "redirect", "url": mesh_url}
+
+        mesh_path = self.repo.get_mesh_path(case_id)
         if mesh_path is not None:
             return {"type": "file", "path": mesh_path}
 
@@ -54,11 +62,15 @@ class ArtifactService:
         if not self.repo.is_artifact_available(case_id, artifact_name):
             raise FileNotFoundError(case_id)
 
-        object_key = self.repo.get_artifact_object_key(case_id, artifact_name)
-        if not self.object_store or not object_key:
+        url = self._get_remote_artifact_download_url(
+            case_id,
+            artifact_name,
+            expires_in_seconds=expires_in_seconds,
+        )
+        if not url:
             raise FileNotFoundError(case_id)
 
-        return self.object_store.generate_download_url(object_key, expires_in_seconds=expires_in_seconds)
+        return url
 
     def get_npy_artifact_delivery(self, case_id: str, artifact_name: str) -> Dict[str, Any]:
         """Resolve a local or cached NPY artifact for chunked raw-byte streaming."""
@@ -71,3 +83,29 @@ class ArtifactService:
         if not payload:
             raise FileNotFoundError(case_id)
         return payload
+
+    def _get_remote_artifact_download_url(
+        self,
+        case_id: str,
+        artifact_name: str,
+        *,
+        expires_in_seconds: int,
+    ) -> str | None:
+        """Return a presigned object-store URL when the remote artifact is available."""
+        if not self.object_store:
+            return None
+
+        object_key = self.repo.get_artifact_object_key(case_id, artifact_name)
+        if not object_key:
+            return None
+
+        try:
+            if not self.object_store.object_exists(object_key):
+                return None
+        except Exception:
+            return None
+
+        return self.object_store.generate_download_url(
+            object_key,
+            expires_in_seconds=expires_in_seconds,
+        )

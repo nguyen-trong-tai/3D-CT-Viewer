@@ -80,7 +80,7 @@ image = (
     startup_timeout=300,
     scaledown_window=600,
     min_containers=1,
-    max_containers=3,
+    max_containers=10,
     enable_memory_snapshot=True,
 )
 class FastAPIService:
@@ -107,7 +107,7 @@ class FastAPIService:
     gpu="A100",
     timeout=1800,
     startup_timeout=300,
-    retries=1,
+    retries=3,
     scaledown_window=300,
 )
 def process_case_modal(case_id: str):

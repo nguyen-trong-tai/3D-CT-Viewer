@@ -912,21 +912,16 @@ class CaseRepository:
         
         return None
     
-    def get_mesh_path(self, case_id: str, prefer_remote: bool = False) -> Optional[Path]:
+    def get_mesh_path(self, case_id: str) -> Optional[Path]:
         """
-        Get path to mesh file if it exists.
-        
-        Returns GLB path if available, otherwise OBJ for legacy support.
+        Get the locally materialized mesh path when one is available.
+
+        Returns the GLB path if available, otherwise OBJ for legacy support.
         """
         glb_path = self._case_dir(case_id) / "mesh.glb"
-        if prefer_remote:
-            remote_glb_path = self._resolve_artifact_path(case_id, "mesh", glb_path, prefer_remote=True)
-            if remote_glb_path.exists():
-                return remote_glb_path
-
         if glb_path.exists():
             return glb_path
-        
+
         # Fallback to OBJ for legacy cases
         obj_path = self._case_dir(case_id) / "mesh.obj"
         return obj_path if obj_path.exists() else None
