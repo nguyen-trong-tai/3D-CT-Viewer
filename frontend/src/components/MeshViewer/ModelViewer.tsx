@@ -581,13 +581,70 @@ const SceneContent = React.memo<ModelViewerProps & {
     onFocusTargetsReady,
     crosshair,
 }) {
-    const meshUrl = meshApi.getMeshUrl(caseId);
+    const [meshUrl, setMeshUrl] = useState<string | null>(null);
+    const [meshUrlPending, setMeshUrlPending] = useState(true);
+    const [meshUrlError, setMeshUrlError] = useState<Error | null>(null);
     const componentVisibility = useViewerStore((state) => state.segmentationVisibility);
     const segmentationLabels = useViewerStore((state) => state.segmentationLabels);
     const displaySegmentationLabels = useMemo(
         () => getDisplaySegmentationLabels(segmentationLabels, paletteMode),
         [paletteMode, segmentationLabels],
     );
+
+    useEffect(() => {
+        let cancelled = false;
+        let objectUrlToCleanup: string | null = null;
+
+        setMeshUrl(null);
+        setMeshUrlPending(true);
+        setMeshUrlError(null);
+
+        void meshApi
+            .getMeshObjectUrl(caseId)
+            .then((resolvedUrl) => {
+                if (cancelled) {
+                    if (resolvedUrl) {
+                        useGLTF.clear(resolvedUrl);
+                        meshApi.revokeObjectUrl(resolvedUrl);
+                    }
+                    return;
+                }
+
+                if (!resolvedUrl) {
+                    setMeshUrlError(new Error('3D mesh presigned URL is not available for this case.'));
+                    return;
+                }
+
+                objectUrlToCleanup = resolvedUrl;
+                setMeshUrl(resolvedUrl);
+            })
+            .catch((error: unknown) => {
+                if (cancelled) {
+                    return;
+                }
+
+                setMeshUrlError(
+                    error instanceof Error ? error : new Error('Unable to load the 3D mesh for this case.')
+                );
+            })
+            .finally(() => {
+                if (!cancelled) {
+                    setMeshUrlPending(false);
+                }
+            });
+
+        return () => {
+            cancelled = true;
+            if (objectUrlToCleanup) {
+                useGLTF.clear(objectUrlToCleanup);
+                meshApi.revokeObjectUrl(objectUrlToCleanup);
+            }
+        };
+    }, [caseId]);
+
+    if (meshUrlError) {
+        throw meshUrlError;
+    }
 
     return (
         <>
@@ -611,27 +668,31 @@ const SceneContent = React.memo<ModelViewerProps & {
                 />
             )}
 
-            <Suspense fallback={<LoadingFallback />}>
-                <ProcessedMesh
-                    url={meshUrl}
-                    wireframe={showWireframe}
-                    componentVisibility={componentVisibility}
-                    visibilityPreset={visibilityPreset}
-                    activeTool={activeTool}
-                    selectedNoduleId={selectedNoduleId}
-                    hoveredNoduleId={hoveredNoduleId}
-                    labels={displaySegmentationLabels}
-                    paletteMode={paletteMode}
-                    onLoad={onModelLoad}
-                    onNoduleClick={onNoduleClick}
-                    onHoverNoduleChange={onHoverNoduleChange}
-                    onFocusTargetsReady={onFocusTargetsReady}
-                    crosshair={crosshair}
-                    volumeDimensions={volumeDimensions}
-                    voxelSpacing={voxelSpacing}
-                    showCrosshairGuide={showCrosshairGuide}
-                />
-            </Suspense>
+            {meshUrlPending || !meshUrl ? (
+                <LoadingFallback />
+            ) : (
+                <Suspense fallback={<LoadingFallback />}>
+                    <ProcessedMesh
+                        url={meshUrl}
+                        wireframe={showWireframe}
+                        componentVisibility={componentVisibility}
+                        visibilityPreset={visibilityPreset}
+                        activeTool={activeTool}
+                        selectedNoduleId={selectedNoduleId}
+                        hoveredNoduleId={hoveredNoduleId}
+                        labels={displaySegmentationLabels}
+                        paletteMode={paletteMode}
+                        onLoad={onModelLoad}
+                        onNoduleClick={onNoduleClick}
+                        onHoverNoduleChange={onHoverNoduleChange}
+                        onFocusTargetsReady={onFocusTargetsReady}
+                        crosshair={crosshair}
+                        volumeDimensions={volumeDimensions}
+                        voxelSpacing={voxelSpacing}
+                        showCrosshairGuide={showCrosshairGuide}
+                    />
+                </Suspense>
+            )}
         </>
     );
 });

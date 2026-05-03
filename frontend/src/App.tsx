@@ -3,7 +3,6 @@ import { Box, Loader2 } from 'lucide-react';
 import { MainLayout } from './components/Layout/MainLayout';
 import { SliceViewer } from './components/CTViewer/SliceViewer';
 import { ModelViewer } from './components/MeshViewer/ModelViewer';
-import VTKHybridViewer from './components/CTViewer/VTKHybridViewer';
 import { UploadPage } from './components/Entry/UploadPage';
 import { PipelineVisualizer } from './components/Pipeline/PipelineVisualizer';
 import { useViewerStore } from './stores/viewerStore';
@@ -132,7 +131,6 @@ function App() {
   const setNoduleEntities = useViewerStore((state) => state.setNoduleEntities);
   const bumpArtifactRefreshVersion = useViewerStore((state) => state.bumpArtifactRefreshVersion);
 
-  const [showVTK, setShowVTK] = useState(false);
   const [meshAvailable, setMeshAvailable] = useState(false);
 
   const requestedProcessingRef = useRef<Set<string>>(new Set());
@@ -260,8 +258,6 @@ function App() {
     let cancelled = false;
 
     setMeshAvailable(false);
-    setShowVTK(false);
-
     const syncPipelineState = async (allowStartProcessing: boolean) => {
       const status = await casesApi.getPipelineStatus(caseId);
       if (cancelled) {
@@ -354,7 +350,7 @@ function App() {
         : 'Preparing background pipeline state...';
   const currentStageLabel = runningStep ? `Current stage: ${runningStep.label}.` : '';
   const show2DViewerOverlays = viewMode !== 'MPR_3D';
-  const show2DNoduleNavigator = viewMode === '2D' || viewMode === 'MPR';
+  const show2DNoduleNavigator = viewMode === '2D';
   const isSingleSlice2DMode = viewMode === '2D';
   const show3DCrosshairGuide = viewMode === 'MPR_3D';
 
@@ -433,55 +429,15 @@ function App() {
       viewer3D={
         metadata ? (
           meshAvailable ? (
-            showVTK ? (
-              <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-                <button
-                  onClick={() => setShowVTK(false)}
-                  style={{
-                    position: 'absolute',
-                    top: 10,
-                    right: 10,
-                    zIndex: 100,
-                    padding: '5px 10px',
-                    background: '#3b82f6',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  Back to Three.js
-                </button>
-                <VTKHybridViewer caseId={metadata.id} />
-              </div>
-            ) : (
-              <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-                {/* <button
-                  onClick={() => setShowVTK(true)}
-                  style={{
-                    position: 'absolute',
-                    top: 10,
-                    right: 10,
-                    zIndex: 100,
-                    padding: '5px 10px',
-                    background: '#eab308',
-                    color: 'black',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                  }}
-                >
-                  Try VTK.js PoC
-                </button> */}
-                <ModelViewer
-                  caseId={metadata.id}
-                  volumeDimensions={metadata.dimensions}
-                  voxelSpacing={metadata.voxelSpacing}
-                  showWireframe={showWireframe}
-                  showCrosshairGuide={show3DCrosshairGuide}
-                />
-              </div>
-            )
+            <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+              <ModelViewer
+                caseId={metadata.id}
+                volumeDimensions={metadata.dimensions}
+                voxelSpacing={metadata.voxelSpacing}
+                showWireframe={showWireframe}
+                showCrosshairGuide={show3DCrosshairGuide}
+              />
+            </div>
           ) : (
             <MeshPendingView
               pipelineLabel={pipelineLabel}

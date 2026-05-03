@@ -564,6 +564,22 @@ const fetchArrayBuffer = async (
     return response.data;
 };
 
+const fetchBlobObjectUrl = async (url: string): Promise<string> => {
+    try {
+        const response = await axios.get(url, {
+            responseType: 'blob',
+        });
+        return URL.createObjectURL(response.data);
+    } catch (error) {
+        if (axios.isAxiosError(error) && !error.response) {
+            throw new Error(
+                'Unable to fetch the 3D mesh from its presigned URL. Verify object-store CORS for GET requests.'
+            );
+        }
+        throw error;
+    }
+};
+
 const parseNpyHeaderShape = (headerText: string): [number, number, number] => {
     const shapeMatch = headerText.match(/'shape':\s*\(([^)]*)\)/);
     if (!shapeMatch) {
@@ -1565,22 +1581,16 @@ export const maskApi = {
 
 export const meshApi = {
     /**
-     * Get mesh URL for 3D viewer
+     * Resolve a browser-safe blob URL backed by the mesh presigned URL.
      */
-    getMeshUrl: (caseId: string): string => {
-        return `${API_V1}/cases/${caseId}/mesh`;
+    getMeshObjectUrl: async (caseId: string): Promise<string | null> => {
+        const presignedUrl = await fetchArtifactUrl(`${API_V1}/cases/${caseId}/mesh-url`);
+        const sourceUrl = presignedUrl ?? `${API_V1}/cases/${caseId}/mesh`;
+        return fetchBlobObjectUrl(sourceUrl);
     },
 
-    /**
-     * Check if mesh is available
-     */
-    checkMeshAvailable: async (caseId: string): Promise<boolean> => {
-        try {
-            await axios.head(`${API_V1}/cases/${caseId}/mesh`);
-            return true;
-        } catch {
-            return false;
-        }
+    revokeObjectUrl: (url: string): void => {
+        URL.revokeObjectURL(url);
     },
 };
 

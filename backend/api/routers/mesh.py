@@ -9,10 +9,38 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from api.dependencies import get_artifact_service
 from config import settings
+from models import ArtifactUrlResponse
 from services.artifact_service import ArtifactService
 
 
 router = APIRouter(tags=["Mesh"])
+
+
+@router.get(
+    "/cases/{case_id}/mesh-url",
+    response_model=ArtifactUrlResponse,
+    summary="Get 3D mesh download URL",
+)
+async def get_mesh_url(
+    case_id: str,
+    artifact_service: ArtifactService = Depends(get_artifact_service),
+):
+    """Get a presigned download URL for the reconstructed 3D mesh."""
+    try:
+        url = artifact_service.get_artifact_download_url(
+            case_id,
+            "mesh",
+            expires_in_seconds=settings.MESH_URL_TTL_SECONDS,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Mesh URL not available")
+
+    return ArtifactUrlResponse(
+        case_id=case_id,
+        artifact="mesh",
+        url=url,
+        expires_in_seconds=settings.MESH_URL_TTL_SECONDS,
+    )
 
 
 @router.get("/cases/{case_id}/mesh", summary="Get 3D mesh")
