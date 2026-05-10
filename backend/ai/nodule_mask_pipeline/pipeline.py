@@ -83,6 +83,7 @@ class NoduleMaskPipeline:
         print(f"Segmentor accepted {segmentor_output.accepted_candidate_count} candidates.", flush=True)
         segmentor_end_time = time.time()
         post_processor_start_time = time.time()
+        # --- POST-PROCESSING  ---
         final_mask_resampled_xyz = self.post_processor.post_process_probability_volume(
             segmentor_output.probability_volume_resampled_xyz,
             prepared.resampled_lung_mask_xyz,

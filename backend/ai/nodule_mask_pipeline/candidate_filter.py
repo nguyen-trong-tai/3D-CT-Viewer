@@ -356,18 +356,26 @@ class CandidateProbabilityFilter:
             return filled
 
         support = np.asarray(support_xyz, dtype=bool)
-        for x_index in range(filled.shape[0]):
-            for y_index in range(filled.shape[1]):
-                z_hits = np.flatnonzero(filled[x_index, y_index, :])
-                if z_hits.size < 2:
-                    continue
-                for left_z, right_z in zip(z_hits[:-1], z_hits[1:]):
-                    gap = int(right_z - left_z - 1)
-                    if gap <= 0 or gap > max_gap:
-                        continue
-                    gap_slice = slice(left_z + 1, right_z)
-                    if np.all(support[x_index, y_index, gap_slice]):
-                        filled[x_index, y_index, gap_slice] = True
+        nz = filled.shape[2]
+
+        # Vectorized: process all (x, y) columns simultaneously per gap position.
+        # For each gap_size and z position, check boundary + support + emptiness
+        # across the entire X*Y plane at once, instead of looping per column.
+        for gap_size in range(1, max_gap + 1):
+            for z_left in range(nz - gap_size - 1):
+                z_right = z_left + gap_size + 1
+                # (X, Y) boolean: columns with True boundary on both sides
+                has_left = filled[:, :, z_left]
+                has_right = filled[:, :, z_right]
+                # All support voxels within the gap must be True
+                gap_support = np.all(support[:, :, z_left + 1:z_right], axis=2)
+                # Gap must currently be empty (no voxels already filled in between)
+                gap_empty = ~np.any(filled[:, :, z_left + 1:z_right], axis=2)
+                # Fill qualifying columns
+                to_fill = has_left & has_right & gap_support & gap_empty
+                if to_fill.any():
+                    for gz in range(z_left + 1, z_right):
+                        filled[:, :, gz] |= to_fill
         return filled
 
     def _build_slice_binary_mask(

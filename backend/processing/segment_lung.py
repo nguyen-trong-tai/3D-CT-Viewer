@@ -77,11 +77,12 @@ class LungSegmenter:
         lung_mask = self._keep_lung_components(internal_air)
         print(f"[SEG] Step 3/5 complete in {perf_counter() - step_start:.2f}s")
 
-        print("[SEG] Step 4/5: post-process lung mask...")
-        step_start = perf_counter()
-        lung_mask = self._postprocess_3d(lung_mask)
-        print(f"[SEG] Step 4/5 complete in {perf_counter() - step_start:.2f}s")
-
+        # print("[SEG] Step 4/5: post-process lung mask...")
+        # step_start = perf_counter()
+        # lung_mask = self._postprocess_3d(lung_mask)
+        # print(f"[SEG] Step 4/5 complete in {perf_counter() - step_start:.2f}s")
+        print(f"[SEG] Step 4/5 post-process lung mask SKIP")
+        
         print("[SEG] Step 5/5: split left/right lungs...")
         step_start = perf_counter()
         left_mask, right_mask = self._separate_lobes(lung_mask)

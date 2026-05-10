@@ -31,10 +31,12 @@ class MaskPostProcessor:
             self.config.postprocess_support_threshold,
         )
         relaxed_lung_xyz = self._relax_lung_mask(lung_mask_xyz)
+        # Cache binary conversion once to avoid redundant np.asarray calls
+        binary_bool = np.asarray(binary_xyz, dtype=bool) if binary_xyz is not None else None
         repaired_binary_xyz = (
-            np.asarray(binary_xyz, dtype=bool) & relaxed_lung_xyz
-            if binary_xyz is not None
-            else np.zeros_like(np.asarray(probability_xyz, dtype=bool), dtype=bool)
+            binary_bool & relaxed_lung_xyz
+            if binary_bool is not None
+            else np.zeros(probability_xyz.shape, dtype=bool)
         )
         relaxed_lung_xyz = self._augment_relaxed_lung_mask_with_candidates(
             relaxed_lung_xyz=relaxed_lung_xyz,
@@ -43,13 +45,17 @@ class MaskPostProcessor:
             candidate_records=list(candidate_records or []),
             support_threshold=support_threshold,
         )
+        # Re-mask with augmented lung mask (reuse cached binary_bool)
         repaired_binary_xyz = (
-            np.asarray(binary_xyz, dtype=bool) & relaxed_lung_xyz
-            if binary_xyz is not None
-            else np.zeros_like(np.asarray(probability_xyz, dtype=bool), dtype=bool)
+            binary_bool & relaxed_lung_xyz
+            if binary_bool is not None
+            else np.zeros(probability_xyz.shape, dtype=bool)
         )
-        seed_xyz = np.asarray(probability_xyz >= seed_threshold, dtype=bool) & relaxed_lung_xyz
-        support_xyz = np.asarray(probability_xyz >= support_threshold, dtype=bool) & relaxed_lung_xyz
+        # In-place boolean ops to avoid intermediate array allocations
+        seed_xyz = probability_xyz >= seed_threshold
+        seed_xyz &= relaxed_lung_xyz
+        support_xyz = probability_xyz >= support_threshold
+        support_xyz &= relaxed_lung_xyz
         seed_xyz |= repaired_binary_xyz
         support_xyz |= repaired_binary_xyz
         if not seed_xyz.any():
@@ -76,7 +82,7 @@ class MaskPostProcessor:
 
         keep_seed = np.isin(labeled, keep_labels)
         grown_mask = ndimage.binary_propagation(keep_seed, structure=structure, mask=support_xyz)
-        grown_mask = ndimage.binary_closing(grown_mask, structure=structure, iterations=1)
+        grown_mask = ndimage.binary_closing(grown_mask, structure=structure, iterations=5)
         grown_mask |= repaired_binary_xyz
         grown_mask &= relaxed_lung_xyz
         grown_mask = self._fill_mask_holes(grown_mask)
@@ -183,11 +189,20 @@ class MaskPostProcessor:
         if not mask_bool.any():
             return []
 
-        labeled, _ = ndimage.label(mask_bool, structure=ndimage.generate_binary_structure(3, 1))
-        mask_uint8 = np.asarray(mask_bool, dtype=np.uint8)
+        structure = ndimage.generate_binary_structure(3, 1)
+        labeled, num_components = ndimage.label(mask_bool, structure=structure)
+        if num_components == 0:
+            return []
+        mask_uint8 = mask_bool.view(np.uint8)
         component_sizes = np.bincount(labeled.ravel())
         objects = ndimage.find_objects(labeled)
         voxel_volume_mm3 = float(np.prod(np.asarray(spacing_xyz, dtype=np.float32)))
+        # Batch centroid computation: single scipy call for all components
+        all_centroids = ndimage.center_of_mass(
+            mask_uint8, labeled, range(1, num_components + 1)
+        )
+        if num_components == 1:
+            all_centroids = [all_centroids]
         stats: list[dict[str, Any]] = []
         for label_id, bbox in enumerate(objects, start=1):
             if bbox is None:
@@ -195,11 +210,11 @@ class MaskPostProcessor:
             voxel_count = int(component_sizes[label_id])
             if voxel_count <= 0:
                 continue
-            centroid = ndimage.center_of_mass(mask_uint8, labeled, label_id)
+            centroid = all_centroids[label_id - 1]
             x0, x1 = int(bbox[0].start), int(bbox[0].stop)
             y0, y1 = int(bbox[1].start), int(bbox[1].stop)
             z0, z1 = int(bbox[2].start), int(bbox[2].stop)
-            local_mask = np.asarray(labeled[x0:x1, y0:y1, z0:z1] == int(label_id), dtype=np.uint8)
+            local_mask = np.asarray(labeled[x0:x1, y0:y1, z0:z1] == label_id, dtype=np.uint8)
             stats.append(
                 {
                     "label_id": int(label_id),

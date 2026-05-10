@@ -25,8 +25,22 @@ def fill_mask_holes_per_slice(mask_xyz: np.ndarray) -> np.ndarray:
     filled = np.asarray(mask_xyz, dtype=bool).copy()
     if not filled.any():
         return filled
-    for z_index in range(filled.shape[2]):
-        filled[:, :, z_index] = ndimage.binary_fill_holes(filled[:, :, z_index])
+    
+    # Optimize by extracting the bounding box containing the nodule
+    coords = np.where(filled)
+    bbox = tuple(slice(np.min(c), np.max(c) + 1) for c in coords)
+    cropped = filled[bbox]
+    
+    # 1. 3D fill for fully enclosed cavities (runs instantly on small cropped region)
+    cropped = ndimage.binary_fill_holes(cropped)
+    
+    # 2. 2D fill per slice for open cavities
+    for z in range(cropped.shape[2]):
+        if cropped[:, :, z].any():
+            cropped[:, :, z] = ndimage.binary_fill_holes(cropped[:, :, z])
+            
+    # Put the filled crop back into the original volume
+    filled[bbox] = cropped
     return filled
 
 
