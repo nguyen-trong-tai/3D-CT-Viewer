@@ -10,6 +10,11 @@ const formatVolume = (volumeMm3: number, volumeMl: number): string =>
 const formatConfidence = (score?: number): string | null =>
     typeof score === 'number' ? `AI ${Math.round(score * 100)}%` : null;
 
+const CLINICAL_HU_RANGE = { min: -1024, max: 3071 };
+
+const formatHuRange = (range: { min: number; max: number }): string =>
+    `${range.min.toFixed(0)} ~ ${range.max.toFixed(0)}`;
+
 export const PatientInfoPanel: React.FC = () => {
     const metadata = useViewerStore((state) => state.metadata);
     const viewMode = useViewerStore((state) => state.viewMode);
@@ -100,11 +105,16 @@ export const PatientInfoPanel: React.FC = () => {
                 <InfoRow label="Slices" value={metadata.totalSlices} mono />
                 {metadata.huRange && (
                     <InfoRow
-                        label="HU Range"
-                        value={`${metadata.huRange.min.toFixed(0)} ~ ${metadata.huRange.max.toFixed(0)}`}
+                        label="Stored HU Range"
+                        value={formatHuRange(metadata.huRange)}
                         mono
                     />
                 )}
+                <InfoRow
+                    label="Clinical HU Range"
+                    value={formatHuRange(CLINICAL_HU_RANGE)}
+                    mono
+                />
             </div>
 
             {is3DContext ? (

@@ -77,11 +77,11 @@ class LungSegmenter:
         lung_mask = self._keep_lung_components(internal_air)
         print(f"[SEG] Step 3/5 complete in {perf_counter() - step_start:.2f}s")
 
-        # print("[SEG] Step 4/5: post-process lung mask...")
-        # step_start = perf_counter()
-        # lung_mask = self._postprocess_3d(lung_mask)
-        # print(f"[SEG] Step 4/5 complete in {perf_counter() - step_start:.2f}s")
-        print(f"[SEG] Step 4/5 post-process lung mask SKIP")
+        print("[SEG] Step 4/5: post-process lung mask...")
+        step_start = perf_counter()
+        lung_mask = self._postprocess_3d(lung_mask)
+        print(f"[SEG] Step 4/5 complete in {perf_counter() - step_start:.2f}s")
+        # print(f"[SEG] Step 4/5 post-process lung mask SKIP")
         
         print("[SEG] Step 5/5: split left/right lungs...")
         step_start = perf_counter()
@@ -135,17 +135,13 @@ class LungSegmenter:
     def _create_body_mask(self, volume_hu: np.ndarray) -> np.ndarray:
         """
         Estimate the patient body mask slice-by-slice on axial planes.
-
-        The key difference from the previous approach is that we do not remove
-        air components by checking whether they touch the outer volume border.
-        Instead, we first find the body and only keep air that is inside it.
         """
         body_mask = np.zeros_like(volume_hu, dtype=bool)
         open_structure = np.ones((3, 3), dtype=bool)
         close_structure = np.ones((5, 5), dtype=bool)
         tissue_volume = np.asarray(volume_hu > self.body_threshold, dtype=bool)
-        active_z = np.flatnonzero(tissue_volume.any(axis=(0, 1)))
-        if active_z.size == 0:
+        active_z = np.flatnonzero(tissue_volume.any(axis=(0, 1))) #slice chứa tissue
+        if active_z.size == 0: 
             return body_mask
 
         x_bounds, y_bounds = self._compute_xy_roi_bounds(tissue_volume, self.body_bbox_margin_px)
@@ -161,7 +157,7 @@ class LungSegmenter:
         closing_margin = max(close_structure.shape[0] // 2, close_structure.shape[1] // 2)
 
         for z in active_z:
-            tissue = roi_tissue_volume[:, :, z]
+            tissue = roi_tissue_volume[:, :, z] # lấy tissue trong slice z
             if not tissue.any():
                 continue
 
@@ -171,7 +167,7 @@ class LungSegmenter:
             (slice_x0, slice_x1), (slice_y0, slice_y1) = slice_bounds
             cropped_tissue = tissue[slice_x0:slice_x1, slice_y0:slice_y1]
 
-            # Break weak links to the table, then restore the body outline.
+            # phá các liên kết yếu rồi khôi phục đường cơ thể
             timer = perf_counter()
             cropped_tissue = ndimage.binary_opening(cropped_tissue, structure=open_structure, iterations=1)
             cropped_tissue = ndimage.binary_closing(cropped_tissue, structure=close_structure, iterations=1)

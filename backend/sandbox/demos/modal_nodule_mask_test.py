@@ -2,12 +2,14 @@
 Standalone Modal entrypoints for testing the sandbox nodule mask pipeline.
 
 Usage examples:
+step 1: Upload dataset to volume "RAW_DATA_PATH" by CLI modal volume upload data_raw /path/to/dataset
 
+step 2: run test
 1. Test an already-uploaded case:
-   modal run backend/sandbox/modal_nodule_mask_test.py::main --case-id <case_id>
+   modal run backend/sandbox/modal_nodule_mask_test.py::main --case-id LIDC-IDRI-0001
 
 2. Test raw data already uploaded to the `data_raw` Modal volume:
-   modal run backend/sandbox/modal_nodule_mask_test.py::main --volume-path dataset/3000522.000000-NA-04919
+   modal run backend/sandbox/modal_nodule_mask_test.py::main --volume-path dataset/LIDC-IDRI-0001
 
 3. Save the returned JSON locally as well:
    modal run backend/sandbox/modal_nodule_mask_test.py::main --volume-path <path-in-data-raw> --output-path backend/sandbox/nodule_mask_result.json
@@ -1100,6 +1102,144 @@ def _visualize_candidates(
     return records
 
 
+def _export_pipeline_step_by_step_debug(
+    output_dir: Path,
+    volume_xyz: np.ndarray,
+    lung_mask_xyz: np.ndarray,
+    final_mask_xyz: np.ndarray,
+) -> dict[str, Any]:
+    from PIL import Image
+
+    debug_dir = output_dir / "pipeline_debug_slices"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    lung_mask_bool = np.asarray(lung_mask_xyz, dtype=bool)
+    occupied_z = np.where(lung_mask_bool.any(axis=(0, 1)))[0]
+    if occupied_z.size == 0:
+        return {"present": False}
+
+    z_indices = _sample_z_indices([int(value) for value in occupied_z.tolist()], max_slices=50)
+
+    for z in z_indices:
+        # 1. CT Raw
+        ct_raw = _window_hu_to_uint8(volume_xyz[:, :, z].T)
+        Image.fromarray(ct_raw, mode="L").save(debug_dir / f"z_{z:04d}_01_ct_raw.png")
+
+        # 2. Lung mask (0-1, không tô màu)
+        lung_mask = np.asarray(lung_mask_xyz[:, :, z].T, dtype=np.uint8)
+        Image.fromarray(lung_mask, mode="L").save(debug_dir / f"z_{z:04d}_02_lung_mask.png")
+
+        # 3. Final mask (0-1, không tô màu)
+        final_mask = np.asarray(final_mask_xyz[:, :, z].T, dtype=np.uint8)
+        Image.fromarray(final_mask, mode="L").save(debug_dir / f"z_{z:04d}_03_final_mask.png")
+
+    return {
+        "present": True,
+        "debug_dir": _relative_output_path(debug_dir),
+        "z_indices": z_indices,
+    }
+
+
+def _export_thesis_presentation_assets(
+    output_dir: Path,
+    volume_xyz: np.ndarray,
+    lung_mask_xyz: np.ndarray,
+    final_mask_xyz: np.ndarray,
+    spacing_xyz_mm: tuple[float, float, float],
+    pipeline_result: Any,
+) -> dict[str, Any]:
+    from PIL import Image
+
+    presentation_dir = output_dir / "presentation_assets"
+    presentation_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_debug_items = list(getattr(pipeline_result, "candidate_debug_volumes", []))
+    if not raw_debug_items:
+        return {"present": False}
+
+    candidates = list(getattr(pipeline_result, "candidates", []))
+    threshold = float(getattr(pipeline_result, "debug", {}).get("foreground_threshold", 0.45))
+    spacing_x, spacing_y, spacing_z = [float(value) for value in spacing_xyz_mm]
+    
+    target_spacing_xyz = tuple(
+        float(value)
+        for value in pipeline_result.debug.get("target_spacing_xyz_mm", spacing_xyz_mm)
+    )
+
+    records = []
+    
+    for item in raw_debug_items:
+        candidate_index = int(item.get("candidate_index", len(records) + 1))
+        candidate_dir = presentation_dir / f"candidate_{candidate_index:03d}"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        
+        candidate_info = next((c for c in candidates if int(c.get("candidate_index", -1)) == candidate_index), None)
+        diameter_mm = max(1.0, float(candidate_info.get("diameter_mm", 20.0))) if candidate_info else 20.0
+        radius_mm = diameter_mm / 2.0
+        
+        center_xyz = item.get("center_xyz", [0.0, 0.0, 0.0])
+        center_x = float(center_xyz[0])
+        center_y = float(center_xyz[1])
+        
+        segmentor_slices = list(item.get("segmentor_slices", []))
+        
+        for slice_item in segmentor_slices:
+            z_resampled = int(slice_item.get("z_index_resampled", 0))
+            
+            # Map Z back to original volume space
+            z_original = int(round(z_resampled * target_spacing_xyz[2] / max(spacing_z, 1e-6)))
+            z_original = _clip_index(z_original, volume_xyz.shape[2])
+            
+            slice_prefix = f"z_{z_original:04d}"
+            
+            # 1. CT Raw (Full size)
+            ct_raw = _window_hu_to_uint8(volume_xyz[:, :, z_original].T)
+            Image.fromarray(ct_raw, mode="L").save(candidate_dir / f"{slice_prefix}_01_ct_raw.png")
+            
+            # 2. Lung Mask (Full size, 0-255 binary)
+            lung_mask = np.asarray(lung_mask_xyz[:, :, z_original].T, dtype=np.uint8) * 255
+            Image.fromarray(lung_mask, mode="L").save(candidate_dir / f"{slice_prefix}_02_lung_mask.png")
+            
+            # 3. Detect Candidate (CT Raw with Bounding Box)
+            detect_candidate_rgb = _compose_candidate_box_rgb(
+                ct_raw,
+                center_col=center_x,
+                center_row=center_y,
+                half_width_px=radius_mm / max(spacing_x, 1e-6),
+                half_height_px=radius_mm / max(spacing_y, 1e-6),
+            )
+            Image.fromarray(detect_candidate_rgb, mode="RGB").save(candidate_dir / f"{slice_prefix}_03_detect_candidate.png")
+            
+            # 4. Patch 128x128 Input
+            input_patch = slice_item.get("input_patch_yx")
+            if input_patch is not None:
+                patch_array = np.asarray(input_patch, dtype=np.float32)
+                patch_uint8 = _normalized_patch_to_uint8(patch_array)
+                Image.fromarray(patch_uint8, mode="L").save(candidate_dir / f"{slice_prefix}_04_patch_128x128_input.png")
+                
+            # 5. Patch 128x128 Mask (0-255 binary)
+            prob_patch = slice_item.get("probability_patch_yx")
+            if prob_patch is not None:
+                prob_array = np.asarray(prob_patch, dtype=np.float32)
+                mask_patch_uint8 = (prob_array >= threshold).astype(np.uint8) * 255
+                Image.fromarray(mask_patch_uint8, mode="L").save(candidate_dir / f"{slice_prefix}_05_patch_128x128_mask.png")
+                
+            # 6. Nodule Mask Full Size (0-255 binary)
+            final_mask = np.asarray(final_mask_xyz[:, :, z_original].T, dtype=np.uint8) * 255
+            Image.fromarray(final_mask, mode="L").save(candidate_dir / f"{slice_prefix}_06_nodule_mask_full_size.png")
+
+        records.append({
+            "candidate_index": candidate_index,
+            "slices_exported": len(segmentor_slices)
+        })
+
+    return {
+        "present": True,
+        "presentation_dir": _relative_output_path(presentation_dir),
+        "exported_candidates": records,
+    }
+
+
 def _visualize_final_mask(
     output_dir: Path,
     volume_xyz: np.ndarray,
@@ -1404,6 +1544,20 @@ def _serialize_pipeline_result(
         pipeline_result=pipeline_result,
         spacing_xyz_mm=spacing_xyz_mm,
     )
+    step_by_step_debug = _export_pipeline_step_by_step_debug(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(volume_xyz),
+        lung_mask_xyz=np.asarray(pipeline_result.lung_mask_xyz),
+        final_mask_xyz=np.asarray(pipeline_result.final_mask_xyz),
+    )
+    presentation_assets = _export_thesis_presentation_assets(
+        output_dir=output_dir,
+        volume_xyz=np.asarray(volume_xyz),
+        lung_mask_xyz=np.asarray(pipeline_result.lung_mask_xyz),
+        final_mask_xyz=np.asarray(pipeline_result.final_mask_xyz),
+        spacing_xyz_mm=spacing_xyz_mm,
+        pipeline_result=pipeline_result,
+    )
 
     payload = {
         "final_mask_voxel_count": int(np.asarray(pipeline_result.final_mask_xyz, dtype=np.uint8).sum()),
@@ -1433,6 +1587,8 @@ def _serialize_pipeline_result(
             "final_mask_views": final_mask_views,
             "final_mask_resampled_views": final_mask_resampled_views,
             "final_mask_mesh": final_mask_mesh,
+            "step_by_step_debug": step_by_step_debug,
+            "presentation_assets": presentation_assets,
         },
     }
     return payload
