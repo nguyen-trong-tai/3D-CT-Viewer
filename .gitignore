@@ -21,7 +21,6 @@ dist/
 *.swp
 
 # Project specific
-docs/
 data/
-dataset/
+# dataset/
 outputs/

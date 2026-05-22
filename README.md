@@ -2,6 +2,22 @@
 
 ViewR CT is a research and educational monorepo for turning CT studies into interactive 2D and 3D visualizations. The system supports uploading DICOM or NIfTI data, building a normalized CT volume, running a processing pipeline, storing intermediate artifacts per case, and rendering the result in a web UI.
 
+![ViewR CT Workflow Montage](assets/workflow_montage.png)
+
+## Live Demo
+
+Try the deployed demo:
+
+[https://ct-viewer-3.vercel.app/](https://ct-viewer-3.vercel.app/)
+
+This deployment is intended for testing and demonstration only.
+
+## Demo Video
+
+Watch the product walkthrough:
+
+[![ViewR CT Demo Video](https://img.youtube.com/vi/Chc0iHAOYfM/maxresdefault.jpg)](https://www.youtube.com/watch?v=Chc0iHAOYfM)
+
 ## Disclaimer
 
 This project is for research, prototyping, and education only. It is not intended for clinical diagnosis or treatment.
@@ -15,6 +31,32 @@ This project is for research, prototyping, and education only. It is not intende
 - Persist intermediate artifacts such as CT preview volumes, masks, SDFs, and meshes
 - Visualize axial/coronal/sagittal views and a 3D mesh in the frontend
 - Support local/shared-volume execution and distributed execution with Redis + Cloudflare R2
+
+## Feature Preview
+
+### Upload CT Data
+
+Users can upload sample CT data from the `dataset/` folder to test the viewer.
+
+![ViewR CT Upload Flow](assets/screenshot_uploadview.png)
+
+### 2D CT Viewer
+
+Inspect CT slices in the browser with windowing and viewer controls.
+
+![ViewR CT 2D Viewer](assets/screenshot_2Dview.png)
+
+### Segmentation Overlay
+
+Review processed segmentation results overlaid on CT slices.
+
+![ViewR CT Segmentation Overlay](assets/screenshot_2Doverlay.png)
+
+### 3D Mesh Viewer
+
+Render generated mesh artifacts in an interactive 3D viewer.
+
+![ViewR CT 3D Viewer](assets/screenshot_3Dview.png)
 
 ## Repository Layout
 
@@ -69,6 +111,8 @@ This mode is active when both Redis and Cloudflare R2 are configured and distrib
 
 ## Main User Flow
 
+![ViewR CT Processing Pipeline](assets/system_Pipeline.png)
+
 ```text
 Upload CT data
 -> backend builds a case
@@ -78,6 +122,16 @@ Upload CT data
 -> frontend loads preview/full data for 2D viewing
 -> frontend loads mesh for 3D viewing
 ```
+
+## Sample Data
+
+Sample CT data is available in the `dataset/` folder. Download one of the sample files or folders and upload it through the web application to test the full processing and visualization flow.
+
+Supported upload inputs include:
+
+- DICOM archives or folders
+- NIfTI volumes (`.nii`, `.nii.gz`)
+- ZIP archives (`.zip`)
 
 ## Quick Start
 
@@ -157,6 +211,10 @@ The backend contains a Modal app definition for background workers and cloud dep
 cd backend
 modal deploy modal_app.py
 ```
+
+## Report
+
+A detailed project report will be updated later.
 
 ## Current Scope
 
