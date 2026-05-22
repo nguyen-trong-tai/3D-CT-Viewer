@@ -34,12 +34,6 @@ This project is for research, prototyping, and education only. It is not intende
 
 ## Feature Preview
 
-### Upload CT Data
-
-Users can upload sample CT data from the `dataset/` folder to test the viewer.
-
-![ViewR CT Upload Flow](assets/screenshot_uploadview.png)
-
 ### 2D CT Viewer
 
 Inspect CT slices in the browser with windowing and viewer controls.
@@ -56,7 +50,7 @@ Review processed segmentation results overlaid on CT slices.
 
 Render generated mesh artifacts in an interactive 3D viewer.
 
-![ViewR CT 3D Viewer](assets/screenshot_3Dview.png)
+![ViewR CT 3D Viewer](assets/screenshot_3Dview_opacity.png)
 
 ## Repository Layout
 
